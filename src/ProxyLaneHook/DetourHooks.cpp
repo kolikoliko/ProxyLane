@@ -18,7 +18,7 @@ namespace
 
 }
 
-LONG InstallDetourHooks(const DetourHookBinding* bindings, size_t count)
+static LONG ApplyDetourHooks(const DetourHookBinding* bindings, size_t count, bool attach)
 {
     if (!bindings && count) return ERROR_INVALID_PARAMETER;
     if (!count) return NO_ERROR;
@@ -43,11 +43,22 @@ LONG InstallDetourHooks(const DetourHookBinding* bindings, size_t count)
     // Deliberately do not suspend host threads. The transaction prepares the
     // entire batch, but publishing entry patches is not atomic to other threads.
     for (size_t i = 0; i < count && error == NO_ERROR; ++i)
-        error = DetourAttach(bindings[i].original, bindings[i].replacement);
+        error = attach ? DetourAttach(bindings[i].original, bindings[i].replacement)
+                       : DetourDetach(bindings[i].original, bindings[i].replacement);
     if (error != NO_ERROR)
     {
         DetourTransactionAbort();
         return error;
     }
     return DetourTransactionCommit();
+}
+
+LONG InstallDetourHooks(const DetourHookBinding* bindings, size_t count)
+{
+    return ApplyDetourHooks(bindings, count, true);
+}
+
+LONG RemoveDetourHooks(const DetourHookBinding* bindings, size_t count)
+{
+    return ApplyDetourHooks(bindings, count, false);
 }

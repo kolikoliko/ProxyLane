@@ -37,8 +37,8 @@ def main():
     parser.add_argument("--msbuild-dir", type=Path,
                         help="Optional VS 2019 MSBuild/Current/Bin containing MSBuild.exe and amd64/MSBuild.exe")
     args = parser.parse_args()
-    # Older foreign Hook DLLs can detach in this disposable runner.
-    # Persistent builds cannot; require an unproxied runner in that case.
+    # Detach only in this disposable runner, before starting threads or I/O.
+    # The runner owns quiescence; do not alter the user's proxy process.
     kernel = ctypes.WinDLL("kernel32")
     kernel.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
     kernel.GetModuleHandleW.restype = ctypes.c_void_p

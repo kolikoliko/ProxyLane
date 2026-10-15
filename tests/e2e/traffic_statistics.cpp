@@ -132,25 +132,25 @@ int main(int argc, char** argv)
 		Require(WSAStartup(MAKEWORD(2, 2), &wsa) == 0, "client WSAStartup");
 		__CONNECTEX cachedConnectEx = NULL;
 		__WSASENDMSG cachedSendMsg = NULL;
-		Require(!gp_UnhookWinsock() && GetLastError() == ERROR_NOT_SUPPORTED,
-			"unhook unsupported before installation");
+		Require(!gp_UnhookWinsock() && GetLastError() == ERROR_NOT_FOUND,
+			"unhook reports no installed object");
 		// A missing service must leave the object unpublished to callbacks and allow retry.
 		char missingPipe[128];
 		sprintf_s(missingPipe, "\\\\.\\pipe\\ProxyLane-missing-test-%lu", GetCurrentProcessId());
 		Require(!gp_HookWinsock(missingPipe), "failed installation before retry");
-		BYTE installedConnect[16] = { 0 };
+		BYTE originalConnect[16] = { 0 };
 		PVOID connectEntry = reinterpret_cast<PVOID>(GetProcAddress(GetModuleHandleW(L"ws2_32.dll"), "connect"));
 		Require(connectEntry != NULL, "connect entry");
-		for (int cycle = -1; cycle < 2; ++cycle)
+		memcpy(originalConnect, connectEntry, sizeof(originalConnect));
+		for (int cycle = -1; cycle < 3; ++cycle)
 		{
-			if (cycle == 0)
+			if (cycle >= 0)
 			{
-				Require(gp_HookWinsock(argv[2]), "client install once");
-				memcpy(installedConnect, connectEntry, sizeof(installedConnect));
-			}
-			if (cycle == 1)
+				Require(gp_HookWinsock(argv[2]), "client install/reinstall");
 				Require(!gp_HookWinsock(argv[2]) && GetLastError() == ERROR_ALREADY_EXISTS,
-					"reject repeated installation");
+					"reject duplicate installation");
+				if (cycle > 0) CheckCachedExtensions(cachedConnectEx, cachedSendMsg);
+			}
 			SOCKET tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 			SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 			GUID connectGuid = WSAID_CONNECTEX;
@@ -165,12 +165,16 @@ int main(int argc, char** argv)
 			closesocket(tcp); closesocket(udp);
 			CheckCachedExtensions(cachedConnectEx, cachedSendMsg);
 			if (cycle < 0) continue; // Capture the native provider's validation errors.
-			Require(!gp_UnhookWinsock() && GetLastError() == ERROR_NOT_SUPPORTED,
-				"runtime unhook explicitly unsupported");
-			Require(memcmp(installedConnect, connectEntry, sizeof(installedConnect)) == 0,
-				"rejected unhook leaves entry patch unchanged");
+			if (cycle == 0) Transfer(atoi(argv[4]), atoi(argv[3]), atoi(argv[5]));
+			// Single calling thread, completed I/O and closed sockets: caller owns quiescence.
+			Require(gp_UnhookWinsock(), "explicit client unhook");
+			Require(memcmp(originalConnect, connectEntry, sizeof(originalConnect)) == 0,
+				"unhook restores original entry bytes");
 			CheckCachedExtensions(cachedConnectEx, cachedSendMsg);
-			if (cycle == 1) Transfer(atoi(argv[4]), atoi(argv[3]), atoi(argv[5]));
+			Require(!gp_UnhookWinsock() && GetLastError() == ERROR_NOT_FOUND,
+				"repeat unhook reports no installed object");
+			Require(!gp_HookWinsock(missingPipe), "failed reinstallation leaves callbacks valid");
+			CheckCachedExtensions(cachedConnectEx, cachedSendMsg);
 		}
 		WSACleanup();
 		return 0;

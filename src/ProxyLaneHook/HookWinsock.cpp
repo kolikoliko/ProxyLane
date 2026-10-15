@@ -461,20 +461,36 @@ CString CHookWinsock::GetPRCPipeName()
 	return m_szPRCPipeName;
 }
 
-BOOL CHookWinsock::InstallHooks()
+BOOL CHookWinsock::DisableHook()
+{
+	// Caller owns quiescence. Never destroy callback state if detach fails.
+	if (m_bHookEnabled && !ApplyHooks(false))
+		return FALSE;
+	if (m_ChildGuardInstalled && m_ChildGuardName[0])
+		SetEnvironmentVariableW(m_ChildGuardName, NULL);
+	m_ChildGuardInstalled = FALSE;
+	ZeroMemory(m_ChildGuardName, sizeof(m_ChildGuardName));
+	ZeroMemory(m_HookedInfo, sizeof(m_HookedInfo));
+	ZeroMemory(&m_psi, sizeof(m_psi));
+	return TRUE;
+}
+
+BOOL CHookWinsock::ApplyHooks(bool attach)
 {
 	DetourHookBinding bindings[HOOKAPI_COUNT];
 	size_t count = 0;
 	for (int i = 0; i < HOOKAPI_COUNT; ++i)
 		if (m_HookedInfo[i].original) bindings[count++] = m_HookedInfo[i];
-	LONG error = InstallDetourHooks(bindings, count);
+	LONG error = attach ? InstallDetourHooks(bindings, count)
+	                    : RemoveDetourHooks(bindings, count);
 	if (error != NO_ERROR)
 	{
-		m_szLastError.Format(_T("Detours attach failed: %ld"), error);
+		m_szLastError.Format(_T("Detours %s failed: %ld"),
+			attach ? _T("attach") : _T("detach"), error);
 		::SetLastError(error);
 		return FALSE;
 	}
-	m_bHookEnabled = TRUE;
+	m_bHookEnabled = attach ? TRUE : FALSE;
 	return TRUE;
 }
 
@@ -1001,6 +1017,15 @@ MyDetourProc(has_Return,
 	)
 	)
 {
+	// Applications may keep this callback after explicit detach. The DLL and
+	// provider pointer stay alive; the callback object does not.
+	if (!g_pHookWinsock || !g_pHookWinsock->IsHookEnabled())
+	{
+		if (!Original_ConnectEx)
+		{ WSASetLastError(WSAEOPNOTSUPP); return FALSE; }
+		return Original_ConnectEx(s, name, namelen, lpSendBuffer,
+			dwSendDataLength, lpdwBytesSent, lpOverlapped);
+	}
 	return g_pHookWinsock->inhook_ConnectEx(s,
 		name,
 		namelen,
@@ -1078,6 +1103,13 @@ INT PASCAL hook_WSASendMsg(SOCKET s, LPWSAMSG lpMsg, DWORD dwFlags,
 	LPDWORD lpNumberOfBytesSent, LPWSAOVERLAPPED lpOverlapped,
 	LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine)
 {
+	if (!g_pHookWinsock || !g_pHookWinsock->IsHookEnabled())
+	{
+		if (!Original_WSASendMsg)
+		{ WSASetLastError(WSAEOPNOTSUPP); return SOCKET_ERROR; }
+		return Original_WSASendMsg(s, lpMsg, dwFlags, lpNumberOfBytesSent,
+			lpOverlapped, lpCompletionRoutine);
+	}
 	return g_pHookWinsock->inhook_WSASendMsg(s, lpMsg, dwFlags,
 		lpNumberOfBytesSent, lpOverlapped, lpCompletionRoutine);
 }
@@ -2420,7 +2452,7 @@ BOOL CHookWinsock::HookWinsock()
 				break;
 		}
 
-		return InstallHooks();
+		return ApplyHooks(true);
 	} while (FALSE);
 
 	return FALSE;

@@ -35,7 +35,7 @@ def main():
     # A running ProxyLane can inject this disposable Python runner and then
     # inject a second Hook DLL into its children. Keep the controlled local
     # endpoints and probe isolated, without changing the user's proxy process.
-    # Only older DLLs support detach; persistent builds require an unproxied runner.
+    # Detach before starting threads or I/O: this runner owns quiescence.
     kernel = ctypes.WinDLL("kernel32")
     kernel.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
     kernel.GetModuleHandleW.restype = ctypes.c_void_p

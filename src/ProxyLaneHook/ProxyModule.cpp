@@ -184,7 +184,7 @@ BOOL WINAPI gp_HookWinsock(LPCSTR lpszPRCPipeName)
 	if (g_pPMHookWs && g_pPMHookWs->IsHookEnabled())
 	{ SetLastError(ERROR_ALREADY_EXISTS); return FALSE; }
 
-	// Installed entry patches, trampolines and extension callbacks live until process exit.
+	// Cached extension callbacks remain callable even after explicit hook removal.
 	HMODULE pinned = NULL;
 	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN |
 		GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
@@ -207,9 +207,16 @@ BOOL WINAPI gp_HookWinsock(LPCSTR lpszPRCPipeName)
 
 BOOL WINAPI gp_UnhookWinsock()
 {
-	// ABI compatibility only: runtime detach would invalidate active/cached callbacks.
-	SetLastError(ERROR_NOT_SUPPORTED);
-	return FALSE;
+	// Serializes lifecycle requests only. The caller must quiesce all affected
+	// calls (including Bypass_* and cached extensions) before entering here.
+	HookLifecycleScope lifecycle;
+	if (!g_pPMHookWs)
+	{ SetLastError(ERROR_NOT_FOUND); return FALSE; }
+	if (!g_pPMHookWs->DisableHook())
+		return FALSE;
+	delete g_pPMHookWs;
+	g_pPMHookWs = NULL;
+	return TRUE;
 }
 
 static UINT get_arg(LPSTR lpszIn, LPCSTR lpszOpt, LPSTR lpszBuf, int size)

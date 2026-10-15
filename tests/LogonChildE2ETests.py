@@ -222,8 +222,8 @@ def main():
     parser.add_argument("--modes", nargs="+", default=["null", "unicode", "ansi", "suspended", "invalid-flags", "missing-file"])
     parser.add_argument("--interactive-runas", action="store_true")
     args = parser.parse_args()
-    # Detach an older foreign Hook only in this disposable runner, if it is already
-    # proxied by another installation, so children use the test binaries.
+    # Detach only in this disposable runner, before starting threads or I/O,
+    # so its children use the test binaries. The runner owns quiescence.
     kernel = ctypes.WinDLL("kernel32")
     kernel.GetModuleHandleW.restype = wintypes.HMODULE
     if kernel.GetModuleHandleW("ProxyLaneHook64.dll"):

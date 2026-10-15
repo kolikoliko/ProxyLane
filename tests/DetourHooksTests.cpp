@@ -17,7 +17,7 @@ struct Code {
     bool installed;
     Code() : bytes(static_cast<BYTE*>(VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))), installed(false)
     { Check(bytes != NULL, "allocate code"); }
-    // Installed targets, like the production DLL, stay mapped until process exit.
+    // Never release an executable target while its patch is still installed.
     ~Code() { if (!installed) VirtualFree(bytes, 0, MEM_RELEASE); }
     void Seal() {
         DWORD old;
@@ -42,11 +42,19 @@ void Exercise(const BYTE* instructions, size_t size, bool addressResult)
     ULONG_PTR expected = addressResult ? reinterpret_cast<ULONG_PTR>(code.bytes + 128) : 42;
     Check(entry() == expected, "original code result");
     DetourHookBinding binding = { reinterpret_cast<PVOID*>(&original), Replacement };
-    Check(InstallDetourHooks(&binding, 1) == NO_ERROR, "attach relocated code");
-    code.installed = true;
-    for (int i = 0; i < 1000; ++i)
-        Check(entry() == expected + 1 && original() == expected, "persistent hook and trampoline results");
-    code.CheckProtection();
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        Check(InstallDetourHooks(&binding, 1) == NO_ERROR, "attach relocated code");
+        code.installed = true;
+        for (int i = 0; i < 1000; ++i)
+            Check(entry() == expected + 1 && original() == expected, "hook and trampoline results");
+        code.CheckProtection();
+        // This test has no concurrent callers. Detach does not stop them for us.
+        Check(RemoveDetourHooks(&binding, 1) == NO_ERROR, "explicit quiescent detach");
+        code.installed = false;
+        Check(original == entry && entry() == expected, "restore original pointer and behavior");
+        Check(std::memcmp(code.bytes, instructions, size) == 0, "restore entry bytes");
+        code.CheckProtection();
+    }
 }
 struct WorkerState { Function entry; volatile LONG failures; };
 DWORD WINAPI CallWorker(void* parameter)
@@ -76,6 +84,44 @@ void ConcurrentCalls()
     Check(WaitForMultipleObjects(4, workers, TRUE, 10000) == WAIT_OBJECT_0, "join callers");
     for (int i = 0; i < 4; ++i) CloseHandle(workers[i]);
     Check(state.failures == 0, "concurrent persistent hook results");
+    // The caller joins every worker before changing entry code or freeing trampolines.
+    Check(RemoveDetourHooks(&binding, 1) == NO_ERROR, "detach after joining callers");
+    code.installed = false;
+    Check(state.entry() == 42 && original == state.entry, "native call after joined detach");
+}
+
+void DetachRollback()
+{
+    Code code;
+    const BYTE constant[] = { 0xb8, 42, 0, 0, 0, 0xc3 };
+    std::memcpy(code.bytes, constant, sizeof(constant));
+    std::memcpy(code.bytes + 128, constant, sizeof(constant));
+    code.Seal();
+    Function entry = reinterpret_cast<Function>(code.bytes);
+    Function secondEntry = reinterpret_cast<Function>(code.bytes + 128);
+    original = entry;
+    Function second = secondEntry;
+    DetourHookBinding bindings[] = {
+        { reinterpret_cast<PVOID*>(&original), Replacement },
+        { reinterpret_cast<PVOID*>(&second), WrongReplacement }
+    };
+    Check(InstallDetourHooks(bindings, 2) == NO_ERROR, "install detach rollback batch");
+    code.installed = true;
+    Function firstTrampoline = original, secondTrampoline = second;
+    BYTE patched[16];
+    std::memcpy(patched, code.bytes, sizeof(patched));
+    DetourHookBinding wrong[] = { bindings[0], { bindings[1].original, Replacement } };
+    Check(RemoveDetourHooks(wrong, 2) != NO_ERROR, "reject second mismatched detach");
+    Check(original == firstTrampoline && second == secondTrampoline, "failed detach preserves pointers");
+    Check(std::memcmp(code.bytes, patched, sizeof(patched)) == 0, "failed detach preserves first patch");
+    Check(entry() == 43 && secondEntry() == 0 && second() == 42, "failed detach preserves both hooks");
+    code.CheckProtection();
+    Check(RemoveDetourHooks(bindings, 2) == NO_ERROR, "retry correct detach batch");
+    code.installed = false;
+    Check(original == entry && second == secondEntry && entry() == 42 && secondEntry() == 42,
+        "successful detach restores both functions");
+    Check(std::memcmp(code.bytes, constant, sizeof(constant)) == 0 &&
+        std::memcmp(code.bytes + 128, constant, sizeof(constant)) == 0, "restore both entry patches");
 }
 void Rollback()
 {
@@ -138,6 +184,7 @@ int DetourHooksTestCase(const char* name)
     }
 #endif
     else if (!std::strcmp(name, "rollback")) Rollback();
+    else if (!std::strcmp(name, "detach-rollback")) DetachRollback();
     else if (!std::strcmp(name, "concurrent")) ConcurrentCalls();
     else return 2;
     return 0;
@@ -148,7 +195,7 @@ int DetourHooksTestsMain()
 #ifdef _WIN64
     RunCase("rip-lea"); RunCase("rip-mov");
 #endif
-    RunCase("rollback"); RunCase("concurrent");
-    std::puts("Detours relocation, rollback/retry and persistent concurrent callers passed (isolated processes)");
+    RunCase("rollback"); RunCase("detach-rollback"); RunCase("concurrent");
+    std::puts("Detours relocation, attach/detach rollback, quiescent cycles and concurrent callers passed");
     return 0;
 }
