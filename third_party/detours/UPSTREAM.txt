@@ -1,0 +1,7 @@
+Microsoft Detours
+Source: https://github.com/microsoft/Detours
+Commit: 1dbd4ea281d73d478aa8d09a8b83fbd265f715f7
+License: MIT (see LICENSE.md)
+
+Upstream source files are unmodified. ProxyLane builds only the x86/x64
+inline-hook core through Detours.props; process injection remains separate.
