@@ -1,5 +1,6 @@
 """Check native traffic_statistics.exe against controlled local endpoints."""
 import argparse
+import ctypes
 import pathlib
 import socket
 import subprocess
@@ -31,6 +32,19 @@ def main():
     parser.add_argument("--probe", type=pathlib.Path, required=True)
     parser.add_argument("--socks-server", type=pathlib.Path, required=True)
     args = parser.parse_args()
+    # A running ProxyLane can inject this disposable Python runner and then
+    # inject a second Hook DLL into its children. Keep the controlled local
+    # endpoints and probe isolated, without changing the user's proxy process.
+    kernel = ctypes.WinDLL("kernel32")
+    kernel.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+    kernel.GetModuleHandleW.restype = ctypes.c_void_p
+    hook = "ProxyLaneHook%d.dll" % (ctypes.sizeof(ctypes.c_void_p) * 8)
+    if kernel.GetModuleHandleW(hook):
+        unhook = ctypes.WinDLL(hook).gp_UnhookWinsock
+        unhook.argtypes = []
+        unhook.restype = ctypes.c_int
+        if not unhook():
+            raise RuntimeError("Could not detach the inherited Hook from the test runner")
     tcp = socket.socket()
     tcp.bind(("127.0.0.1", 0))
     tcp.listen()

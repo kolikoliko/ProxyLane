@@ -2,9 +2,10 @@
 
 ## 分支与依赖
 
-`main` 的 `4461854` 只清理未使用的旧 hook 实现。后续迁移位于
-`codex/detours-migration`，使用独立 worktree；稳定版修复仍提交到 `main`，
-再合并或 cherry-pick 到迁移分支。验证完成后整体合并迁移分支，避免长期维护两个后端。
+迁移已通过 `e45f579` 合并到 `main`，保留依赖引入 `fb535c6`、后端替换
+`8f80a84`、回归测试 `8d3ab7f` 三个提交。旧后端最后一个提交为 `4461854`，
+使用附注标签 `pre-detours-migration` 保存，便于检出对照版本。
+后续 Windows ARM64 原生适配单独评估，不改变此 x86/x64 基线。
 
 Detours 源码位于 `third_party/detours`，固定到 Microsoft 上游提交
 `1dbd4ea281d73d478aa8d09a8b83fbd265f715f7`，使用 MIT 许可证。
@@ -14,6 +15,11 @@ Detours 源码位于 `third_party/detours`，固定到 Microsoft 上游提交
 
 本次仅迁移 Win32/x64 inline hook。DLL 注入、跨位数启动和现有代理策略沿用原实现；
 没有添加 ARM64 或 ARM64EC 构建配置。
+
+旧 x64 后端使用入口前 5 字节填充区和入口处的 `EB F9` 短跳转。
+当前 Detours 没有主动创建这种 patch-above 布局的接口；其 x86/x64 入口补丁
+需要至少 5 字节完整指令或可用的函数尾填充。过短目标会导致本项目中止整批安装。
+识别已有 OS hotpatch 的能力不等于支持创建该布局，这是已知的兼容性差异。
 
 ## 实现与生命周期
 
@@ -50,6 +56,13 @@ Detours 源码位于 `third_party/detours`，固定到 Microsoft 上游提交
 v141_xp/v142、Windows SDK、项目所用 ATL/MFC，以及 PATH 中的 Go、64 位 Python
 （含 psutil）、Rust/cargo/rustup；解决方案会构建已有的安全传输组件。
 仅运行单元测试可使用 `tests/run-tests.ps1`。
+
+2026-10-15 合并后，已在原工程目录重新构建 Win32/x64 Release 并通过完整回归。
+日志保存在 `build/qa/detours-merge`。运行中的另一套 ProxyLane 曾向测试服务和探针
+注入第二份 Hook DLL，导致 UDP 超时；流量测试现与托管启动测试一样，仅解除一次性
+Python 测试进程继承的 hook，再创建受控子进程，不修改用户正在运行的代理。
+发布脚本同时携带 Detours 的许可证与来源信息，已检查生成的 ZIP 内容。
+迁移 worktree 的构建产物及日志另存于 `build/detours-migration-archive`。
 
 尚未验证 XP/Windows 7、Windows 11 或 Windows on ARM 的运行环境。保留 v141_xp
 编译配置不等于已经完成旧系统运行认证。线程快照也不能约束宿主在提交期间新建线程；
