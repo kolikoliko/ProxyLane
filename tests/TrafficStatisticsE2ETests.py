@@ -35,6 +35,7 @@ def main():
     # A running ProxyLane can inject this disposable Python runner and then
     # inject a second Hook DLL into its children. Keep the controlled local
     # endpoints and probe isolated, without changing the user's proxy process.
+    # Only older DLLs support detach; persistent builds require an unproxied runner.
     kernel = ctypes.WinDLL("kernel32")
     kernel.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
     kernel.GetModuleHandleW.restype = ctypes.c_void_p
@@ -44,7 +45,7 @@ def main():
         unhook.argtypes = []
         unhook.restype = ctypes.c_int
         if not unhook():
-            raise RuntimeError("Could not detach the inherited Hook from the test runner")
+            raise RuntimeError("Inherited Hook cannot be detached; run tests from an unproxied process")
     tcp = socket.socket()
     tcp.bind(("127.0.0.1", 0))
     tcp.listen()

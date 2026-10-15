@@ -639,7 +639,6 @@ public:
 
 	BOOL IsHookEnabled();
 	BOOL EnableHook();
-	BOOL DisableHook();
 
 	BOOL SetPRCPipeName(LPCSTR lpszPipeName);
 	CString GetPRCPipeName();
@@ -648,9 +647,8 @@ public:
 
 
 	BOOL HookWinsock();
-	BOOL UnhookWinsock();
 
-	BOOL ApplyHooks(bool attach);
+	BOOL InstallHooks();
 	BOOL HookAPI(eHOOKMODUDLE ehm, eHOOKFUN ehf, char *exportfunc, LPVOID myfuncaddr, PVOID* original);
 
 	BOOL IsHostNameReserved(const char *name);

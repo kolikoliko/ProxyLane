@@ -303,6 +303,7 @@ BOOL GetProxyLaneChildGuardInfo(
 
 
 BOOL WINAPI gp_HookWinsock(LPCSTR lpszPRCPipeName);
+// Retained export: returns FALSE / ERROR_NOT_SUPPORTED; hooks remain installed.
 BOOL WINAPI gp_UnhookWinsock();
 DWORD WINAPI AttachToHandles(HANDLE hProcess, HANDLE hThread, LPCSTR szPipeName);
 DWORD WINAPI AttachToI(DWORD dwPid, DWORD dwTid, LPCSTR szPipeName);
