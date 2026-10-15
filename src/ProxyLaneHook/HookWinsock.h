@@ -1,11 +1,12 @@
-﻿#pragma once
+#pragma once
 
 
 #include "structinfo.h"
 #include "TSSTL.h"
 #include "PRCPipeClient.h"
 #include "DnsRedirectPolicy.h"
-#include "inlinehook.h"
+#include "HookDispatch.h"
+#include "DetourHooks.h"
 
 using namespace std;
 
@@ -36,7 +37,6 @@ typedef enum
 	//kernel32
 	HOOKAPI_CreateProcessInternalW,
 	HOOKAPI_CreateProcessWithLogonW,
-	//HOOKAPI_AddAccessAllowedAce,
 
 	HOOKAPI_COUNT
 }eHOOKFUN; 
@@ -55,17 +55,11 @@ class CAsyncSocketExLayer;
 
 class CHookWinsock
 {
-	friend CAsyncSocketExLayer;
 
 	
 
 	//hook info struct
-	typedef struct
-	{
-		void* funcaddr;
-		void* myfuncaddr;
-		void* newfuncaddr;
-	}HOOKSTRUCT;
+	typedef DetourHookBinding HOOKSTRUCT;
 
 	//
 
@@ -656,8 +650,8 @@ public:
 	BOOL HookWinsock();
 	BOOL UnhookWinsock();
 
-	void HookOnOff(eHOOKFUN ehf, bool DOUNT);
-	BOOL HookAPI(eHOOKMODUDLE ehm, eHOOKFUN ehf, char *exportfunc, LPVOID myfuncaddr, LPVOID newfuncaddr);
+	BOOL ApplyHooks(bool attach);
+	BOOL HookAPI(eHOOKMODUDLE ehm, eHOOKFUN ehf, char *exportfunc, LPVOID myfuncaddr, PVOID* original);
 
 	BOOL IsHostNameReserved(const char *name);
 
@@ -783,10 +777,7 @@ private:
 	MODULENAME   m_ModuleName[HOOKMODULE_COUNT];
 	HOOKSTRUCT m_HookedInfo[HOOKAPI_COUNT];
 
-	void *m_mem4bakcode[HOOKMODULE_COUNT];
 
-	__CONNECTEX m_pConnectEx;
-	__WSASENDMSG m_pWSASendMsg;
 
 	CString m_szLastError;
 	CString m_szPRCPipeName;
@@ -799,3 +790,14 @@ private:
 	void LogBlockedIPv6(SOCKET socketHandle, const _SockAddr& destination);
 
 };
+
+// Stable bypass entry points; callers must not cache Detours trampoline addresses.
+int WSAAPI Bypass_connect(SOCKET s, const sockaddr* name, int length);
+hostent* WSAAPI Bypass_gethostbyname(const char* name);
+HANDLE WSAAPI Bypass_WSAAsyncGetHostByName(HWND window, unsigned int message,
+	const char* name, char* buffer, int length);
+int WSAAPI Bypass_sendto(SOCKET s, const char* buffer, int length, int flags,
+	const sockaddr* to, int toLength);
+int WSAAPI Bypass_WSASendTo(SOCKET s, LPWSABUF buffers, DWORD count,
+	LPDWORD sent, DWORD flags, const sockaddr* to, int toLength,
+	LPWSAOVERLAPPED overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE completion);

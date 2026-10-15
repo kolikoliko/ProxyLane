@@ -308,7 +308,6 @@ CHookWinsock::CHookWinsock(void)
 	m_ProcessCreationTls = TlsAlloc();
 	ZeroMemory(m_HookedInfo, sizeof(m_HookedInfo));
 	ZeroMemory(&m_psi, sizeof(m_psi));
-	ZeroMemory(m_mem4bakcode, sizeof(m_mem4bakcode));
 	ZeroMemory(m_LocalDnsHostName, sizeof(m_LocalDnsHostName));
 	ZeroMemory(m_ChildGuardName, sizeof(m_ChildGuardName));
 	m_ChildGuardInstalled = FALSE;
@@ -328,8 +327,6 @@ CHookWinsock::CHookWinsock(void)
 		m_ModuleName[HOOKMODULE_KERNEL32] = "Kernel32.dll";
 
 	m_szPRCPipeName = PRC_PIPESERVER_NAME;
-	m_pConnectEx = NULL;
-	m_pWSASendMsg = NULL;
 }
 
 CHookWinsock::~CHookWinsock(void)
@@ -455,14 +452,14 @@ BOOL CHookWinsock::EnableHook()
 
 BOOL CHookWinsock::DisableHook()
 {
-	UnhookWinsock();
+	if (!UnhookWinsock())
+		return FALSE;
 	if (m_ChildGuardInstalled && m_ChildGuardName[0])
 		SetEnvironmentVariableW(m_ChildGuardName, NULL);
 	m_ChildGuardInstalled = FALSE;
 	ZeroMemory(m_ChildGuardName, sizeof(m_ChildGuardName));
 	ZeroMemory(m_HookedInfo, sizeof(m_HookedInfo));
 	ZeroMemory(&m_psi, sizeof(m_psi));
-	ZeroMemory(m_mem4bakcode, sizeof(m_mem4bakcode));
 
 	return TRUE;
 }
@@ -478,68 +475,43 @@ CString CHookWinsock::GetPRCPipeName()
 	return m_szPRCPipeName;
 }
 
-BOOL CHookWinsock::UnhookWinsock()
+BOOL CHookWinsock::ApplyHooks(bool attach)
 {
-	m_bHookEnabled = FALSE;
-	int i = 0;
-	for (i = 0; i<HOOKAPI_COUNT; i++)
+	DetourHookBinding bindings[HOOKAPI_COUNT];
+	size_t count = 0;
+	for (int i = 0; i < HOOKAPI_COUNT; ++i)
+		if (m_HookedInfo[i].original) bindings[count++] = m_HookedInfo[i];
+	LONG error = ApplyDetourHooks(bindings, count, attach);
+	if (error != NO_ERROR)
 	{
-		HookOnOff((eHOOKFUN)i, false);
+		m_szLastError.Format(_T("Detours %s failed: %ld"),
+			attach ? _T("attach") : _T("detach"), error);
+		::SetLastError(error);
+		return FALSE;
 	}
-
+	m_bHookEnabled = attach ? TRUE : FALSE;
 	return TRUE;
 }
 
-void CHookWinsock::HookOnOff(eHOOKFUN ehf, bool DOUNT)
+BOOL CHookWinsock::UnhookWinsock()
 {
-	HOOKSTRUCT *hookfunc = &m_HookedInfo[ehf];
-	if (!hookfunc->funcaddr)
-	{
-		return;
-	}
-
-	int ret;
-
-	if (DOUNT)
-	{
-		ret = hook_set((unsigned char*)hookfunc->funcaddr, (unsigned char*)hookfunc->newfuncaddr, hookfunc->myfuncaddr);
-	}
-	else
-	{
-		ret = hook_remove((unsigned char*)hookfunc->newfuncaddr, hookfunc->myfuncaddr);
-	}
-	
+	return !m_bHookEnabled || ApplyHooks(false);
 }
 
-BOOL CHookWinsock::HookAPI(eHOOKMODUDLE ehm, eHOOKFUN ehf, char *exportfunc, LPVOID myfuncaddr, LPVOID newfuncaddr)
+// Resolve every export before beginning the single attach transaction.
+BOOL CHookWinsock::HookAPI(eHOOKMODUDLE ehm, eHOOKFUN ehf, char *exportfunc,
+	LPVOID myfuncaddr, PVOID* original)
 {
-	char *dllname = m_ModuleName[ehm];
-	HOOKSTRUCT *hookfunc = &m_HookedInfo[ehf];
-	long writtenCodeSize = 0;
-
-	hookfunc->myfuncaddr = myfuncaddr;
-	hookfunc->newfuncaddr = newfuncaddr;
-
-	HMODULE hModule = GetModuleHandleA(dllname);
-	if (hModule == NULL)
+	HMODULE module = GetModuleHandleA(m_ModuleName[ehm]);
+	PVOID target = module ? reinterpret_cast<PVOID>(GetProcAddress(module, exportfunc)) : NULL;
+	if (!target)
+	{
+		m_szLastError.Format(_T("Unable to resolve hook export: %hs"), exportfunc);
 		return FALSE;
-
-	hookfunc->funcaddr = GetProcAddress(hModule, exportfunc);
-	if (hookfunc->funcaddr == NULL)
-		return FALSE;
-
-#ifdef _WIN64
-
-	if (0 != hook_set_hp((unsigned char*)hookfunc->funcaddr, (unsigned char*)newfuncaddr, myfuncaddr, (void*)(((char*)m_mem4bakcode[ehm]) + ehf*JMPBOARD_SIZE)))
-		return FALSE;
-
-#else
-
-	if (0 != hook_set((unsigned char*)hookfunc->funcaddr, (unsigned char*)newfuncaddr, myfuncaddr))
-		return FALSE;
-
-#endif
-
+	}
+	*original = target;
+	m_HookedInfo[ehf].original = original;
+	m_HookedInfo[ehf].replacement = myfuncaddr;
 	return TRUE;
 }
 
@@ -594,6 +566,9 @@ BOOL CHookWinsock::HackDNS(const char *name)
 
 MyDetourProc(has_Return, hostent*, WSAAPI, gethostbyname, (const char* name))
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(gethostbyname)(name);
 	return g_pHookWinsock->inhook_gethostbyname(name);
 }
 
@@ -614,6 +589,9 @@ hostent* WSAAPI CHookWinsock::inhook_gethostbyname(const char* name)
 
 MyDetourProc(has_Return, HANDLE, WSAAPI, WSAAsyncGetHostByName, (HWND hWnd, unsigned int wMsg, const char* name, char* buf, int buflen))
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(WSAAsyncGetHostByName)(hWnd, wMsg, name, buf, buflen);
 	return g_pHookWinsock->inhook_WSAAsyncGetHostByName(hWnd, wMsg, name, buf, buflen);
 }
 
@@ -631,6 +609,9 @@ HANDLE WSAAPI CHookWinsock::inhook_WSAAsyncGetHostByName(HWND hWnd, unsigned int
 
 MyDetourProc(has_Return, int, WSAAPI, getaddrinfo, (IN const char FAR * nodename, IN const char FAR * servname, IN const struct addrinfo FAR * hints, OUT struct addrinfo FAR * FAR * res))
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(getaddrinfo)(nodename, servname, hints, res);
 	return g_pHookWinsock->inhook_getaddrinfo(nodename, servname, hints, res);
 }
 
@@ -711,6 +692,18 @@ struct timeval *timeout,
 	LPLOOKUPSERVICE_COMPLETION_ROUTINE  lpCompletionRoutine,
 	LPHANDLE        lpHandle))
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(GetAddrInfoExW)(pName,
+		pServiceName,
+		dwNameSpace,
+		lpNspId,
+		hints,
+		ppResult,
+		timeout,
+		lpOverlapped,
+		lpCompletionRoutine,
+		lpHandle);
 	return g_pHookWinsock->inhook_GetAddrInfoExW(pName,
 		pServiceName,
 		dwNameSpace,
@@ -841,6 +834,9 @@ MyDetourProc(has_Return,
 	)
 	)
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(GetAddrInfoW)(pNodeName, pServiceName, pHints, ppResult);
 	return g_pHookWinsock->inhook_GetAddrInfoW(pNodeName, pServiceName, pHints, ppResult);
 }
 
@@ -928,6 +924,9 @@ int WSAAPI CHookWinsock::inhook_GetAddrInfoW(
 
 MyDetourProc(has_Return, int, WSAAPI, connect, (SOCKET s, const struct sockaddr FAR * name, int namelen))
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(connect)(s, name, namelen);
 	return g_pHookWinsock->inhook_connect(s, name, namelen);
 }
 
@@ -984,6 +983,9 @@ MyDetourProc(has_Return,
 	WSAConnect,(SOCKET s, const struct sockaddr* name, int namelen, LPWSABUF lpCallerData, LPWSABUF lpCalleeData, LPQOS lpSQOS, LPQOS lpGQOS)
 	)
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(WSAConnect)(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
 	return g_pHookWinsock->inhook_WSAConnect(s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
 }
 
@@ -1049,6 +1051,15 @@ MyDetourProc(has_Return,
 	)
 	)
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(ConnectEx)(s,
+		name,
+		namelen,
+		lpSendBuffer,
+		dwSendDataLength,
+		lpdwBytesSent,
+		lpOverlapped);
 	return g_pHookWinsock->inhook_ConnectEx(s,
 		name,
 		namelen,
@@ -1068,13 +1079,13 @@ BOOL PASCAL CHookWinsock::inhook_ConnectEx(
 	LPOVERLAPPED lpOverlapped
 	)
 {
-	if (!m_pConnectEx)
+	if (!Original_ConnectEx)
 	{
 		WSASetLastError(WSAEOPNOTSUPP);
 		return FALSE;
 	}
 	if (!name || (name->sa_family != AF_INET && name->sa_family != AF_INET6))
-		return m_pConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength,
+		return Original_ConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength,
 			lpdwBytesSent, lpOverlapped);
 
 	_SockAddr addrname;
@@ -1111,7 +1122,7 @@ BOOL PASCAL CHookWinsock::inhook_ConnectEx(
 			return FALSE;
 		}
 	}
-	return m_pConnectEx(s,
+	return Original_ConnectEx(s,
 		redirected,
 		redirectedLength,
 		lpSendBuffer,
@@ -1120,10 +1131,16 @@ BOOL PASCAL CHookWinsock::inhook_ConnectEx(
 		lpOverlapped);
 }
 
+static __WSASENDMSG Original_WSASendMsg = NULL;
+
 INT PASCAL hook_WSASendMsg(SOCKET s, LPWSAMSG lpMsg, DWORD dwFlags,
 	LPDWORD lpNumberOfBytesSent, LPWSAOVERLAPPED lpOverlapped,
 	LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine)
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(WSASendMsg)(s, lpMsg, dwFlags,
+		lpNumberOfBytesSent, lpOverlapped, lpCompletionRoutine);
 	return g_pHookWinsock->inhook_WSASendMsg(s, lpMsg, dwFlags,
 		lpNumberOfBytesSent, lpOverlapped, lpCompletionRoutine);
 }
@@ -1132,7 +1149,7 @@ INT PASCAL CHookWinsock::inhook_WSASendMsg(SOCKET s, LPWSAMSG lpMsg,
 	DWORD dwFlags, LPDWORD lpNumberOfBytesSent, LPWSAOVERLAPPED lpOverlapped,
 	LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine)
 {
-	if (!m_pWSASendMsg)
+	if (!Original_WSASendMsg)
 	{
 		WSASetLastError(WSAEOPNOTSUPP);
 		return SOCKET_ERROR;
@@ -1159,7 +1176,7 @@ INT PASCAL CHookWinsock::inhook_WSASendMsg(SOCKET s, LPWSAMSG lpMsg,
 		return SOCKET_ERROR;
 	}
 	if (!m_psi.bHookUDP || !lpMsg)
-		return m_pWSASendMsg(s, lpMsg, dwFlags, lpNumberOfBytesSent,
+		return Original_WSASendMsg(s, lpMsg, dwFlags, lpNumberOfBytesSent,
 			lpOverlapped, lpCompletionRoutine);
 	if (!lpMsg->name)
 	{
@@ -1172,12 +1189,12 @@ INT PASCAL CHookWinsock::inhook_WSASendMsg(SOCKET s, LPWSAMSG lpMsg,
 			WSASetLastError(WSAEMSGSIZE);
 			return SOCKET_ERROR;
 		}
-		return m_pWSASendMsg(s, lpMsg, dwFlags, lpNumberOfBytesSent,
+		return Original_WSASendMsg(s, lpMsg, dwFlags, lpNumberOfBytesSent,
 			lpOverlapped, lpCompletionRoutine);
 	}
 	_SockAddr destination;
 	if (!NormalizeSocketAddress(lpMsg->name, lpMsg->namelen, &destination))
-		return m_pWSASendMsg(s, lpMsg, dwFlags, lpNumberOfBytesSent,
+		return Original_WSASendMsg(s, lpMsg, dwFlags, lpNumberOfBytesSent,
 			lpOverlapped, lpCompletionRoutine);
 	if (!EnsureSocketBound(s, lpMsg->name))
 		return SOCKET_ERROR;
@@ -1191,7 +1208,7 @@ INT PASCAL CHookWinsock::inhook_WSASendMsg(SOCKET s, LPWSAMSG lpMsg,
 		return SOCKET_ERROR;
 	}
 	if (decision == HOOK_BYPASS)
-		return m_pWSASendMsg(s, lpMsg, dwFlags, lpNumberOfBytesSent,
+		return Original_WSASendMsg(s, lpMsg, dwFlags, lpNumberOfBytesSent,
 			lpOverlapped, lpCompletionRoutine);
 	if (!IsWSABufferPayloadAllowed(lpMsg->lpBuffers, lpMsg->dwBufferCount,
 		maxPayload))
@@ -1213,7 +1230,7 @@ INT PASCAL CHookWinsock::inhook_WSASendMsg(SOCKET s, LPWSAMSG lpMsg,
 	// is not meaningful for the local PRC route. WSASendTo also avoids keeping
 	// a stack-local WSAMSG alive across an overlapped operation.
 	__WSASendTo realWSASendTo = reinterpret_cast<__WSASendTo>(
-		m_HookedInfo[HOOKAPI_WSASendTo].newfuncaddr);
+		*m_HookedInfo[HOOKAPI_WSASendTo].original);
 	INT result = realWSASendTo(s, lpMsg->lpBuffers,
 		lpMsg->dwBufferCount, lpNumberOfBytesSent, dwFlags, redirected,
 		redirectedLength, lpOverlapped, lpCompletionRoutine);
@@ -1404,6 +1421,9 @@ MyDetourProc(has_Return,
 	int, WSAAPI, getpeername, (SOCKET s, struct sockaddr* name, int* namelen)
 	)
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(getpeername)(s, name, namelen);
 	return g_pHookWinsock->inhook_getpeername(s, name, namelen);
 }
 
@@ -1440,6 +1460,9 @@ int WSAAPI CHookWinsock::inhook_getpeername(SOCKET s, struct sockaddr* name, int
 MyDetourProc(has_Return,
 	int, WSAAPI, closesocket, (SOCKET s))
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(closesocket)(s);
 	return g_pHookWinsock->inhook_closesocket(s);
 }
 
@@ -1483,6 +1506,9 @@ int WSAAPI CHookWinsock::inhook_closesocket(SOCKET s)
 MyDetourProc(has_Return,
 	int, WSAAPI, sendto,(SOCKET s, const char* buf, int len, int flags, const struct sockaddr* to, int tolen))
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(sendto)(s, buf, len, flags, to, tolen);
 	return g_pHookWinsock->inhook_sendto(s, buf, len, flags, to, tolen);
 }
 
@@ -1498,6 +1524,9 @@ MyDetourProc(has_Return, int, WSAAPI, WSASendTo, (
 	LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine
 	))
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(WSASendTo)(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpTo, iToLen, lpOverlapped, lpCompletionRoutine);
 	return g_pHookWinsock->inhook_WSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpTo, iToLen, lpOverlapped, lpCompletionRoutine);
 }
 
@@ -1886,6 +1915,9 @@ static BOOL ResolveChildAppPath(HANDLE hChildProc, LPCWSTR lpApplicationName, LP
 
 MyDetourProc(has_Return, BOOL, WINAPI, CreateProcessInternalW, (HANDLE hToken, LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes, LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation, PHANDLE hNewToken))
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(CreateProcessInternalW)(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, hNewToken);
 	return g_pHookWinsock->inhook_CreateProcessInternalW(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, hNewToken);
 }
 
@@ -2302,6 +2334,11 @@ MyDetourProc(has_Return, BOOL, WINAPI, CreateProcessWithLogonW, (
 	LPVOID environment, LPCWSTR currentDirectory, LPSTARTUPINFOW startup,
 	LPPROCESS_INFORMATION process))
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(CreateProcessWithLogonW)(username, domain,
+		password, logonFlags, applicationName, commandLine, creationFlags,
+		environment, currentDirectory, startup, process);
 	return g_pHookWinsock->inhook_CreateProcessWithLogonW(username, domain,
 		password, logonFlags, applicationName, commandLine, creationFlags,
 		environment, currentDirectory, startup, process);
@@ -2354,6 +2391,9 @@ MyDetourProc(has_Return, int, WSAAPI, WSAIoctl, (
 	LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine
 	))
 {
+	HookCallScope call(g_HookCalls);
+	if (!call.Enabled())
+		return CallTrampoline(WSAIoctl)(s, dwIoControlCode, lpvInBuffer, cbInBuffer, lpvOutBuffer, cbOutBuffer, lpcbBytesReturned, lpOverlapped, lpCompletionRoutine);
 	return g_pHookWinsock->inhook_WSAIoctl(s, dwIoControlCode, lpvInBuffer, cbInBuffer, lpvOutBuffer, cbOutBuffer, lpcbBytesReturned, lpOverlapped, lpCompletionRoutine);
 }
 
@@ -2384,7 +2424,7 @@ int WSAAPI CHookWinsock::inhook_WSAIoctl(
 			&& cbOutBuffer >= sizeof(void*)
 			)
 		{
-			*(void**)&m_pConnectEx = *(void**)lpvOutBuffer;
+			*(void**)&Original_ConnectEx = *(void**)lpvOutBuffer;
 			*(void**)lpvOutBuffer = hook_ConnectEx;
 		}
 #ifndef WSAID_WSASENDMSG
@@ -2396,56 +2436,11 @@ int WSAAPI CHookWinsock::inhook_WSAIoctl(
 			cbOutBuffer >= sizeof(void*) &&
 			memcmp(&guid_WSAID_WSASENDMSG, lpvInBuffer, sizeof(GUID)) == 0)
 		{
-			*(void**)&m_pWSASendMsg = *(void**)lpvOutBuffer;
+			*(void**)&Original_WSASendMsg = *(void**)lpvOutBuffer;
 			*(void**)lpvOutBuffer = hook_WSASendMsg;
 		}
 	}
 	return ret;
-}
-
-MyDetourProc(has_Return,
-BOOL, WINAPI, AddAccessAllowedAce,(
-	PACL pAcl,
-	DWORD dwAceRevision,
-	DWORD AccessMask,
-	PSID pSid
-	)
-	)
-{
-	return CallTrampoline(AddAccessAllowedAce)(pAcl, dwAceRevision, AccessMask, pSid);
-}
-
-
-/////////////
-
-void *myAlloc4Bakcode(HMODULE hAfterDll, SIZE_T size)
-{
-	//return VirtualAlloc(0, size, MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-
-	PIMAGE_DOS_HEADER        pDosHeader = (PIMAGE_DOS_HEADER)hAfterDll;
-	PIMAGE_FILE_HEADER        pFileHeader = (PIMAGE_FILE_HEADER)(((PBYTE)hAfterDll) + pDosHeader->e_lfanew + 4);
-	PIMAGE_OPTIONAL_HEADER    pOptionalHeader = (PIMAGE_OPTIONAL_HEADER)(pFileHeader + 1);
-	DWORD dwOffset = pOptionalHeader->SizeOfImage;
-	while (dwOffset + size < 0x7fffffff)
-	{
-		void *p = VirtualAlloc((char*)hAfterDll + dwOffset, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-		if (p != NULL)
-			return p;
-
-		dwOffset += 4096;
-	}
-
-	dwOffset = 0;
-	while (pOptionalHeader->SizeOfImage + dwOffset + size < 0x7fffffff)
-	{
-		void *p = VirtualAlloc((char*)hAfterDll - dwOffset, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-		if (p != NULL)
-			return p;
-
-		dwOffset += 4096;
-	}
-
-	return NULL;
 }
 
 BOOL CHookWinsock::HookWinsock()
@@ -2455,29 +2450,16 @@ BOOL CHookWinsock::HookWinsock()
 	int i;
 	for (i = 0; i < HOOKMODULE_COUNT; i++)
 	{
-		if (!LoadLibraryA(m_ModuleName[i]))
+		if (!GetModuleHandleA(m_ModuleName[i]) && !LoadLibraryA(m_ModuleName[i]))
 		{
 			m_szLastError = _T("Failed to initialize HookWinsock: LoadLibrary");
 			return FALSE;
 		}
 	}
 
-#ifdef _WIN64
-	for (i = 0; i < HOOKMODULE_COUNT; i++)
-	{
-		m_mem4bakcode[i] = myAlloc4Bakcode(GetModuleHandleA(m_ModuleName[i]), HOOKAPI_COUNT * JMPBOARD_SIZE);
-		if (!m_mem4bakcode[i])
-		{
-			m_szLastError = _T("Failed to initialize HookWinsock: myAlloc4Bakcode");
-			return FALSE;
-		}
-	}
-#endif
-
-
 #define _EHF(method) HOOKAPI_##method
 #define _HOOKFUNC(method) hook_##method
-#define _TRAMPFUNC(method) Trampoline_##method
+#define _TRAMPFUNC(method) reinterpret_cast<PVOID*>(&Original_##method)
 
 	do
 	{
@@ -2524,18 +2506,38 @@ BOOL CHookWinsock::HookWinsock()
 				break;
 		}
 
-// 		if (!HookAPI(HOOKMODULE_KERNEL32, _EHF(AddAccessAllowedAce), "SHRegDeleteUSValueW", _HOOKFUNC(AddAccessAllowedAce), _TRAMPFUNC(AddAccessAllowedAce)))
-// 			break;
-// 
-// 		AddAccessAllowedAce(0, 0, 0, 0);
-
-		m_bHookEnabled = TRUE;
-		return TRUE;
+		return ApplyHooks(true);
 	} while (FALSE);
 
-	//!!!!
-
-	m_szLastError = _T("Failed to initialize HookWinsock: HookAPI");
-
 	return FALSE;
+}
+
+int WSAAPI Bypass_connect(SOCKET s, const sockaddr* name, int length)
+{
+	HookCallScope call(g_HookCalls);
+	return (Original_connect ? Original_connect : ::connect)(s, name, length);
+}
+
+hostent* WSAAPI Bypass_gethostbyname(const char* name)
+{
+	HookCallScope call(g_HookCalls);
+	return (Original_gethostbyname ? Original_gethostbyname : ::gethostbyname)(name);
+}
+
+HANDLE WSAAPI Bypass_WSAAsyncGetHostByName(HWND window, unsigned int message, const char* name, char* buffer, int length)
+{
+	HookCallScope call(g_HookCalls);
+	return (Original_WSAAsyncGetHostByName ? Original_WSAAsyncGetHostByName : ::WSAAsyncGetHostByName)(window, message, name, buffer, length);
+}
+
+int WSAAPI Bypass_sendto(SOCKET s, const char* buffer, int length, int flags, const sockaddr* to, int toLength)
+{
+	HookCallScope call(g_HookCalls);
+	return (Original_sendto ? Original_sendto : ::sendto)(s, buffer, length, flags, to, toLength);
+}
+
+int WSAAPI Bypass_WSASendTo(SOCKET s, LPWSABUF buffers, DWORD count, LPDWORD sent, DWORD flags, const sockaddr* to, int toLength, LPWSAOVERLAPPED overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE completion)
+{
+	HookCallScope call(g_HookCalls);
+	return (Original_WSASendTo ? Original_WSASendTo : ::WSASendTo)(s, buffers, count, sent, flags, to, toLength, overlapped, completion);
 }
