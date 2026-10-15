@@ -359,7 +359,6 @@
 	<ClInclude Include="ElevatedLauncher.h" />
 	<ClInclude Include="ElevatedLaunchProtocol.h" />
     <ClInclude Include="asynsocket\types.h" />
-    <ClInclude Include="detour.h" />
     <ClInclude Include="GlobalProxy.h" />
     <ClInclude Include="AppContainerPipeAccess.h" />
     <ClInclude Include="HookWinsock.h" />

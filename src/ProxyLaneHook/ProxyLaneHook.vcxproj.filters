@@ -116,9 +116,6 @@
     <ClInclude Include="asynsocket\types.h">
       <Filter>Source Files</Filter>
     </ClInclude>
-    <ClInclude Include="detour.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="GlobalProxy.h">
       <Filter>Header Files</Filter>
     </ClInclude>
