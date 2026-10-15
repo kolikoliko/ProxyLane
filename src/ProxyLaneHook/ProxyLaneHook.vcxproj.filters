@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <Filter Include="Source Files">
@@ -21,6 +21,8 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="HookCallGate.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="DetourHooks.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="GlobalProxy.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -233,9 +235,9 @@
     <ClInclude Include="asynsocket\autoBuffer.h">
       <Filter>Header Files\asynsocket</Filter>
     </ClInclude>
-    <ClInclude Include="inlinehook.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
+    <ClInclude Include="HookDispatch.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="HookCallGate.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="DetourHooks.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="InjectDll.h">
       <Filter>Header Files</Filter>
     </ClInclude>

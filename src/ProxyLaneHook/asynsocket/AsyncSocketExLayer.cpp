@@ -89,28 +89,7 @@ CAsyncSocketExLayer::CAsyncSocketExLayer()
 	m_connMainFlag = 0;
 	m_connSubFlag = 0;
 
-	if(g_pHookWinsock && g_pHookWinsock->IsHookEnabled())
-	{
-		m_pReal_connect = (__connect)g_pHookWinsock->m_HookedInfo[HOOKAPI_connect].newfuncaddr;
-		m_pReal_gethostbyname = (__gethostbyname)g_pHookWinsock->m_HookedInfo[HOOKAPI_gethostbyname].newfuncaddr;
-		m_pReal_WSAAsyncGetHostByName = (__WSAAsyncGetHostByName)g_pHookWinsock->m_HookedInfo[HOOKAPI_WSAAsyncGetHostByName].newfuncaddr;
-		m_pReal_sendto = (__sendto)g_pHookWinsock->m_HookedInfo[HOOKAPI_sendto].newfuncaddr;
-		m_pReal_WSASendTo = (__WSASendTo)g_pHookWinsock->m_HookedInfo[HOOKAPI_WSASendTo].newfuncaddr;
-		// Receive APIs are intentionally not hooked. SOCKS5 UDP decapsulation
-		// happens in the PRC, and source-address restoration is disabled.
-		m_pReal_recvfrom = ::recvfrom;
-		m_pReal_WSARecvFrom = ::WSARecvFrom;
-	}else
-	{
-		m_pReal_connect = connect;
-		m_pReal_gethostbyname = gethostbyname;
-		m_pReal_WSAAsyncGetHostByName = WSAAsyncGetHostByName;
-		m_pReal_sendto = sendto;
-		m_pReal_recvfrom = recvfrom;
-		m_pReal_WSASendTo = ::WSASendTo;
-		m_pReal_WSARecvFrom = ::WSARecvFrom;
-
-	}
+	BypassHook(TRUE);
 }
 
 CAsyncSocketExLayer::~CAsyncSocketExLayer()
@@ -707,13 +686,13 @@ void CAsyncSocketExLayer::SetConnectionFlag(DWORD main, DWORD sub)
 //
 void CAsyncSocketExLayer::BypassHook(BOOL bBypass)
 {
-	if(bBypass && g_pHookWinsock && g_pHookWinsock->IsHookEnabled())
+	if (bBypass)
 	{
-		m_pReal_connect = (__connect)g_pHookWinsock->m_HookedInfo[HOOKAPI_connect].newfuncaddr;
-		m_pReal_gethostbyname = (__gethostbyname)g_pHookWinsock->m_HookedInfo[HOOKAPI_gethostbyname].newfuncaddr;
-		m_pReal_WSAAsyncGetHostByName = (__WSAAsyncGetHostByName)g_pHookWinsock->m_HookedInfo[HOOKAPI_WSAAsyncGetHostByName].newfuncaddr;
-		m_pReal_sendto = (__sendto)g_pHookWinsock->m_HookedInfo[HOOKAPI_sendto].newfuncaddr;
-		m_pReal_WSASendTo = (__WSASendTo)g_pHookWinsock->m_HookedInfo[HOOKAPI_WSASendTo].newfuncaddr;
+		m_pReal_connect = Bypass_connect;
+		m_pReal_gethostbyname = Bypass_gethostbyname;
+		m_pReal_WSAAsyncGetHostByName = Bypass_WSAAsyncGetHostByName;
+		m_pReal_sendto = Bypass_sendto;
+		m_pReal_WSASendTo = Bypass_WSASendTo;
 		m_pReal_recvfrom = ::recvfrom;
 		m_pReal_WSARecvFrom = ::WSARecvFrom;
 	}else

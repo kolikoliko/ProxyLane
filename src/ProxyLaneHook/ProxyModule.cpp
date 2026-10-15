@@ -103,7 +103,7 @@ BOOL APIENTRY DllMain( HANDLE hModule,
 
 	case DLL_PROCESS_DETACH:
 		{
-			gp_UnhookWinsock();
+			// Hook installation pins this DLL. Process teardown needs no detach transaction.
 			//WSACleanup();
 		}
 
@@ -161,39 +161,67 @@ BOOL GetProxyLaneChildGuardInfo(
 
 
 
-BOOL WINAPI gp_HookWinsock(LPCSTR lpszPRCPipeName)
+namespace
 {
-	if (g_pPMHookWs) {
-		g_pPMHookWs->SetPRCPipeName(lpszPRCPipeName);
-
-		return FALSE;
-	}
-
-	g_pPMHookWs = new CHookWinsock;
-	if(!g_pPMHookWs)
-		return FALSE;
-
-	g_pPMHookWs->SetPRCPipeName(lpszPRCPipeName);
-	const BOOL hookResult = g_pPMHookWs->EnableHook();
-
-	DeferredMitigationPolicy::RestoreCigPolicy();
-
-	return hookResult;
+	struct HookLifecycleLock
+	{
+		CRITICAL_SECTION value;
+		HookLifecycleLock() { InitializeCriticalSection(&value); }
+		~HookLifecycleLock() { DeleteCriticalSection(&value); }
+	} hookLifecycleLock;
+	struct HookLifecycleScope
+	{
+		HookLifecycleScope() { EnterCriticalSection(&hookLifecycleLock.value); }
+		~HookLifecycleScope() { LeaveCriticalSection(&hookLifecycleLock.value); }
+	};
 }
 
+BOOL WINAPI gp_HookWinsock(LPCSTR lpszPRCPipeName)
+{
+	if (g_HookCalls.InCall()) { SetLastError(ERROR_BUSY); return FALSE; }
+	HookLifecycleScope lifecycle;
+	if (!lpszPRCPipeName || !lpszPRCPipeName[0])
+	{ SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+	if (g_pPMHookWs && g_pPMHookWs->IsHookEnabled()) return FALSE;
+	if (!g_HookCalls.Close(5000)) return FALSE;
+
+	// WSAIoctl clients may retain our extension callbacks after disabling hooks.
+	HMODULE pinned = NULL;
+	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN |
+		GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+		reinterpret_cast<LPCWSTR>(&gp_HookWinsock), &pinned))
+	{
+		g_HookCalls.Open(false);
+		return FALSE;
+	}
+	g_pPMHookWs = new CHookWinsock;
+	g_pPMHookWs->SetPRCPipeName(lpszPRCPipeName);
+	const BOOL result = g_pPMHookWs->EnableHook();
+	if (!result)
+	{
+		delete g_pPMHookWs;
+		g_pPMHookWs = NULL;
+	}
+	g_HookCalls.Open(result != FALSE);
+	DeferredMitigationPolicy::RestoreCigPolicy();
+	return result;
+}
 
 BOOL WINAPI gp_UnhookWinsock()
 {
-	if(!g_pPMHookWs)
-		return FALSE;
-
-	if(! g_pPMHookWs->DisableHook())
-		return FALSE;
-
-	delete g_pPMHookWs;
-	g_pPMHookWs = NULL;
-
-	return TRUE;
+	if (g_HookCalls.InCall()) { SetLastError(ERROR_BUSY); return FALSE; }
+	HookLifecycleScope lifecycle;
+	if (!g_pPMHookWs) return FALSE;
+	if (!g_HookCalls.Close(5000)) return FALSE;
+	const BOOL result = g_pPMHookWs->DisableHook();
+	if (result)
+	{
+		delete g_pPMHookWs;
+		g_pPMHookWs = NULL;
+	}
+	// A failed detach keeps the object, configuration and trampoline pointers alive.
+	g_HookCalls.Open(!result);
+	return result;
 }
 
 static UINT get_arg(LPSTR lpszIn, LPCSTR lpszOpt, LPSTR lpszBuf, int size)

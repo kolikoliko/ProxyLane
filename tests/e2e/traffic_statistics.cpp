@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <windows.h>
+#include <mswsock.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <vector>
@@ -92,8 +93,12 @@ static void RunClient(const char* pipe, int port, int type, int length)
 	char command[MAX_PATH * 3];
 	sprintf_s(command, "\"%s\" --child \"%s\" %d %d %d", executable, pipe, port, type, length);
 	STARTUPINFOA startup = { sizeof(startup) };
+	startup.dwFlags = STARTF_USESTDHANDLES;
+	startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+	startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+	startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
 	PROCESS_INFORMATION process = { 0 };
-	Require(CreateProcessA(NULL, command, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+	Require(CreateProcessA(NULL, command, NULL, NULL, TRUE, CREATE_NO_WINDOW,
 		NULL, NULL, &startup, &process), "start client");
 	DWORD wait = WaitForSingleObject(process.hProcess, 15000);
 	if (wait != WAIT_OBJECT_0)
@@ -102,7 +107,20 @@ static void RunClient(const char* pipe, int port, int type, int length)
 	GetExitCodeProcess(process.hProcess, &code);
 	CloseHandle(process.hThread);
 	CloseHandle(process.hProcess);
+	if (code) fprintf(stderr, "client exit=0x%08lx wait=%lu\n", code, wait);
 	Require(wait == WAIT_OBJECT_0 && code == 0, "client completed");
+}
+
+static void CheckCachedExtensions(__CONNECTEX connectEx, __WSASENDMSG sendMsg)
+{
+	static int connectError = -1, sendError = -1;
+	Require(!connectEx(INVALID_SOCKET, NULL, 0, NULL, 0, NULL, NULL), "cached ConnectEx result");
+	if (connectError == -1) connectError = WSAGetLastError();
+	Require(WSAGetLastError() == connectError, "cached ConnectEx native error");
+	Require(sendMsg(INVALID_SOCKET, NULL, 0, NULL, NULL, NULL) == SOCKET_ERROR,
+		"cached WSASendMsg result");
+	if (sendError == -1) sendError = WSAGetLastError();
+	Require(WSAGetLastError() == sendError, "cached WSASendMsg native error");
 }
 
 int main(int argc, char** argv)
@@ -112,9 +130,29 @@ int main(int argc, char** argv)
 	{
 		WSADATA wsa;
 		Require(WSAStartup(MAKEWORD(2, 2), &wsa) == 0, "client WSAStartup");
-		Require(gp_HookWinsock(argv[2]), "client hook");
-		Transfer(atoi(argv[4]), atoi(argv[3]), atoi(argv[5]));
-		Require(gp_UnhookWinsock(), "client unhook");
+		__CONNECTEX cachedConnectEx = NULL;
+		__WSASENDMSG cachedSendMsg = NULL;
+		for (int cycle = -1; cycle < 3; ++cycle)
+		{
+			if (cycle >= 0) Require(gp_HookWinsock(argv[2]), "client hook/re-hook");
+			SOCKET tcp = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+			SOCKET udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+			GUID connectGuid = WSAID_CONNECTEX;
+			GUID sendGuid = WSAID_WSASENDMSG;
+			DWORD bytes = 0;
+			Require(WSAIoctl(tcp, SIO_GET_EXTENSION_FUNCTION_POINTER, &connectGuid,
+				sizeof(connectGuid), &cachedConnectEx, sizeof(cachedConnectEx), &bytes, NULL, NULL) == 0,
+				"query hooked ConnectEx");
+			Require(WSAIoctl(udp, SIO_GET_EXTENSION_FUNCTION_POINTER, &sendGuid,
+				sizeof(sendGuid), &cachedSendMsg, sizeof(cachedSendMsg), &bytes, NULL, NULL) == 0,
+				"query hooked WSASendMsg");
+			closesocket(tcp); closesocket(udp);
+			CheckCachedExtensions(cachedConnectEx, cachedSendMsg);
+			if (cycle < 0) continue; // Capture the native provider's validation errors.
+			if (cycle == 0) Transfer(atoi(argv[4]), atoi(argv[3]), atoi(argv[5]));
+			Require(gp_UnhookWinsock(), "client unhook");
+			CheckCachedExtensions(cachedConnectEx, cachedSendMsg);
+		}
 		WSACleanup();
 		return 0;
 	}

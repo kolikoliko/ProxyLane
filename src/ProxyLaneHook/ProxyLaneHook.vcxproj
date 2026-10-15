@@ -135,8 +135,6 @@
       <DataExecutionPrevention />
       <ImportLibrary>$(OutDir)$(TargetName).lib</ImportLibrary>
       <TargetMachine>MachineX86</TargetMachine>
-      <AdditionalDependencies>inlineHook_x86D.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>../lib</AdditionalLibraryDirectories>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
     </Link>
     <Bscmake>
@@ -187,8 +185,6 @@
       <DataExecutionPrevention>
       </DataExecutionPrevention>
       <ImportLibrary>$(OutDir)$(TargetName).lib</ImportLibrary>
-      <AdditionalLibraryDirectories>../lib</AdditionalLibraryDirectories>
-      <AdditionalDependencies>inlineHook_x64D.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
     </Link>
     <Bscmake>
@@ -240,8 +236,6 @@
       <ImportLibrary>$(OutDir)$(TargetName).lib</ImportLibrary>
       <TargetMachine>MachineX86</TargetMachine>
       <GenerateMapFile>false</GenerateMapFile>
-      <AdditionalDependencies>inlineHook_x86.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>../lib</AdditionalLibraryDirectories>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
     </Link>
@@ -294,8 +288,6 @@
       </DataExecutionPrevention>
       <ImportLibrary>$(OutDir)$(TargetName).lib</ImportLibrary>
       <GenerateMapFile>false</GenerateMapFile>
-      <AdditionalDependencies>inlineHook_x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>../lib</AdditionalLibraryDirectories>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
     </Link>
@@ -312,6 +304,8 @@
   <ItemGroup>
 	<ClCompile Include="ElevatedLauncher.cpp" />
     <ClCompile Include="GlobalProxy.cpp" />
+    <ClCompile Include="HookCallGate.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
+    <ClCompile Include="DetourHooks.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
     <ClCompile Include="AppContainerPipeAccess.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
@@ -363,7 +357,9 @@
     <ClInclude Include="AppContainerPipeAccess.h" />
     <ClInclude Include="HookWinsock.h" />
     <ClInclude Include="InjectDll.h" />
-    <ClInclude Include="inlinehook.h" />
+    <ClInclude Include="HookDispatch.h" />
+    <ClInclude Include="HookCallGate.h" />
+    <ClInclude Include="DetourHooks.h" />
     <ClInclude Include="MySocket.h" />
     <ClInclude Include="PRCPipeClient.h" />
     <ClInclude Include="PRCPipeServer.h" />
@@ -407,6 +403,7 @@
   <ItemGroup>
     <ResourceCompile Include="ProxyLaneHook.rc" />
   </ItemGroup>
+  <Import Project="..\..\third_party\detours\Detours.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
