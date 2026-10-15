@@ -17,8 +17,11 @@ int ProcessActionsTestsMain();
 int ScopedProcessSuspensionTestsMain();
 int TrafficStatisticsTestsMain();
 
+int DetourHooksTestsMain();
+
 int main()
 {
+	if (DetourHooksTestsMain() != 0) return 1;
 	if (TrafficStatisticsTestsMain() != 0)
 		return 1;
 	if (Socks5UdpCodecTestsMain() != 0)

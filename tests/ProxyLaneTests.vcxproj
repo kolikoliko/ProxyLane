@@ -37,6 +37,9 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="ProxyLaneTestsMain.cpp" />
+    <ClCompile Include="DetourHooksTests.cpp" />
+    <ClCompile Include="..\src\ProxyLaneHook\DetourHooks.cpp" />
+    <ClCompile Include="..\src\ProxyLaneHook\HookCallGate.cpp" />
     <ClCompile Include="TrafficStatisticsTests.cpp" />
     <ClCompile Include="ProcessActionsTests.cpp" />
     <ClCompile Include="ScopedProcessSuspensionTests.cpp" />
@@ -56,5 +59,6 @@
 	<ClCompile Include="DeferredMitigationPolicyTests.cpp"><PreprocessorDefinitions>main=DeferredMitigationPolicyTestsMain;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
     <ClCompile Include="..\src\ProxyLaneHook\Socks5UdpCodec.cpp" />
   </ItemGroup>
+  <Import Project="..\third_party\detours\Detours.props" />
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
