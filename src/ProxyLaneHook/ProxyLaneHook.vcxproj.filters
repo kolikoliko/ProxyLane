@@ -46,6 +46,12 @@
     <ClCompile Include="PRCTcpPeer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="MitmBridge.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ProxyMonitor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="PRCTcpServer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -136,6 +142,15 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PRCTcpPeer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MitmBridge.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="MitmControl.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ProxyMonitor.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="PRCTcpServer.h">

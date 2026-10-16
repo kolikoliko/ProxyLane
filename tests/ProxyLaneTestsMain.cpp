@@ -3,6 +3,7 @@
 
 int Socks5UdpCodecTestsMain();
 int BoundedLogQueueTestsMain();
+int MonitorLogFormatTestsMain();
 int UdpAssociationPolicyTestsMain();
 int UdpPayloadPolicyTestsMain();
 int DnsRedirectPolicyTestsMain();
@@ -24,6 +25,7 @@ int DetourHooksTestCase(const char* name);
 
 int main(int argc, char** argv)
 {
+    if (MonitorLogFormatTestsMain() != 0) return 1;
 	if (argc == 3 && std::strcmp(argv[1], "--detours-case") == 0)
 		return DetourHooksTestCase(argv[2]);
 	if (DetourHooksTestsMain() != 0) return 1;

@@ -10,6 +10,7 @@
 #include "ProxyReceptionCentre.h"
 #include "ProxyDataHandle.h"
 #include "ProxyTransportPolicy.h"
+#include "MitmBridge.h"
 
 CPRCTcpPeer::CPRCTcpPeer(CTcpProxyTask *pNotify)
 {
@@ -240,6 +241,7 @@ void CPRCTcpPeer::ClearBuffer()
 
 void CPRCTcpPeer::OnReceive(int nErrorCode)
 {
+	if (m_pNotify->m_pMitm) { m_pNotify->m_pMitm->OnRead(this, nErrorCode); return; }
 	const int MAX_EVENT_READ_BYTES = MAXTCPBUFSIZE * 16;
 	if(nErrorCode != 0)
 	{
@@ -411,6 +413,12 @@ int CPRCTcpPeer::TransferSend()
 
 void CPRCTcpPeer::OnSend(int nErrorCode)
 {
+	if (m_pNotify->m_pMitm)
+	{
+		if (nErrorCode) OnClose(nErrorCode);
+		else m_pNotify->m_pMitm->OnWritable();
+		return;
+	}
 	if(nErrorCode != 0)
 	{
 		return;
@@ -495,6 +503,13 @@ void CPRCTcpPeer::OnConnect(int nErrorCode)
 	m_bForwardingReady = TRUE;
 	//代理已经建立，修改Client关注的event
 	m_pPartner->AsyncSelect(FD_READ | FD_WRITE | FD_CLOSE);
+	if (m_pNotify->m_pMitm)
+	{
+		m_pNotify->m_pMitm->OnWritable();
+		TriggerEvent(FD_READ);
+		m_pPartner->TriggerEvent(FD_READ);
+		return;
+	}
 	// The application may have written and half-closed while the proxy
 	// handshake was still in progress. Flush that buffered payload before
 	// propagating its FIN to the newly established upstream connection.
@@ -515,6 +530,11 @@ void CPRCTcpPeer::OnConnect(int nErrorCode)
 
 void CPRCTcpPeer::OnClose(int nErrorCode)
 {
+	if (m_pNotify->m_pMitm && nErrorCode == 0)
+	{
+		m_pNotify->m_pMitm->OnRead(this, 0);
+		return;
+	}
 	m_bConnShutted = TRUE;
 	if( nErrorCode == 0 )
 	{
@@ -602,6 +622,11 @@ void CPRCTcpPeer::TryFinishConnection()
 
 void CPRCTcpPeer::OnTimer()
 {
+	if (m_pNotify->m_pMitm && (m_bForwardingReady || !m_pProxyLayer))
+	{
+		m_pNotify->m_pMitm->OnWritable();
+		return;
+	}
 
 	switch(m_SocketStatus)
 	{

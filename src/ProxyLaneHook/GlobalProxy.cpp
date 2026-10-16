@@ -10,6 +10,11 @@
 #include "ProxySettings.h"
 #include "ProxyLog.h"
 #include "ProxyTesterMgr.h"
+#include "MitmControl.h"
+#include "ProxyMonitor.h"
+
+IProxyTlsControl* CGlobalProxy::GetTlsControl() { return &CMitmControl::Instance(); }
+IProxyMonitor* CGlobalProxy::GetMonitorInstance() { return &CProxyMonitor::Instance(); }
 
 CGlobalProxy::CGlobalProxy(void)
 {

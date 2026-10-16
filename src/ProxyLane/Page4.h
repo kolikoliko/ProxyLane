@@ -1,59 +1,55 @@
-﻿#pragma once
-
-#include "..\ProxyLaneHook\ProxyModule.h"
-#include <list>
-#include "afxwin.h"
+#pragma once
+#include "../ProxyLaneHook/ProxyModule.h"
 #include "ModernUI.h"
+#include "MonitorLogFormat.h"
+#include <deque>
+#include <memory>
+#include <vector>
 
-using namespace std;
-// CPage4 对话框
-
+struct MitmJob;
 class CPage4 : public CModernDialog
-	, public IProxyDataHandle
 {
-	DECLARE_DYNAMIC(CPage4)
-
+    DECLARE_DYNAMIC(CPage4)
 public:
-	CPage4(CWnd* pParent = NULL);   // 标准构造函数
-	virtual ~CPage4();
-
-	////重载IProxyDataHandle
-	void OnConnect(LPProxyPacketInfo lpppi);
-	void OnEachPacket(LPProxyPacketInfo lpppi);
-	void OnClose(LPProxyPacketInfo lpppi);
-	void OnLayerCallback(LPProxyPacketInfo lpppi, int nType, int nCode, WPARAM wParam, LPARAM lParam);
-	void PrintText(LPCTSTR lpsz);
-	void UpdateMonitorStatus();
-
-public:
-	CEdit m_Edit;
-	CButton m_btnMonitor;
-	CButton m_btnHex;
-	CModernButton m_btnClear;
-
-	BOOL m_bAttachedPDH;
-	list<CString> m_textls;
-	enum{
-		ShowFMT_RAW,
-		ShowFMT_HEX,
-	};
-	int m_ShowFMT;
-	CFont m_font;
-
-// 对话框数据
-	enum { IDD = IDD_Page4 };
-
+    CPage4(CWnd* parent = NULL);
+    virtual ~CPage4();
+    enum { IDD = IDD_Page4 };
+    void UpdateMonitorStatus();
 protected:
-	virtual void DoDataExchange(CDataExchange* pDX);    // DDX/DDV 支持
-	virtual BOOL OnInitDialog();
-
-	DECLARE_MESSAGE_MAP()
-public:
-	afx_msg void OnSize(UINT nType, int cx, int cy);
-	afx_msg BOOL OnEraseBkgnd(CDC* pDC);
-
-	afx_msg void OnBnClickedCheck1();
-	afx_msg void OnBnClickedCheckHex();
-	afx_msg void OnTimer(UINT_PTR nIDEvent);
-	afx_msg void OnBnClickedBtnClear();
+    virtual void DoDataExchange(CDataExchange* dx);
+    virtual BOOL OnInitDialog();
+    afx_msg void OnSize(UINT type, int cx, int cy);
+    afx_msg void OnTimer(UINT_PTR id);
+    afx_msg void OnMonitor();
+    afx_msg void OnView();
+    afx_msg void OnClear();
+    afx_msg void OnCA();
+    afx_msg void OnDecrypt();
+    DECLARE_MESSAGE_MAP()
+private:
+    void LayoutControls(int cx, int cy);
+    struct Record {
+        CString header;
+        DWORD kind, length;
+        std::vector<BYTE> preview;
+    };
+    Record MakeRecord(const ProxyMonitorEvent& event);
+    CString FormatRecord(const Record& record) const;
+    void AppendText(const CString& text);
+    void BeginReplay();
+    void SetDecryptStatus();
+    void OpenCA(bool enableAfterClose);
+    void StartDecryption();
+    CEdit m_edit;
+    CButton m_monitor, m_hex, m_decrypt;
+    CModernButton m_clear, m_ca;
+    CFont m_font;
+    IProxyTlsControl* m_tls;
+    IProxyMonitor* m_dataMonitor;
+    bool m_recording;
+    std::deque<Record> m_history;
+    ULONGLONG m_dropped, m_truncated, m_evicted;
+    bool m_needsReplay, m_replaying;
+    size_t m_replayIndex;
+    std::shared_ptr<MitmJob> m_job;
 };

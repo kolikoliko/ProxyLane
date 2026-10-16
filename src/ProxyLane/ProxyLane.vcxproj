@@ -239,7 +239,9 @@
       </Command>
     </PostBuildEvent>
     <PostBuildEvent>
-      <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(SolutionDir)build-secure-transport.bat</Command>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">call "$(SolutionDir)build-secure-transport.bat"
+if errorlevel 1 exit /b %errorlevel%
+powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)..\scripts\build-mitm.ps1"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -289,6 +291,7 @@
     <ClInclude Include="Page2.h" />
     <ClInclude Include="Page3.h" />
     <ClInclude Include="Page4.h" />
+    <ClInclude Include="MonitorLogFormat.h" />
     <ClInclude Include="Page5.h" />
 	<ClInclude Include="ProfileCommandBroker.h" />
     <ClInclude Include="ProxyLane.h" />

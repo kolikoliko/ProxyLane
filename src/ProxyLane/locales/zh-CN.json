@@ -150,7 +150,6 @@
   "page3.partial_failure": "部分进程代理失败",
   "page3.completed": "操作完成",
   "page4.title": "数据监视",
-  "page4.subtitle": "查看经过代理的连接与数据内容；开启监视会增加额外开销",
   "page4.monitor": "开始监视",
   "page4.hex": "HEX 显示",
   "page4.connections_zero": "TCP 连接: 0    UDP 连接: 0",
@@ -261,5 +260,19 @@
   "dialog.drop_launch_failed": "无法启动拖入的程序，请检查文件状态和运行权限。",
   "dialog.drop_failed_title": "无法启动并代理",
   "automation.command_line_help_title": "ProxyLane 命令行帮助",
-  "automation.command_line_help": "用法\r\n\r\n启动并透明代理一个程序：\r\nProxyLane.exe --auto --profile <配置名称> --run <程序路径> [-- <程序参数...>]\r\n\r\n显示此帮助：\r\nProxyLane.exe /?\r\n\r\n参数\r\n--auto       使用命令行自动启动模式。\r\n--profile    指定已保存的配置名称。\r\n--run        指定要启动并代理的程序。\r\n--           后面的内容作为目标程序参数。\r\n/?, -?, --help    显示此帮助。\r\n\r\n示例\r\nProxyLane.exe --auto --profile \"Test\" --run \"C:\\Tools\\app.exe\" -- -arg value\r\n\r\n如果同一安装目录、用户会话和配置已有运行实例，命令会复用该实例。"
+  "automation.command_line_help": "用法\r\n\r\n启动并透明代理一个程序：\r\nProxyLane.exe --auto --profile <配置名称> --run <程序路径> [-- <程序参数...>]\r\n\r\n显示此帮助：\r\nProxyLane.exe /?\r\n\r\n参数\r\n--auto       使用命令行自动启动模式。\r\n--profile    指定已保存的配置名称。\r\n--run        指定要启动并代理的程序。\r\n--           后面的内容作为目标程序参数。\r\n/?, -?, --help    显示此帮助。\r\n\r\n示例\r\nProxyLane.exe --auto --profile \"Test\" --run \"C:\\Tools\\app.exe\" -- -arg value\r\n\r\n如果同一安装目录、用户会话和配置已有运行实例，命令会复用该实例。",
+  "mitm.ca": "CA 管理",
+  "mitm.enable": "解密 HTTPS",
+  "mitm.busy": "正在准备 CA / TLS，请稍候…",
+  "mitm.failed": "操作失败，请查看详细信息。",
+  "mitm.install": "安装到当前用户",
+  "mitm.remove": "移除信任",
+  "mitm.refresh": "刷新",
+  "mitm.close": "关闭",
+  "mitm.trusted": "CA 已初始化 · 当前用户已信任",
+  "mitm.untrusted": "解密 HTTPS 需要将 CA 证书安装到当前系统用户。请点击“安装到当前用户”。",
+  "mitm.uninitialized": "解密 HTTPS 需要将 CA 证书安装到当前系统用户。点击“安装到当前用户”即可自动初始化并安装。",
+  "mitm.enable_failed": "无法开启 HTTPS 解密，请检查下方错误。",
+  "monitor.preparing": "HTTPS 解密（准备中…）",
+  "monitor.limits": " · 丢弃 %I64u / 截断 %I64u / 淘汰 %I64u"
 }

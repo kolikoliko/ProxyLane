@@ -1,5 +1,114 @@
 # ProxyLane end-to-end test tools
 
+## Desktop startup regression
+
+After building both Release platforms, run on an unlocked desktop:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests/run-startup-smoke.ps1
+```
+
+This launches the real main dialog twice through each entry executable and
+checks that it remains responsive for 10 seconds. On 64-bit Windows the Win32
+launcher is verified through its exact x64 child. Use `-BinaryDirectory` with
+an isolated copy of the release and sample INI to avoid using personal profiles.
+The test starts no proxy and changes no certificate trust.
+
+This catches initialization recursion such as calling an MFC `OnSize` handler
+directly from `OnInitDialog`: its default handler redispatches the current
+`WM_INITDIALOG`, causing stack overflow before the main window appears.
+Initialization and resize must call a shared layout helper instead.
+
+For monitor page activation, resizing and CA dialog layout (Python + Pillow):
+
+```powershell
+python tests/MonitorLayoutE2ETests.py
+python tests/MonitorLayoutE2ETests.py --language en-US
+python tests/MonitorLayoutE2ETests.py --ca-guidance
+```
+
+This uses an isolated release copy and CA directory, checks actual control
+rectangles after navigation, a parameterless `WM_SIZE`, resize and reactivation,
+and opens the CA status dialog without changing trust. Screenshots and results
+are retained in `build/qa/monitor-layout-*`. A running process alone does not
+count as passing this check: controls must be visible and inside the page.
+
+The optional `--ca-guidance` case installs a unique temporary CA through the GUI
+and removes that exact CA in `finally`. It checks missing CA guidance,
+cancel without installation, direct installation without an initialization button,
+and automatic decryption after installation
+and closing the dialog. Adding `--ca-read-error` deliberately opens an error popup
+for a corrupt test CA file, which is restored before cleanup.
+
+## HTTPS MITM validation
+
+Build both solution Release platforms (x64 Release also builds both MITM DLLs),
+or run `scripts/build-mitm.ps1` to build only the optional TLS components.
+Core tests (no trust-store changes):
+
+```powershell
+cargo test --manifest-path src/ProxyLaneMitm/Cargo.toml --locked
+cargo clippy --manifest-path src/ProxyLaneMitm/Cargo.toml --locked --all-targets -- -D warnings
+```
+
+Compile `mitm_host.cpp` in an x64 Visual Studio developer prompt:
+
+```bat
+cl /nologo /EHsc /O2 /DUNICODE /D_UNICODE tests\e2e\mitm_host.cpp /Fo:build\qa\mitm_host64.obj /Fe:bin\mitm_host64.exe /link /LIBPATH:bin\x64\Release ProxyLaneHook.lib ws2_32.lib user32.lib
+```
+
+For Win32 use an x86 developer prompt, output `mitm_host32.exe` and link
+`bin\Win32\Release\ProxyLaneHook.lib` (also use a different `/Fo` path).
+Then run with Python 3 and `cryptography` installed:
+
+```powershell
+python tests/e2e/mitm_e2e.py --arch 64
+python tests/e2e/mitm_e2e.py --arch 32
+```
+
+The test creates a unique CA in `build/qa/mitm-<id>/pki`, installs that exact
+CA in CurrentUser ROOT, and removes it in `finally`. It does not change existing
+proxy profiles, other certificates, or revocation caches. If the test is forcibly
+killed, set `PROXYLANE_MITM_HOME` to the printed test directory's `pki` subdirectory
+and run `bin/ProxyLaneMitm64.exe remove` to remove that test CA.
+
+The test controller removes any inherited ProxyLane hooks **inside its own
+process** before creating threads and children, so an already-running developer
+proxy does not redirect the test. It leaves that developer proxy running.
+The test host explicitly injects the matching Hook DLL into Windows curl.
+By default all origins and proxy relays are local; TEST-NET addresses are mapped
+to them. Optional `--external-ifconfig` reproduces a live HTTPS request to
+ifconfig.io through the test relay and records shutdown diagnostics.
+
+Cases cover certificate persistence and idempotent installation/removal,
+Schannel TLS 1.2 with normal revocation checking through SOCKS5 and HTTP CONNECT,
+plain TCP, 2 MiB bidirectional payload integrity, rejection of a mismatched
+upstream identity, and process-associated plaintext records. The x64 run also
+injects a Python/OpenSSL TLS 1.3 client for systems without Schannel TLS 1.3.
+Rust tests additionally exercise byte-at-a-time ClientHello and short writes,
+ALPN agreement, bounded buffers, malformed TLS, and half-close behavior.
+Tests also check that TLS ciphertext/handshake JSON never enters the simple
+monitor, plain TCP remains visible, clean shutdown has no error, and missing
+close_notify reports its endpoint once. Abrupt close after a complete response
+is distinguished from a truncated HTTP response, which must fail at the client.
+CA tests verify the new name and identity-preserving directory migration.
+
+The host uses the same object interfaces as the GUI: CA status/init/install/remove,
+enable preflight and live event polling through `IGlobalProxy`. The environment enable flag is off.
+Tests reject enabling before CA trust, verify request/response plaintext with
+the injected PID, creation time and connection ID, disable decryption during an
+established TLS stream without interrupting it, and verify new connections pass
+through after disabling. Both TLS versions also check observer byte integrity
+in the Rust tests, including an unusable capture path. End-to-end tests assert
+that default sessions never create a `captures` directory while still delivering
+process-associated plaintext to the memory observer. Temporary CA removal is
+checked after every run.
+
+Manual GUI check: open Data monitoring, enable HTTPS decryption, install the CA
+when prompted, and reconnect an injected application. Verify plaintext-only
+TLS records, raw records for ordinary connections, HEX view, pause, clear, and CA removal. These interactive
+checks are separate from the backend API tests.
+
 These small Go and Python programs provide controlled endpoints for testing the
 real injected Windows binaries. They intentionally use TEST-NET-3 addresses
 (`203.0.113.0/24`) and `.test` names; the local proxy servers map those targets
@@ -138,6 +247,28 @@ This covers the startup-context regression where a newly created x86 CLR
 process receives `_CorExeMain` in EAX during loader initialization, but the
 injection trampoline used to overwrite it with the pre-initialization
 snapshot on return from `remoteCode`.
+
+## Simple data monitoring under load
+
+After building Release for both platforms, run:
+
+```powershell
+python tests/MonitorLayoutE2ETests.py --binary-directory bin
+python tests/MonitorLayoutE2ETests.py --binary-directory bin --language en-US
+python tests/MonitorTrafficE2ETests.py --binary-directory bin
+```
+
+The traffic test launches a disposable GUI with a unique profile and transfers
+128 MiB through an injected child and a local SOCKS5 relay. It verifies complete
+delivery by SHA-256 while HEX logging stays below 128 Ki characters, private
+memory growth stays below 48 MiB, and window message latency stays below one
+second. It also checks tail following, hidden-page replay, HEX switching and
+clearing. Screenshots and measurements remain in `build/qa/monitor-traffic-*`.
+No user profiles or CA trust are changed. `mitm_host32.exe monitor-queue` and
+`mitm_host64.exe monitor-queue` test queue overflow order, clear, and pause.
+The queue checks also cover capture through the existing data-handler interface
+without GUI callbacks, and service lifetime across proxy owner recreation.
+The ordinary native tests cover HEX byte formatting and text budget boundaries.
 
 ## Alternate-user process creation
 

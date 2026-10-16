@@ -1,12 +1,16 @@
 [CmdletBinding()]
 param(
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+    [string]$BinaryDirectory = 'bin'
 )
 
 $ErrorActionPreference = 'Stop'
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$binaryDirectory = Join-Path $repositoryRoot 'bin'
+if (-not [System.IO.Path]::IsPathRooted($BinaryDirectory)) {
+    $BinaryDirectory = Join-Path $repositoryRoot $BinaryDirectory
+}
+$binaryDirectory = [System.IO.Path]::GetFullPath($BinaryDirectory)
 $exampleConfig = Join-Path $repositoryRoot 'examples\ProxyLane.ini'
 
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
@@ -24,6 +28,10 @@ $packageFiles = @(
     @{ Source = (Join-Path $binaryDirectory 'ProxyLaneHook64.dll'); Entry = 'ProxyLaneHook64.dll'; Versioned = $true },
     @{ Source = (Join-Path $binaryDirectory 'ProxyLaneSecureTransport32.dll'); Entry = 'ProxyLaneSecureTransport32.dll'; Versioned = $false },
     @{ Source = (Join-Path $binaryDirectory 'ProxyLaneSecureTransport64.dll'); Entry = 'ProxyLaneSecureTransport64.dll'; Versioned = $false },
+    @{ Source = (Join-Path $binaryDirectory 'ProxyLaneMitm32.dll'); Entry = 'ProxyLaneMitm32.dll'; Versioned = $false },
+    @{ Source = (Join-Path $binaryDirectory 'ProxyLaneMitm64.dll'); Entry = 'ProxyLaneMitm64.dll'; Versioned = $false },
+    @{ Source = (Join-Path $binaryDirectory 'ProxyLaneMitm32.exe'); Entry = 'ProxyLaneMitm32.exe'; Versioned = $false },
+    @{ Source = (Join-Path $binaryDirectory 'ProxyLaneMitm64.exe'); Entry = 'ProxyLaneMitm64.exe'; Versioned = $false },
     @{ Source = $exampleConfig;                                     Entry = 'ProxyLane.ini';       Versioned = $false },
     @{ Source = (Join-Path $repositoryRoot 'LICENSE');              Entry = 'LICENSE';             Versioned = $false },
     @{ Source = (Join-Path $repositoryRoot 'third_party\detours\LICENSE.md'); Entry = 'LICENSE-Detours.txt'; Versioned = $false },

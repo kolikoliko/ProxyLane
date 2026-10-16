@@ -245,7 +245,7 @@ void Localization::ApplyDialog(CWnd* dialog, UINT dialogId)
 		{ IDC_SELECT_APP, _T("apps.select") }, { IDC_TERMINATE_PROCESS, _T("action.end_process") }
 	};
 	static const ControlTranslation page4[] = {
-		{ IDC_STATIC_PAGE_TITLE, _T("page4.title") }, { IDC_STATIC_PAGE_SUBTITLE, _T("page4.subtitle") },
+		{ IDC_STATIC_PAGE_TITLE, _T("page4.title") },
 		{ IDC_CHECK1, _T("page4.monitor") }, { IDC_CHECK_HEX, _T("page4.hex") },
 		{ IDC_BTN_CLEAR, _T("action.clear") }, { IDC_STATIC_TASKCOUNT, _T("page4.connections_zero") }
 	};

@@ -91,6 +91,18 @@ After changing translations, validate the catalogs and embedded resources with:
 powershell -ExecutionPolicy Bypass -File .\scripts\check-locales.ps1
 ```
 
+## HTTPS Inspection and Data Monitoring (Experimental)
+
+ProxyLane lets you inspect HTTPS requests and responses from selected processes for development and debugging. Applications do not need to use the system proxy, and TLS connections on ports other than 443 are supported. Data Monitor identifies the process, destination, and traffic direction, with text and HEX views.
+
+1. Open **Data Monitor** and enable **Decrypt HTTPS**.
+2. On first use, choose **Trust for this user** in **CA management**, then close the dialog to enable decryption.
+3. Start the proxy, select the target process, and have the application establish new connections to view decrypted traffic.
+
+Decrypted connections show plaintext; other connections show raw data. Monitoring keeps recent data in memory without automatically saving traffic files. You can pause or clear the monitor and remove certificate trust through CA management.
+
+This is a simple data viewer; structured protocol analysis is not yet available. Some applications with their own certificate checks may reject decryption. QUIC/HTTP3 is not supported yet.
+
 ## Packaging a Release
 
 Build the Win32 and x64 Release configurations, then run the following command from the repository root:
@@ -99,7 +111,7 @@ Build the Win32 and x64 Release configurations, then run the following command f
 powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 ```
 
-The script reads version information from the application and Hook binaries, verifies that they have the same version, and creates `dist/ProxyLane-version-Windows.zip`. The archive contains the Win32 and x64 applications, matching Hook DLLs, both secure-transport DLLs, the sample configuration, and both README files.
+The script reads version information from the application and Hook binaries, verifies that they have the same version, and creates `dist/ProxyLane-version-Windows.zip`. The archive contains the Win32 and x64 applications, matching Hook DLLs, both secure-transport DLLs, both MITM DLLs and CA command-line tools, the sample configuration, and both README files.
 
 The sample configuration is stored at `examples/ProxyLane.ini` and is copied to the package root as `ProxyLane.ini`.
 

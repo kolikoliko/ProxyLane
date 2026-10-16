@@ -13,6 +13,7 @@ class CProxyDataHandle;
 class CPRCTcpPeer
 	: public CAsyncSocketEx
 {
+	friend class CMitmBridge;
 
 #define MAXTCPBUFSIZE 1024*4
 

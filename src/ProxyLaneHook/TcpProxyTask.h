@@ -4,10 +4,12 @@
 
 class CProxyTCPTaskMgr;
 class CPRCTcpPeer;
+class CMitmBridge;
 
 class CTcpProxyTask
 {
 	friend CProxyTCPTaskMgr;
+	friend CMitmBridge;
 public:
 	CTcpProxyTask(CProxyTCPTaskMgr *pTaskmgr);
 	~CTcpProxyTask(void);
@@ -23,6 +25,7 @@ public:
 public:
 	PRCClient m_PRCClient;
 	ProxyInfo m_ProxyInfo;
+	CMitmBridge* m_pMitm;
 
 private:
 	CPRCTcpPeer *m_pClient;

@@ -7,6 +7,7 @@
 #include "TcpProxyTask.h"
 #include "ProxyTaskMgr.h"
 #include "PRCTcpPeer.h"
+#include "MitmBridge.h"
 
 CTcpProxyTask::CTcpProxyTask(CProxyTCPTaskMgr *pTaskmgr)
 {
@@ -15,6 +16,7 @@ CTcpProxyTask::CTcpProxyTask(CProxyTCPTaskMgr *pTaskmgr)
 	m_pClient = NULL;
 	m_pServer = NULL;
 	m_bDeletePending = FALSE;
+	m_pMitm = NULL;
 }
 
 CTcpProxyTask::~CTcpProxyTask(void)
@@ -62,6 +64,15 @@ BOOL CTcpProxyTask::SetTaskInfo(SOCKET sClient, LPPRCClient lpPRCClient, LPProxy
 		m_ProxyInfo = *lpProxyInfo;
 		m_pClient->SetPartner(m_pServer);
 		m_pServer->SetPartner(m_pClient);
+		if (CMitmBridge::Enabled())
+		{
+			m_pMitm = new CMitmBridge(this);
+			if (!m_pMitm->Initialize())
+			{
+				WSASetLastError(WSAEPROTONOSUPPORT);
+				break;
+			}
+		}
 
 		int socketbufsize=1024*16;
 		m_pServer->SetSockOpt(SO_SNDBUF, &socketbufsize,sizeof(socketbufsize));
@@ -82,6 +93,8 @@ BOOL CTcpProxyTask::SetTaskInfo(SOCKET sClient, LPPRCClient lpPRCClient, LPProxy
 	} while(FALSE);
 
 	const int error = WSAGetLastError();
+	delete m_pMitm;
+	m_pMitm = NULL;
 	delete m_pClient;
 	delete m_pServer;
 	m_pClient = NULL;
@@ -107,6 +120,8 @@ VOID CTcpProxyTask::OnPeerClosed(CPRCTcpPeer *pPeer)
 
 VOID CTcpProxyTask::EndTask()
 {
+	delete m_pMitm;
+	m_pMitm = NULL;
 	if(m_pClient)
 	{
 		m_pClient->Close();

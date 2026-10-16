@@ -101,6 +101,18 @@
 #define IDC_RECENT_LIST                 1082
 #define IDC_RECENT_TITLE                1083
 #define IDC_RECENT_EMPTY                1084
+#define IDD_MITM_CA 135
+#define IDC_MITM_ENABLE 1085
+#define IDC_MITM_CA 1086
+#define IDC_MITM_STATUS 1087
+#define IDC_MITM_VIEW 1088
+#define IDC_MITM_PROCESS 1089
+#define IDC_MITM_CONNECTION 1090
+#define IDC_CA_DETAILS 1091
+#define IDC_CA_INSTALL 1093
+#define IDC_CA_REMOVE 1094
+#define IDC_CA_REFRESH 1095
+#define IDC_CA_HINT 1096
 
 // Next default values for new objects
 // 
@@ -108,7 +120,7 @@
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        202
 #define _APS_NEXT_COMMAND_VALUE         32771
-#define _APS_NEXT_CONTROL_VALUE         1085
+#define _APS_NEXT_CONTROL_VALUE         1097
 #define _APS_NEXT_SYMED_VALUE           101
 #endif
 #endif

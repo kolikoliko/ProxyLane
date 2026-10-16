@@ -1,413 +1,376 @@
-﻿// Page2.cpp : 实现文件
-//
-
 #include "stdafx.h"
 #include "ProxyLane.h"
 #include "Page4.h"
 #include "Localization.h"
+#include <thread>
+#include <atomic>
+#include <algorithm>
 
-
-#define TMID_TASKCOUNT 1
-
-static CString FormatProxyEndpoint(const _SockAddr &address)
+// Workers own their result, never a window pointer. Closing a dialog cannot
+// leave a callback targeting a destroyed HWND. Release/acquire publishes text.
+struct MitmJob {
+    std::atomic<bool> done;
+    int result;
+    bool needsCA;
+    char text[4096];
+    MitmJob() : done(false), result(-1), needsCA(false) { text[0] = 0; }
+};
+static std::shared_ptr<MitmJob> StartMitmJob(IProxyTlsControl* tls, unsigned action, bool enable = false)
 {
-	CString text;
-	if (address.IsIPv6())
-	{
-		TCHAR addressText[INET6_ADDRSTRLEN] = { 0 };
-#ifdef _UNICODE
-		ProxyInetNtopW(AF_INET6, (PVOID)address.GetAddr6(), addressText,
-			_countof(addressText));
-#else
-		ProxyInetNtopA(AF_INET6, (PVOID)address.GetAddr6(), addressText,
-			_countof(addressText));
-#endif
-		text.Format(_T("[%s]:%d"), addressText, address.GetPort());
-	}
-	else
-	{
-		DWORD ip = address.GetdwIP();
-		const BYTE *bytes = reinterpret_cast<const BYTE *>(&ip);
-		text.Format(_T("%u.%u.%u.%u:%d"), bytes[0], bytes[1], bytes[2],
-			bytes[3], address.GetPort());
-	}
-	return text;
+    auto job = std::make_shared<MitmJob>();
+    try {
+        std::thread([job, tls, action, enable]() {
+            if (enable) {
+                // Missing/untrusted CA is an onboarding state, not an error.
+                // Query structured flags; never classify failures by their text.
+                job->result = tls->ManageCA(IProxyTlsControl::QueryCA, job->text, sizeof(job->text));
+                if (job->result >= 0) {
+                    job->needsCA = (job->result & 2) == 0;
+                    if (!job->needsCA)
+                        job->result = tls->SetEnabled(TRUE, job->text, sizeof(job->text)) ? 3 : -1;
+                }
+            } else {
+                job->result = tls->ManageCA(static_cast<IProxyTlsControl::CaAction>(action), job->text, sizeof(job->text));
+            }
+            job->done.store(true);
+        }).detach();
+    } catch (...) {
+        strcpy_s(job->text, "Unable to start CA worker."); job->done.store(true);
+    }
+    return job;
 }
-
-// CPage4 对话框
-
-IMPLEMENT_DYNAMIC(CPage4, CModernDialog)
-
-CPage4::CPage4(CWnd* pParent /*=NULL*/)
-	: CModernDialog(CPage4::IDD, pParent)
+static CString Utf8(const BYTE* bytes, size_t length)
 {
-	m_bAttachedPDH = 0;
+    CString result;
+    if (!length) return result;
+    int count = MultiByteToWideChar(CP_UTF8, 0, (LPCCH)bytes, (int)length, NULL, 0);
+    LPWSTR out = result.GetBuffer(count);
+    MultiByteToWideChar(CP_UTF8, 0, (LPCCH)bytes, (int)length, out, count);
+    // The edit control cannot show embedded NULs. Keep payload length explicit.
+    for (int i = 0; i < count; ++i)
+        if (out[i] < 32 && out[i] != '\r' && out[i] != '\n' && out[i] != '\t') out[i] = L'\x00b7';
+    result.ReleaseBuffer(count);
+    return result;
 }
-
-CPage4::~CPage4()
+static CString Utf8(const char* text) { return Utf8((const BYTE*)text, strlen(text)); }
+static CString Endpoint(const PRCClient& c)
 {
+    CString address;
+    if (c.szDomainName[0]) address = Utf8((const BYTE*)c.szDomainName, strnlen(c.szDomainName, sizeof(c.szDomainName)));
+    else {
+        TCHAR text[64] = {};
+        if (c.dstAddr.IsIPv6()) {
+            ProxyInetNtopW(AF_INET6, (PVOID)c.dstAddr.GetAddr6(), text, _countof(text));
+            address.Format(_T("[%s]"), text);
+        } else {
+            IN_ADDR ip; ip.s_addr = c.dstAddr.GetdwIP();
+            ProxyInetNtopW(AF_INET, &ip, text, _countof(text)); address = text;
+        }
+    }
+    CString out; out.Format(_T("%s:%d"), (LPCTSTR)address, c.dstAddr.GetPort()); return out;
 }
-
-void CPage4::DoDataExchange(CDataExchange* pDX)
-{
-	CDialog::DoDataExchange(pDX);
-	DDX_Control(pDX, IDC_EDIT1, m_Edit);
-
-	DDX_Control(pDX, IDC_CHECK1, m_btnMonitor);
-	DDX_Control(pDX, IDC_CHECK_HEX, m_btnHex);
-	DDX_Control(pDX, IDC_BTN_CLEAR, m_btnClear);
-}
-
-
-BOOL CPage4::OnInitDialog()
-{
-	CModernDialog::OnInitDialog();
-	m_btnClear.SetVisualStyle(CModernButton::STYLE_SECONDARY);
-
-	//
-	m_Edit.SetLimitText(0);
-
-	m_font.CreateFont(
-		14,                        // nHeight
-		0,                        // nWidth
-		0,                        // nEscapement
-		0,                        // nOrientation
-		FW_NORMAL,                // nWeight
-		FALSE,                    // bItalic
-		FALSE,                    // bUnderline
-		0,                        // cStrikeOut
-		ANSI_CHARSET,              // nCharSet
-		OUT_DEFAULT_PRECIS,        // nOutPrecision
-		CLIP_DEFAULT_PRECIS,      // nClipPrecision
-		DEFAULT_QUALITY,          // nQuality
-		FIXED_PITCH|FF_MODERN,
-		_T("Courier New")                    // nPitchAndFamily
-		);              
-
-	m_Edit.SetFont(&m_font);
-
-	m_ShowFMT = m_btnHex.GetCheck()==BST_CHECKED?ShowFMT_HEX:ShowFMT_RAW;
-
-	m_Edit.EmptyUndoBuffer();
-	SetTimer(TMID_TASKCOUNT, 1000, NULL);
-
-	return TRUE;
-}
-
-BEGIN_MESSAGE_MAP(CPage4, CModernDialog)
-	ON_WM_SIZE()
-	//ON_WM_ERASEBKGND()
-
-	ON_BN_CLICKED(IDC_CHECK1, &CPage4::OnBnClickedCheck1)
-	ON_BN_CLICKED(IDC_CHECK_HEX, &CPage4::OnBnClickedCheckHex)
-	ON_WM_TIMER()
-	ON_BN_CLICKED(IDC_BTN_CLEAR, &CPage4::OnBnClickedBtnClear)
+class CMitmCaDialog : public CModernDialog {
+    std::shared_ptr<MitmJob> m_job;
+    CModernButton m_buttons[4];
+    IProxyTlsControl* m_tls;
+    int m_flags;
+public:
+    CMitmCaDialog(CWnd* parent, IProxyTlsControl* tls) : CModernDialog(IDD_MITM_CA, parent), m_tls(tls), m_flags(-1) {}
+    bool IsTrusted() const { return m_flags >= 0 && (m_flags & 2) != 0; }
+    void Start(unsigned action) {
+        for (auto& button : m_buttons) button.EnableWindow(FALSE);
+        SetDlgItemText(IDC_MITM_STATUS, Localization::Get(_T("mitm.busy")));
+        m_job = StartMitmJob(m_tls, action);
+    }
+    BOOL OnInitDialog() override {
+        CModernDialog::OnInitDialog();
+        SetWindowText(Localization::Get(_T("mitm.ca")));
+        const int ids[] = {IDC_CA_INSTALL, IDC_CA_REMOVE, IDC_CA_REFRESH, IDOK};
+        const LPCTSTR keys[] = {_T("mitm.install"), _T("mitm.remove"), _T("mitm.refresh"), _T("mitm.close")};
+        for (int i = 0; i < _countof(ids); ++i) {
+            SetDlgItemText(ids[i], Localization::Get(keys[i]));
+            m_buttons[i].SubclassDlgItem(ids[i], this);
+        }
+        ((CEdit*)GetDlgItem(IDC_CA_DETAILS))->SetLimitText(8192);
+        SetTimer(1, 150, NULL); Start(0); return TRUE;
+    }
+    BOOL OnCommand(WPARAM wParam, LPARAM lParam) override {
+        UINT id = LOWORD(wParam);
+        if (id == IDC_CA_INSTALL || id == IDC_CA_REMOVE || id == IDC_CA_REFRESH) {
+            if (!m_job) Start(id == IDC_CA_INSTALL ? IProxyTlsControl::TrustCA :
+                id == IDC_CA_REMOVE ? IProxyTlsControl::RemoveCATrust : IProxyTlsControl::QueryCA);
+            return TRUE;
+        }
+        return CModernDialog::OnCommand(wParam, lParam);
+    }
+    // Do not allow a trust operation to finish invisibly after dismissing it.
+    void OnOK() override { if (!m_job) CModernDialog::OnOK(); }
+    void OnCancel() override { if (!m_job) CModernDialog::OnCancel(); }
+    afx_msg void OnTimer(UINT_PTR id) {
+        if (m_job && m_job->done.load()) {
+            int flags = m_job->result;
+            m_flags = flags;
+            SetDlgItemText(IDC_CA_DETAILS, Utf8(m_job->text));
+            SetDlgItemText(IDC_MITM_STATUS, Localization::Get(flags < 0 ? _T("mitm.failed") :
+                flags & 2 ? _T("mitm.trusted") : flags & 1 ? _T("mitm.untrusted") : _T("mitm.uninitialized")));
+            m_job.reset();
+            for (auto& button : m_buttons) button.EnableWindow(TRUE);
+            GetDlgItem(IDC_CA_REMOVE)->EnableWindow((flags & 2) && flags >= 0);
+        }
+        CModernDialog::OnTimer(id);
+    }
+    DECLARE_MESSAGE_MAP()
+};
+BEGIN_MESSAGE_MAP(CMitmCaDialog, CModernDialog)
+    ON_WM_TIMER()
 END_MESSAGE_MAP()
 
-
-// CPage4 消息处理程序
-
-void CPage4::OnSize(UINT nType, int cx, int cy)
+IMPLEMENT_DYNAMIC(CPage4, CModernDialog)
+CPage4::CPage4(CWnd* parent) : CModernDialog(IDD, parent), m_tls(nullptr), m_dataMonitor(nullptr),
+    m_recording(false), m_dropped(0), m_truncated(0), m_evicted(0),
+    m_needsReplay(false), m_replaying(false), m_replayIndex(0) {}
+CPage4::~CPage4() { if (m_dataMonitor) m_dataMonitor->SetEnabled(FALSE); }
+void CPage4::DoDataExchange(CDataExchange* dx)
 {
-	CModernDialog::OnSize(nType, cx, cy);
-
-	CRect rc;
-	GetClientRect(rc);
-	if (rc.Width() <= 0 || rc.Height() <= 0)
-		return;
-
-	const int margin = UiTheme::ScaleForWindow(m_hWnd, 8);
-	const int gap = UiTheme::ScaleForWindow(m_hWnd, 8);
-	const int toolbarTop = UiTheme::ScaleForWindow(m_hWnd, 62);
-	const int toolbarHeight = UiTheme::ScaleForWindow(m_hWnd, 24);
-	const int monitorWidth = UiTheme::ScaleForWindow(m_hWnd, 96);
-	const int hexWidth = UiTheme::ScaleForWindow(m_hWnd, 82);
-	const int clearWidth = UiTheme::ScaleForWindow(m_hWnd, 78);
-	const int clearHeight = UiTheme::ScaleForWindow(m_hWnd, 30);
-
-	int x = margin;
-	if (m_btnMonitor.GetSafeHwnd())
-	{
-		m_btnMonitor.MoveWindow(x, toolbarTop, monitorWidth, toolbarHeight);
-		x += monitorWidth + gap;
-	}
-	if (m_btnHex.GetSafeHwnd())
-	{
-		m_btnHex.MoveWindow(x, toolbarTop, hexWidth, toolbarHeight);
-		x += hexWidth + gap;
-	}
-
-	const int clearLeft = rc.right - margin - clearWidth;
-	if (CWnd* taskCount = GetDlgItem(IDC_STATIC_TASKCOUNT))
-	{
-		const int countRight = clearLeft - gap;
-		taskCount->MoveWindow(x, toolbarTop + UiTheme::ScaleForWindow(m_hWnd, 3),
-			max(0, countRight - x), toolbarHeight);
-	}
-
-	if (m_btnClear.GetSafeHwnd())
-	{
-		m_btnClear.MoveWindow(clearLeft,
-			toolbarTop - UiTheme::ScaleForWindow(m_hWnd, 3), clearWidth, clearHeight);
-	}
-
-	if (m_Edit.GetSafeHwnd())
-	{
-		const int editTop = toolbarTop + toolbarHeight + gap;
-		m_Edit.MoveWindow(margin, editTop,
-			rc.right - margin * 2, max(0, rc.bottom - margin - editTop));
-	}
+    CModernDialog::DoDataExchange(dx);
+    DDX_Control(dx, IDC_EDIT1, m_edit); DDX_Control(dx, IDC_CHECK1, m_monitor);
+    DDX_Control(dx, IDC_CHECK_HEX, m_hex); DDX_Control(dx, IDC_BTN_CLEAR, m_clear);
+    DDX_Control(dx, IDC_MITM_ENABLE, m_decrypt); DDX_Control(dx, IDC_MITM_CA, m_ca);
 }
-
-BOOL CPage4::OnEraseBkgnd(CDC* pDC)
+BOOL CPage4::OnInitDialog()
 {
-	// TODO: 在此添加消息处理程序代码和/或调用默认值
-
-	CWnd *pParent = GetParent();
-
-	CRect   rc;   
-	GetClientRect(&rc);   
-	pDC->FillSolidRect(&rc, pParent->GetDC()->GetBkColor());//填充红色
-	return   TRUE;   
-
+    CModernDialog::OnInitDialog();
+    IGlobalProxy* proxy = GetGlobalProxyInstance();
+    m_tls = proxy->GetTlsControl();
+    m_dataMonitor = proxy->GetMonitorInstance();
+    ReleaseGlobalProxyInstance(); // Borrowed services outlive this proxy reference.
+    SetDlgItemText(IDC_MITM_CA, Localization::Get(_T("mitm.ca")));
+    UiTheme::CreateUiFont(m_font, m_hWnd, 9, FW_NORMAL, _T("Consolas"));
+    m_edit.SetFont(&m_font); m_edit.SetLimitText(MonitorLog::TextLimit);
+    SetDecryptStatus(); SetTimer(1, 100, NULL);
+    CRect rect; GetClientRect(rect); LayoutControls(rect.Width(), rect.Height()); return TRUE;
 }
-
-void CPage4::PrintText(LPCTSTR lpsz)
+BEGIN_MESSAGE_MAP(CPage4, CModernDialog)
+    ON_WM_SIZE()
+    ON_WM_TIMER()
+    ON_BN_CLICKED(IDC_CHECK1, &CPage4::OnMonitor)
+    ON_BN_CLICKED(IDC_CHECK_HEX, &CPage4::OnView)
+    ON_BN_CLICKED(IDC_BTN_CLEAR, &CPage4::OnClear)
+    ON_BN_CLICKED(IDC_MITM_ENABLE, &CPage4::OnDecrypt)
+    ON_BN_CLICKED(IDC_MITM_CA, &CPage4::OnCA)
+END_MESSAGE_MAP()
+void CPage4::OnSize(UINT type, int cx, int cy)
 {
-	int nLen= m_Edit.GetWindowTextLength();
-	//m_Edit.SetFocus();
-	m_Edit.SetSel(nLen, nLen);
-	m_Edit.ReplaceSel(lpsz);
+    CModernDialog::OnSize(type, cx, cy);
+    CRect client; GetClientRect(client);
+    LayoutControls(client.Width(), client.Height());
 }
-
-void CPage4::OnConnect(LPProxyPacketInfo lpppi)
+void CPage4::LayoutControls(int cx, int cy)
 {
-	CString szType = lpppi->lpC->sType == SOCK_STREAM ? _T("TCP") : _T("UDP");
-	CString szText;
-	if(lpppi->lpC->IsDNValid())
-	{
-		szText.Format(_T("PID: %d, %s.connect to: %s:%d, state: %s\r\n"), lpppi->lpC->dwPid, szType, (LPCTSTR)(CString)lpppi->lpC->szDomainName, lpppi->lpC->dstAddr.GetPort(), !lpppi->errcode ? _T("success") : _T("failure"));
-	}else
-	{
-		CString endpoint = FormatProxyEndpoint(lpppi->lpC->dstAddr);
-		szText.Format(_T("PID: %d, %s.connect to: %s, state: %s\r\n"),
-			lpppi->lpC->dwPid, szType, (LPCTSTR)endpoint,
-			!lpppi->errcode ? _T("success"):_T("failure"));
-	}
-
-	PrintText(szText);
+    // Shared layout helper: never call an MFC message handler from initialization.
+    if (!m_edit.GetSafeHwnd()) return;
+    auto s = [this](int v) { return UiTheme::ScaleForWindow(m_hWnd, v); };
+    int width = max(0, cx - s(16)), top = s(44), h = s(28);
+    // Size the single toolbar row to its localized labels, keeping actions right-aligned.
+    auto labelWidth = [&](CWnd& control, int padding) {
+        CClientDC dc(&control);
+        CFont* old = dc.SelectObject(control.GetFont());
+        CString text; control.GetWindowText(text);
+        int result = dc.GetTextExtent(text).cx + s(padding);
+        dc.SelectObject(old);
+        return result;
+    };
+    int decryptWidth = labelWidth(m_decrypt, 20), monitorWidth = labelWidth(m_monitor, 20);
+    int hexWidth = labelWidth(m_hex, 20), caWidth = labelWidth(m_ca, 16);
+    int clearWidth = max(s(48), labelWidth(m_clear, 16));
+    if (decryptWidth + monitorWidth + hexWidth + caWidth + clearWidth + s(8) > width) {
+        decryptWidth = labelWidth(m_decrypt, 16);
+        monitorWidth = labelWidth(m_monitor, 16);
+        hexWidth = labelWidth(m_hex, 16);
+        caWidth = labelWidth(m_ca, 8);
+        clearWidth = max(s(40), labelWidth(m_clear, 8));
+    }
+    int gap = max(1, min(s(12), (width - decryptWidth - monitorWidth - hexWidth - caWidth - clearWidth) / 4));
+    m_decrypt.MoveWindow(s(8), top, decryptWidth, h);
+    m_monitor.MoveWindow(s(8) + decryptWidth + gap, top, monitorWidth, h);
+    m_hex.MoveWindow(s(8) + decryptWidth + monitorWidth + gap * 2, top, hexWidth, h);
+    m_clear.MoveWindow(cx - s(8) - clearWidth, top, clearWidth, h);
+    m_ca.MoveWindow(cx - s(8) - clearWidth - gap - caWidth, top, caWidth, h);
+    top += s(36);
+    GetDlgItem(IDC_STATIC_TASKCOUNT)->MoveWindow(s(8), top, width, s(20));
+    top += s(24);
+    m_edit.MoveWindow(s(8), top, width, max(0, cy - top - s(8)));
 }
-
-void Bin2HexFormat(const BYTE *pData, int len, CString &str)
+void CPage4::SetDecryptStatus()
 {
-	int lineIndex = 0;
-
-	for (int i=0; i<len; )
-	{
-		int left = len-i;
-		int n = min(16, left);
-
-		TCHAR szLineIndex[10];
-		TCHAR szLineHex[128];
-		TCHAR szLineRaw[128];
-		_stprintf(szLineIndex, _T("%.8X"), lineIndex*16);
-
-		int m = 0;
-		int j;
-		for (j=0; j<n; j++)
-		{
-			if (j%8 == 0)
-				m += _stprintf(szLineHex+m, _T("  %.2X"), pData[j]);
-			else
-				m += _stprintf(szLineHex+m, _T(" %.2X"), pData[j]);
-		}
-		while (m<50)
-			szLineHex[m++] = ' ';
-
-		szLineHex[m] = '\0';
-		m = 0;
-		szLineRaw[m++] = ' ';
-		for (j=0; j<n; j++)
-		{
-			BYTE ch;
-			if ((pData[j] < (BYTE)'\x20') ||
-				(pData[j] > (BYTE)'\x7E') )
-			{
-				ch = '.';
-			}else
-			{
-				ch = pData[j];
-			}
-			szLineRaw[m++] = ch;
-		}
-
-		while (m<17)
-			szLineRaw[m++] = ' ';
-		szLineRaw[m] = '\0';
-
-		str += szLineIndex;
-		str += szLineHex;
-		str += szLineRaw;
-		str += _T("\r\n");
-
-		pData += n;
-		len -= n;
-		lineIndex++;
-	}
+    m_decrypt.SetCheck(m_tls->IsEnabled() ? BST_CHECKED : BST_UNCHECKED);
+    m_decrypt.SetWindowText(Localization::Get(_T("mitm.enable")));
 }
-
-void CPage4::OnEachPacket(LPProxyPacketInfo lpppi)
+void CPage4::OnCA()
 {
-	CString szType = lpppi->lpC->sType == SOCK_STREAM ? _T("TCP") : _T("UDP");
-	CString szAddr;
-	if(lpppi->lpC->IsDNValid())
-	{
-		szAddr.Format(_T("%s.%s:%d"), szType, (LPCTSTR)(CString)lpppi->lpC->szDomainName, lpppi->lpC->dstAddr.GetPort());
-	}else
-	{
-		CString endpoint = FormatProxyEndpoint(lpppi->lpC->dstAddr);
-		szAddr.Format(_T("%s.%s"), szType, (LPCTSTR)endpoint);
-	}
-
-	CString szFrom;
-
-	if(lpppi->datafrom)
-	{
-		szFrom.Format(_T("PID: %d, Server: "), lpppi->lpC->dwPid);
-	}else
-	{
-		szFrom.Format(_T("PID: %d, Client: "), lpppi->lpC->dwPid);
-	}
-
-	CString szText;
-	if (m_ShowFMT == ShowFMT_RAW)
-		szText.Format(_T("%s\r\n%s\r\n%s\r\n\r\n"), szAddr, szFrom, lpppi->pData?(CString)lpppi->pData:_T(""));
-	else
-	{
-		if (lpppi->pData)
-		{
-			szText.Format(_T("%s\r\n%s\r\n"), szAddr, szFrom);
-			Bin2HexFormat((const BYTE*)lpppi->pData, lpppi->datalen, szText);
-			szText += _T("\r\n\r\n");
-		}else
-		{
-			szText.Format(_T("%s\r\n%s\r\n%s\r\n\r\n"), szAddr, szFrom, lpppi->pData?(CString)lpppi->pData:_T(""));
-		}
-	}
-
-	PrintText(szText);
+    OpenCA(false);
 }
-
-void CPage4::OnClose(LPProxyPacketInfo lpppi)
+void CPage4::OpenCA(bool enableAfterClose)
 {
-	CString szAddr;
-	if(lpppi->lpC->IsDNValid())
-	{
-		szAddr.Format(_T("%s:%d"), (CString)lpppi->lpC->szDomainName, lpppi->lpC->dstAddr.GetPort());
-	}else
-	{
-		szAddr = FormatProxyEndpoint(lpppi->lpC->dstAddr);
-	}
-
-	CString szText;
-	szText.Format(_T("Connection [%s] Closed\r\n"), szAddr);
-
-	PrintText(szText);
+    CMitmCaDialog dialog(this, m_tls);
+    dialog.DoModal();
+    SetDecryptStatus();
+    // Closing without installing cancels this attempt. A successful install
+    // resumes the original checkbox action, including when closed with X/Esc.
+    if (enableAfterClose && dialog.IsTrusted()) StartDecryption();
 }
-
-void CPage4::OnLayerCallback(LPProxyPacketInfo lpppi, int nType, int nCode, WPARAM wParam, LPARAM lParam)
+void CPage4::OnDecrypt()
 {
-
+    if (m_decrypt.GetCheck() != BST_CHECKED) {
+        m_tls->SetEnabled(FALSE, NULL, 0); SetDecryptStatus(); return;
+    }
+    StartDecryption();
 }
-
-void CPage4::OnBnClickedCheck1()
+void CPage4::StartDecryption()
 {
-	// TODO: 在此添加控件通知处理程序代码
-
-	UpdateMonitorStatus();
+    m_decrypt.EnableWindow(FALSE); m_ca.EnableWindow(FALSE);
+    m_decrypt.SetWindowText(Localization::Get(_T("monitor.preparing")));
+    m_job = StartMitmJob(m_tls, IProxyTlsControl::PrepareCA, true);
 }
-
 void CPage4::UpdateMonitorStatus()
 {
-
-	if(g_GlobalProxy)
-	{
-		IProxyDataHandle *pPDH = g_GlobalProxy->GetPRCInstance()->GetPDHInstance();
-		if(m_btnMonitor.GetCheck() == BST_CHECKED)
-		{
-			if (!m_bAttachedPDH)
-			{
-				m_bAttachedPDH = 1;
-				pPDH->AddInstance(this);
-			}
-		}else
-		{
-			IProxyDataHandle::Detach();
-			m_bAttachedPDH = 0;
-		}
-	}else
-	{
-		m_bAttachedPDH = 0;
-	}
+    if (!m_monitor.GetSafeHwnd()) return;
+    bool recording = m_monitor.GetCheck() == BST_CHECKED;
+    m_recording = recording;
+    m_dataMonitor->SetEnabled(recording);
 }
+void CPage4::OnMonitor() { UpdateMonitorStatus(); }
 
-void CPage4::OnBnClickedCheckHex()
+CPage4::Record CPage4::MakeRecord(const ProxyMonitorEvent& e)
 {
-	m_ShowFMT = m_btnHex.GetCheck()==BST_CHECKED?ShowFMT_HEX:ShowFMT_RAW;
+    Record record; record.kind = e.kind; record.length = e.length;
+    const size_t preview = (std::min)(size_t(e.length), MonitorLog::PreviewBytes);
+    record.preview.assign(e.data, e.data + preview);
+    // Log text stays in English independently of the UI language.
+    LPCTSTR label = e.kind == 1 || e.kind == 2 ? _T("Decrypted") :
+        e.kind == 3 || e.kind == 4 ? _T("Raw") : e.kind == 0 ? _T("TLS error") : _T("Connection status");
+    LPCTSTR direction = e.kind == 1 || e.kind == 3 ? _T("Application → server") :
+        e.kind == 2 || e.kind == 4 ? _T("Server → application") : _T("Connection status");
+    // Use the same PID/socket generation for raw and decrypted data.
+    record.header.Format(_T("[%s] PID %lu · %s · %s · %s · socket %I64u/%I64u\r\n"),
+        label, e.client.dwPid,
+        e.client.sType == SOCK_DGRAM ? _T("UDP") : _T("TCP"), (LPCTSTR)Endpoint(e.client),
+        direction, e.client.s, e.client.socketGeneration);
+    return record;
 }
-
-void CPage4::OnTimer(UINT_PTR nIDEvent)
+CString CPage4::FormatRecord(const Record& record) const
 {
-	// TODO: 在此添加消息处理程序代码和/或调用默认值
-	switch (nIDEvent)
-	{
-	case TMID_TASKCOUNT:
-		{
-			if (g_GlobalProxy)
-			{
-				IProxyReceptionCentre* pPRC = g_GlobalProxy->GetPRCInstance();
-				if (pPRC)
-				{
-					CString strText;
-					DWORD dwTcpCount = 0;
-					DWORD dwUdpCount = 0;
-					IProxyTaskMgr* pTaskMgr = pPRC->GetPTMInstance(0);
-					if (pTaskMgr)
-					{
-						pTaskMgr->GetTaskCount(&dwTcpCount);
-					}
-					pTaskMgr = pPRC->GetPTMInstance(1);
-					if (pTaskMgr)
-					{
-						pTaskMgr->GetTaskCount(&dwUdpCount);
-					}
-
-					strText = Localization::Format(_T("page4.connections"), dwTcpCount, dwUdpCount);
-
-					SetDlgItemText(IDC_STATIC_TASKCOUNT, strText);
-				}
-			}
-		}
-		break;
-	}
-
-	__super::OnTimer(nIDEvent);
+    CString output = record.header;
+    if (m_hex.GetCheck() == BST_CHECKED && record.kind != 0 && record.kind != 5)
+        output += MonitorLog::Hex(record.preview.data(), record.preview.size()).c_str();
+    else output += Utf8(record.preview.data(), record.preview.size());
+    if (record.preview.size() < record.length) {
+        CString preview;
+        preview.Format(_T("\r\n[Preview %u / %lu bytes; remainder omitted]"),
+            (unsigned)record.preview.size(), record.length);
+        output += preview;
+    }
+    output += _T("\r\n\r\n");
+    return output;
 }
-
-void CPage4::OnBnClickedBtnClear()
+void CPage4::BeginReplay()
 {
-	// TODO: 在此添加控件通知处理程序代码
-	m_Edit.SetWindowText(_T(""));
-
-// 	// Initialize the new local handle.
-// 	HLOCAL h = ::LocalAlloc(LHND, 4);
-// 	LPTSTR lpszText = (LPTSTR) ::LocalLock(h);
-// 	memset(lpszText, 0, 4);
-// 	::LocalUnlock(h);
-// 
-// 	// Free the current text handle of the edit control.
-// 	::LocalFree(m_Edit.GetHandle());
-// 
-// 	// Set the new text handle.
-// 	m_Edit.SetHandle(h);
+    m_edit.SetWindowText(_T("")); m_edit.EmptyUndoBuffer();
+    m_replayIndex = 0; m_replaying = true; m_needsReplay = false;
+}
+void CPage4::OnView()
+{
+    // Reformat retained previews over subsequent timer ticks, never all at once.
+    if (m_edit.IsWindowVisible()) BeginReplay(); else m_needsReplay = true;
+}
+void CPage4::OnClear()
+{
+    m_dataMonitor->Clear(); m_history.clear(); m_dropped = m_truncated = m_evicted = 0;
+    m_replaying = m_needsReplay = false; m_replayIndex = 0;
+    m_edit.SetWindowText(_T("")); m_edit.EmptyUndoBuffer();
+}
+void CPage4::AppendText(const CString& text)
+{
+    if (text.IsEmpty()) return;
+    int length = m_edit.GetWindowTextLength();
+    int start, end; m_edit.GetSel(start, end);
+    int firstLine = m_edit.GetFirstVisibleLine();
+    SCROLLINFO scroll = { sizeof(scroll), SIF_ALL };
+    m_edit.GetScrollInfo(SB_VERT, &scroll);
+    bool follow = start == end && (length == 0 || scroll.nPos + (int)scroll.nPage >= scroll.nMax);
+    m_edit.SetRedraw(FALSE);
+    if (length + text.GetLength() > MonitorLog::TextLimit) {
+        int trim = length - MonitorLog::TextKeep;
+        int line = m_edit.LineFromChar(max(0, trim));
+        int boundary = m_edit.LineIndex(line + 1);
+        trim = boundary >= trim && boundary <= length ? boundary : max(0, trim);
+        int removedLines = m_edit.LineFromChar(trim);
+        m_edit.SetSel(0, trim); m_edit.ReplaceSel(_T(""), FALSE);
+        length -= trim; start = max(0, start - trim); end = max(0, end - trim);
+        firstLine = max(0, firstLine - removedLines);
+        ++m_evicted;
+    }
+    m_edit.SetSel(length, length); m_edit.ReplaceSel(text, FALSE);
+    m_edit.EmptyUndoBuffer();
+    // Re-enable redraw before scrolling: EDIT may defer its scrollbar range
+    // update while redraw is disabled, leaving SB_BOTTOM at the previous end.
+    m_edit.SetRedraw(TRUE);
+    if (follow) {
+        int endOfText = m_edit.GetWindowTextLength();
+        m_edit.SetSel(endOfText, endOfText);
+        m_edit.SendMessage(WM_VSCROLL, SB_BOTTOM);
+        m_edit.SendMessage(WM_HSCROLL, SB_LEFT);
+    } else {
+        m_edit.SetSel(start, end, TRUE);
+        m_edit.LineScroll(firstLine - m_edit.GetFirstVisibleLine());
+    }
+    m_edit.Invalidate(FALSE);
+}
+void CPage4::OnTimer(UINT_PTR id)
+{
+    if (m_job && m_job->done.load()) {
+        int result = m_job->result; bool needsCA = m_job->needsCA;
+        CString error = Utf8(m_job->text); m_job.reset();
+        m_decrypt.EnableWindow(TRUE); m_ca.EnableWindow(TRUE); SetDecryptStatus();
+        if (needsCA) OpenCA(true);
+        else if (result < 0) MessageBox(Localization::Get(_T("mitm.enable_failed")) + _T("\r\n\r\n") + error,
+            Localization::Get(_T("mitm.ca")), MB_ICONERROR);
+        else { m_monitor.SetCheck(BST_CHECKED); UpdateMonitorStatus(); }
+    }
+    const bool visible = m_edit.IsWindowVisible() != FALSE;
+    if (visible && m_needsReplay) BeginReplay();
+    if (!visible && m_replaying) { m_replaying = false; m_needsReplay = true; }
+    CString pending;
+    const DWORD started = GetTickCount();
+    for (unsigned count = 0; count < MonitorLog::BatchRecords; ++count) {
+        if (pending.GetLength() >= MonitorLog::BatchCharacters || GetTickCount() - started >= MonitorLog::BatchMilliseconds) break;
+        if (visible && m_replaying) {
+            if (m_replayIndex < m_history.size()) {
+                pending += FormatRecord(m_history[m_replayIndex++]); continue;
+            }
+            m_replaying = false;
+        }
+        if (!m_recording) break;
+        ProxyMonitorEvent event;
+        if (!m_dataMonitor->Poll(&event)) break;
+        Record record = MakeRecord(event);
+        if (record.preview.size() < record.length) ++m_truncated;
+        if (m_history.size() >= MonitorLog::HistoryRecords) { m_history.pop_front(); ++m_evicted; }
+        m_history.push_back(std::move(record));
+        if (visible) pending += FormatRecord(m_history.back()); else m_needsReplay = true;
+    }
+    if (visible) AppendText(pending);
+    m_dropped += m_dataMonitor->TakeDroppedCount();
+    DWORD tcp = 0, udp = 0;
+    if (g_GlobalProxy) {
+        auto prc = g_GlobalProxy->GetPRCInstance();
+        if (prc->GetPTMInstance(0)) prc->GetPTMInstance(0)->GetTaskCount(&tcp);
+        if (prc->GetPTMInstance(1)) prc->GetPTMInstance(1)->GetTaskCount(&udp);
+    }
+    CString status = Localization::Format(_T("page4.connections"), tcp, udp);
+    if (m_dropped || m_truncated || m_evicted)
+        status += Localization::Format(_T("monitor.limits"), m_dropped, m_truncated, m_evicted);
+    CString current; GetDlgItemText(IDC_STATIC_TASKCOUNT, current);
+    if (status != current) SetDlgItemText(IDC_STATIC_TASKCOUNT, status);
+    CModernDialog::OnTimer(id);
 }

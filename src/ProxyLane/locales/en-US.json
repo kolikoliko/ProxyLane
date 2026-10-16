@@ -150,7 +150,6 @@
   "page3.partial_failure": "Some Processes Failed",
   "page3.completed": "Operation Complete",
   "page4.title": "Data Monitor",
-  "page4.subtitle": "Inspect proxied connections and data; monitoring adds overhead",
   "page4.monitor": "Start monitoring",
   "page4.hex": "Show HEX",
   "page4.connections_zero": "TCP: 0    UDP: 0",
@@ -261,5 +260,19 @@
   "dialog.drop_launch_failed": "The dropped application could not start. Check the file and its permissions.",
   "dialog.drop_failed_title": "Cannot Start Through Proxy",
   "automation.command_line_help_title": "ProxyLane Command-Line Help",
-  "automation.command_line_help": "Usage\r\n\r\nStart an application through the transparent proxy:\r\nProxyLane.exe --auto --profile <profile name> --run <application path> [-- <application arguments...>]\r\n\r\nShow this help:\r\nProxyLane.exe /?\r\n\r\nOptions\r\n--auto       Use command-line automation mode.\r\n--profile    Select a saved profile.\r\n--run        Select the application to start through the proxy.\r\n--           Pass all remaining arguments to the application.\r\n/?, -?, --help    Show this help.\r\n\r\nExample\r\nProxyLane.exe --auto --profile \"Test\" --run \"C:\\Tools\\app.exe\" -- -arg value\r\n\r\nAn existing instance with the same installation, user session, and profile is reused."
+  "automation.command_line_help": "Usage\r\n\r\nStart an application through the transparent proxy:\r\nProxyLane.exe --auto --profile <profile name> --run <application path> [-- <application arguments...>]\r\n\r\nShow this help:\r\nProxyLane.exe /?\r\n\r\nOptions\r\n--auto       Use command-line automation mode.\r\n--profile    Select a saved profile.\r\n--run        Select the application to start through the proxy.\r\n--           Pass all remaining arguments to the application.\r\n/?, -?, --help    Show this help.\r\n\r\nExample\r\nProxyLane.exe --auto --profile \"Test\" --run \"C:\\Tools\\app.exe\" -- -arg value\r\n\r\nAn existing instance with the same installation, user session, and profile is reused.",
+  "mitm.ca": "CA management",
+  "mitm.enable": "Decrypt HTTPS",
+  "mitm.busy": "Preparing CA / TLS, please wait…",
+  "mitm.failed": "Operation failed. See details.",
+  "mitm.install": "Trust for this user",
+  "mitm.remove": "Remove trust",
+  "mitm.refresh": "Refresh",
+  "mitm.close": "Close",
+  "mitm.trusted": "CA initialized · trusted by current user",
+  "mitm.untrusted": "HTTPS decryption requires installing the CA certificate for the current Windows user. Click “Trust for this user”.",
+  "mitm.uninitialized": "HTTPS decryption requires installing the CA certificate for the current Windows user. Click “Trust for this user” to initialize and install it.",
+  "mitm.enable_failed": "Cannot enable HTTPS decryption. Check the error below.",
+  "monitor.preparing": "HTTPS decryption (preparing…)",
+  "monitor.limits": " · Dropped %I64u / Shortened %I64u / Evicted %I64u"
 }

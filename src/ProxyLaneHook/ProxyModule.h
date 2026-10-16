@@ -18,6 +18,8 @@ class IProxyLog;
 class IProxyTaskMgr;
 class IProxyDataHandle;
 class IProxyTester;
+class IProxyTlsControl;
+class IProxyMonitor;
 
 class IGlobalProxy
 {
@@ -39,6 +41,47 @@ public:
 
 	virtual INT AddRef() = 0;
 	virtual INT Release() = 0;
+
+	// Append only: preserve existing virtual slots. Borrowed services live for
+	// the loaded module lifetime, including proxy stop/start and async CA jobs.
+	// Do not delete/release them. New callers need the matching Hook DLL.
+	virtual IProxyTlsControl* GetTlsControl() = 0;
+	virtual IProxyMonitor* GetMonitorInstance() = 0;
+};
+
+class IProxyTlsControl
+{
+public:
+	enum CaAction { QueryCA, InitializeCA, TrustCA, RemoveCATrust, PrepareCA };
+	// UTF-8 output; negative on failure, otherwise flags: 1 initialized, 2 trusted.
+	// PrepareCA checks trust and prepares the local CRL listener.
+	virtual int ManageCA(CaAction action, char* output, size_t capacity) = 0;
+	virtual BOOL SetEnabled(BOOL enabled, char* error, size_t capacity) = 0;
+	virtual BOOL IsEnabled() = 0;
+protected:
+	virtual ~IProxyTlsControl() {}
+};
+
+struct ProxyMonitorEvent
+{
+	ULONGLONG connection;
+	PRCClient client;
+	DWORD kind; // 0 TLS error (UTF-8), 1/2 plaintext request/response, 3/4 non-decrypted data, 5 connection status
+	DWORD length;
+	BYTE data[8192];
+};
+
+class IProxyMonitor
+{
+public:
+	// One consumer per host; producers belong to the forwarding core.
+	// Disabling clears pending events; Poll copies into caller-owned storage.
+	virtual void SetEnabled(BOOL enabled) = 0;
+	virtual BOOL Poll(ProxyMonitorEvent* event) = 0;
+	virtual DWORD TakeDroppedCount() = 0;
+	virtual void Clear() = 0;
+protected:
+	virtual ~IProxyMonitor() {}
 };
 
 class IProxyReceptionCentre
