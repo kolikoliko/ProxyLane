@@ -102,6 +102,20 @@ BEGIN_MESSAGE_MAP(CModernDialog, CDialog)
 	ON_WM_CTLCOLOR()
 END_MESSAGE_MAP()
 
+void CModernDialog::OnOK()
+{
+	// Embedded navigation pages have no modal result. CDialog::OnOK would
+	// call EndDialog and hide them when Enter reaches the dialog manager.
+	if (!(GetStyle() & WS_CHILD)) CDialog::OnOK();
+}
+
+void CModernDialog::OnCancel()
+{
+	// Keep Esc handling in controls (combos, process finder, etc.) intact;
+	// suppress only the final dialog-cancellation action for child pages.
+	if (!(GetStyle() & WS_CHILD)) CDialog::OnCancel();
+}
+
 void CModernDialog::OnSize(UINT type, int cx, int cy)
 {
 	CDialog::OnSize(type, cx, cy);

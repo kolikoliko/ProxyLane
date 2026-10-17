@@ -5,6 +5,7 @@
 class CProxyTCPTaskMgr;
 class CPRCTcpPeer;
 class CMitmBridge;
+class CProtocolTap;
 
 class CTcpProxyTask
 {
@@ -26,11 +27,13 @@ public:
 	PRCClient m_PRCClient;
 	ProxyInfo m_ProxyInfo;
 	CMitmBridge* m_pMitm;
+	CProtocolTap* m_pProtocol;
 
 private:
 	CPRCTcpPeer *m_pClient;
 	CPRCTcpPeer *m_pServer;
 	BOOL m_bDeletePending;
+    bool m_reconnectSelected = false, m_reconnectPending = false;
 
 public:
 	CProxyTCPTaskMgr *m_pTaskmgr;

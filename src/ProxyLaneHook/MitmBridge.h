@@ -1,5 +1,7 @@
 #pragma once
 #include "../ProxyLaneMitm/ProxyLaneMitm.h"
+#include "structinfo.h"
+#include <atomic>
 
 class CTcpProxyTask;
 class CPRCTcpPeer;
@@ -13,6 +15,7 @@ public:
     bool Initialize();
     void OnRead(CPRCTcpPeer* peer, int error);
     void OnWritable();
+    void Connected(int error);
 private:
     static void __cdecl Observe(uintptr_t user, uint32_t kind, const uint8_t* data, size_t length);
     ULONGLONG m_connection;
@@ -25,4 +28,22 @@ private:
     PLM_FREE_FN m_free;
     bool m_failed;
     bool m_paused;
+};
+
+// Optional observation of the existing TCP forwarding path. Never owns sockets.
+class CProtocolTap {
+public:
+    explicit CProtocolTap(CTcpProxyTask* task);
+    CProtocolTap(const PRCClient& client, bool udp);
+    ~CProtocolTap();
+    void Data(unsigned side, const void* bytes, size_t length);
+    void Eof(unsigned side);
+    void Connected(int error);
+    static bool Enabled();
+    bool IsActive() const { return m_active.load(); }
+private:
+    std::atomic<bool> m_active{false};
+    void* m_handle;
+    PLM_STREAM_IO_FN m_io;
+    bool m_udp;
 };

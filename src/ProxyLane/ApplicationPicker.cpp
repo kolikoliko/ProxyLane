@@ -53,7 +53,8 @@ BOOL CApplicationPicker::OnInitDialog()
 {
 	CModernDialog::OnInitDialog();
 	SetWindowText(Localization::Get(L"apps.title"));
-	m_launch.SetWindowText(Localization::Get(_T("apps.launch")));
+	m_launch.SetWindowText(Localization::Get(g_MainTab && g_MainTab->IsProxyRunning()
+		? _T("apps.launch") : _T("apps.start_proxy_first")));
 	m_launch.SetVisualStyle(CModernButton::STYLE_PRIMARY);
 	m_launch.EnableWindow(FALSE);
 	m_cancel.SetWindowText(Localization::Get(_T("apps.cancel")));
@@ -258,6 +259,7 @@ void CApplicationPicker::OnRefresh() { if (!m_loading) BeginLoad(TRUE); }
 
 BOOL CApplicationPicker::RefreshProfileContext()
 {
+	UpdateSelectionActions();
 	const CString profile = g_MainTab && g_MainTab->IsProxyRunning() ? g_MainTab->GetRunningProfileName() : CString();
 	const CString identity = g_MainTab ? g_MainTab->GetRunningRecentProfileId() : CString();
 	if (profile == m_profile && identity == m_profileId) return FALSE;
@@ -466,7 +468,13 @@ void CApplicationPicker::UpdateSelectionActions()
 	const BOOL selected = row >= 0 && m_list.GetItemData(row) < m_applications.size();
 	const BOOL recent = selected && m_list.GetItemData(row) < m_recentEntries.size();
 	const BOOL available = selected && (!recent || m_recentEntries[m_list.GetItemData(row)].available);
-	m_launch.EnableWindow(available && g_MainTab && g_MainTab->IsProxyRunning());
+	const BOOL running = g_MainTab && g_MainTab->IsProxyRunning();
+	const CString caption = Localization::Get(running
+		? _T("apps.launch") : _T("apps.start_proxy_first"));
+	CString currentCaption;
+	m_launch.GetWindowText(currentCaption);
+	if (currentCaption != caption) m_launch.SetWindowText(caption);
+	m_launch.EnableWindow(available && running);
 	m_removeRecent.ShowWindow(recent ? SW_SHOW : SW_HIDE);
 	m_removeRecent.EnableWindow(recent && !m_recentLoad);
 	GetDlgItem(IDC_APP_STATUS)->ShowWindow(SW_SHOW);

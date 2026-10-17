@@ -34,6 +34,8 @@ public:
 
 protected:
 	virtual BOOL OnInitDialog();
+	virtual void OnOK();
+	virtual void OnCancel();
 	afx_msg void OnSize(UINT type, int cx, int cy);
 	afx_msg BOOL OnEraseBkgnd(CDC* dc);
 	afx_msg HBRUSH OnCtlColor(CDC* dc, CWnd* wnd, UINT ctlColor);

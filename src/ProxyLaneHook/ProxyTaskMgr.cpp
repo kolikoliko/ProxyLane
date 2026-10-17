@@ -6,6 +6,7 @@
 #include "stdafx.h"
 #include "ProxyTaskMgr.h"
 #include "PRCTcpPeer.h"
+#include "MitmBridge.h"
 #include "ProxyLog.h"
 //#include "PRCUdpPeer.h"
 
@@ -168,6 +169,26 @@ VOID CProxyTCPTaskMgr::RemoveAllTasks()
 	m_tasklist.clear();
 }
 
+DWORD CProxyTCPTaskMgr::PrepareReconnect(BOOL decrypt)
+{
+    CTSList<CTcpProxyTask*>::critical lc = m_tasklist;
+    DWORD count = 0;
+    for (auto task : m_tasklist) {
+        task->m_reconnectSelected = !task->IsDeletePending() && !task->m_reconnectPending &&
+            (decrypt ? !task->m_pMitm : !task->m_pMitm && (!task->m_pProtocol || !task->m_pProtocol->IsActive()));
+        if (task->m_reconnectSelected) ++count;
+    }
+    return count;
+}
+void CProxyTCPTaskMgr::CompleteReconnect(BOOL disconnect)
+{
+    CTSList<CTcpProxyTask*>::critical lc = m_tasklist;
+    for (auto task : m_tasklist) {
+        if (task->m_reconnectSelected && disconnect) task->m_reconnectPending = true;
+        task->m_reconnectSelected = false;
+    }
+}
+
 VOID CProxyTCPTaskMgr::OnTimer(UINT_PTR nIDEvent)
 {
 	switch(nIDEvent)
@@ -178,7 +199,14 @@ VOID CProxyTCPTaskMgr::OnTimer(UINT_PTR nIDEvent)
 			for(list<CTcpProxyTask*>::iterator it = m_tasklist.begin(); it!=m_tasklist.end(); )
 			{
 				CTcpProxyTask *pObj = *it;
-				if(pObj->m_pClient && pObj->m_pClient->GetSocketHandle() != INVALID_SOCKET)
+                if (pObj->m_reconnectPending) {
+                    pObj->EndTask();
+                    OnDelTask(&pObj->m_PRCClient);
+                    it = m_tasklist.erase(it);
+                    delete pObj;
+                    continue;
+                }
+                if(pObj->m_pClient && pObj->m_pClient->GetSocketHandle() != INVALID_SOCKET)
 					pObj->m_pClient->OnTimer();
 				if(pObj->m_pServer && pObj->m_pServer->GetSocketHandle() != INVALID_SOCKET)
 					pObj->m_pServer->OnTimer();

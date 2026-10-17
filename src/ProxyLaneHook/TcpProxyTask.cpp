@@ -1,4 +1,4 @@
-﻿/************************************************************************/
+/************************************************************************/
 /*                                                                      */
 /*                                                                      */
 /************************************************************************/
@@ -17,6 +17,7 @@ CTcpProxyTask::CTcpProxyTask(CProxyTCPTaskMgr *pTaskmgr)
 	m_pServer = NULL;
 	m_bDeletePending = FALSE;
 	m_pMitm = NULL;
+	m_pProtocol = NULL;
 }
 
 CTcpProxyTask::~CTcpProxyTask(void)
@@ -74,6 +75,8 @@ BOOL CTcpProxyTask::SetTaskInfo(SOCKET sClient, LPPRCClient lpPRCClient, LPProxy
 			}
 		}
 
+		else if (CProtocolTap::Enabled()) m_pProtocol = new CProtocolTap(this);
+
 		int socketbufsize=1024*16;
 		m_pServer->SetSockOpt(SO_SNDBUF, &socketbufsize,sizeof(socketbufsize));
 		m_pServer->SetSockOpt(SO_RCVBUF, &socketbufsize,sizeof(socketbufsize));
@@ -93,6 +96,10 @@ BOOL CTcpProxyTask::SetTaskInfo(SOCKET sClient, LPPRCClient lpPRCClient, LPProxy
 	} while(FALSE);
 
 	const int error = WSAGetLastError();
+    if (m_pProtocol) m_pProtocol->Connected(error ? error : WSAECONNABORTED);
+    if (m_pMitm) m_pMitm->Connected(error ? error : WSAECONNABORTED);
+	delete m_pProtocol;
+	m_pProtocol = NULL;
 	delete m_pMitm;
 	m_pMitm = NULL;
 	delete m_pClient;
@@ -120,6 +127,8 @@ VOID CTcpProxyTask::OnPeerClosed(CPRCTcpPeer *pPeer)
 
 VOID CTcpProxyTask::EndTask()
 {
+	delete m_pProtocol;
+	m_pProtocol = NULL;
 	delete m_pMitm;
 	m_pMitm = NULL;
 	if(m_pClient)

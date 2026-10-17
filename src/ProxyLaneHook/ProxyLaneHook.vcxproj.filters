@@ -144,6 +144,9 @@
     <ClInclude Include="PRCTcpPeer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="PlatformSupport.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="MitmBridge.h">
       <Filter>Header Files</Filter>
     </ClInclude>

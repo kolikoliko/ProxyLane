@@ -26,6 +26,7 @@ impl Fixture {
         Self {
             path,
             context: Arc::new(Context {
+                crl: ca.serve_crl().unwrap(),
                 ca,
                 roots: Arc::new(roots),
             }),
@@ -41,6 +42,14 @@ impl Fixture {
         .unwrap()
     }
     fn endpoints(&self, tls12: bool, valid: bool) -> (ClientConnection, ServerConnection) {
+        self.endpoints_alpn(tls12, valid, b"http/1.1")
+    }
+    fn endpoints_alpn(
+        &self,
+        tls12: bool,
+        valid: bool,
+        alpn: &[u8],
+    ) -> (ClientConnection, ServerConnection) {
         let versions = if tls12 {
             vec![&rustls::version::TLS12]
         } else {
@@ -52,7 +61,7 @@ impl Fixture {
             .unwrap()
             .with_root_certificates(self.context.roots.clone())
             .with_no_client_auth();
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![alpn.to_vec()];
         let mut client =
             ClientConnection::new(Arc::new(config), ServerName::try_from("localhost").unwrap())
                 .unwrap();
@@ -60,7 +69,10 @@ impl Fixture {
         let cert = self
             .context
             .ca
-            .leaf(if valid { "localhost" } else { "wrong.test" })
+            .leaf(
+                if valid { "localhost" } else { "wrong.test" },
+                self.context.crl.port(),
+            )
             .unwrap();
         #[derive(Debug)]
         struct Resolver(Arc<rustls::sign::CertifiedKey>);
@@ -77,7 +89,7 @@ impl Fixture {
             .unwrap()
             .with_no_client_auth()
             .with_cert_resolver(Arc::new(Resolver(cert)));
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = vec![alpn.to_vec()];
         (client, ServerConnection::new(Arc::new(config)).unwrap())
     }
 }
@@ -149,11 +161,83 @@ fn persistent_ca_and_signed_leaf() {
         params.distinguished_name.get(&rcgen::DnType::CommonName),
         Some(&rcgen::DnValue::Utf8String("ProxyLane CA".into()))
     );
-    assert_eq!(reloaded.leaf("localhost").unwrap().cert.len(), 1);
+    assert_eq!(
+        reloaded
+            .leaf("localhost", f.context.crl.port())
+            .unwrap()
+            .cert
+            .len(),
+        1
+    );
     assert!(!std::fs::read_to_string(f.path.join("ca.json"))
         .unwrap()
         .contains("PRIVATE KEY"));
+    let leaf = reloaded.leaf("validity.test", f.context.crl.port()).unwrap();
+    let cert = rcgen::CertificateParams::from_ca_cert_der(&leaf.cert[0]).unwrap();
+    let remaining = cert.not_after.unix_timestamp() - time::OffsetDateTime::now_utc().unix_timestamp();
+    assert!((14 * 86400 - 10..=14 * 86400).contains(&remaining));
     assert!(!reloaded.crl().unwrap().is_empty());
+}
+
+#[test]
+fn crl_port_fallback_certificate_cache_and_independent_lifetimes() {
+    use std::net::{TcpListener, TcpStream};
+    let f = Fixture::new();
+    let saved = std::fs::read(f.path.join("ca.json")).unwrap();
+    let blocker = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let preferred = blocker.local_addr().unwrap().port();
+    let mut ca = pki::Authority::load(&f.path, false).unwrap();
+    ca.port = preferred;
+    let ca = Arc::new(ca);
+    let first = ca.serve_crl().unwrap();
+    let second = ca.serve_crl().unwrap();
+    assert_ne!(first.port(), preferred);
+    assert_ne!(first.port(), second.port());
+    let a = ca.leaf("localhost", first.port()).unwrap();
+    let b = ca.leaf("localhost", second.port()).unwrap();
+    assert_ne!(a.cert[0], b.cert[0]);
+    assert!(Arc::ptr_eq(
+        &a,
+        &ca.leaf("localhost", first.port()).unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        &b,
+        &ca.leaf("localhost", second.port()).unwrap()
+    ));
+    for (cert, port) in [(&a, first.port()), (&b, second.port())] {
+        let url = format!("http://127.0.0.1:{port}/pki/{}.crl", ca.id);
+        assert!(cert.cert[0].windows(url.len()).any(|w| w == url.as_bytes()));
+    }
+    let get = |port: u16| {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        write!(
+            stream,
+            "GET /pki/{}.crl HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            ca.id
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).unwrap();
+        assert!(bytes.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        let body = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert!(!bytes[body..].is_empty());
+    };
+    get(first.port());
+    get(second.port());
+    let port = first.port();
+    drop(first);
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err());
+    get(second.port());
+    drop(blocker);
+    let third = ca.serve_crl().unwrap();
+    assert_eq!(third.port(), preferred);
+    get(third.port());
+    assert_eq!(std::fs::read(f.path.join("ca.json")).unwrap(), saved);
+    assert_eq!(ca.der, f.context.ca.der);
+    assert!(ca.leaf("localhost", 0).is_err());
 }
 
 #[test]
@@ -311,6 +395,134 @@ fn tls12_tls13_fragmented_hello_alpn_payload_close() {
 }
 
 #[test]
+fn realtime_tls_protocol_without_monitor_observer_and_authenticated_eof() {
+    for clean in [true, false] {
+        let f = Fixture::new();
+        let runtime = crate::protocol::Runtime::new(proxylane_protocol::cache::CacheConfig {
+            root: f.path.join("payload"),
+            ..Default::default()
+        })
+        .unwrap();
+        let directory = f.path.join("payload");
+        let mut m = f.session();
+        m.enable_protocol(
+            runtime.clone(),
+            proxylane_protocol::Connection {
+                id: "123/456".into(),
+                pid: 123,
+                socket: 456,
+                generation: 7,
+                process_start: 987,
+                destination: "localhost:8443".into(),
+                ..Default::default()
+            },
+        );
+        assert!(m.observer.is_none()); // GUI monitoring is off.
+        let (mut app, mut origin) = f.endpoints(false, true);
+        for _ in 0..30 {
+            exchange(&mut m, &mut app, &mut origin, 3).unwrap();
+        }
+        app.writer()
+            .write_all(b"GET /eof HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        for _ in 0..4 {
+            exchange(&mut m, &mut app, &mut origin, 17).unwrap();
+        }
+        let mut received = Vec::new();
+        let _ = origin.reader().read_to_end(&mut received);
+        assert!(received.starts_with(b"GET /eof"));
+        origin
+            .writer()
+            .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nplaintext")
+            .unwrap();
+        if clean {
+            origin.send_close_notify();
+        }
+        for _ in 0..8 {
+            exchange(&mut m, &mut app, &mut origin, 7).unwrap();
+        }
+        if !clean {
+            assert!(m.input_eof(1).is_err());
+        }
+        drop(m);
+        let result = runtime.query(&json!({"type":"poll"})).unwrap();
+        let records = result["records"].as_array().unwrap();
+        let flow = records.iter().find(|r| r["type"] == "exchange").unwrap();
+        assert_eq!(flow["connection"]["process_start"], 987);
+        assert_eq!(flow["exchange"]["response"]["complete"], clean, "{result}");
+        assert_eq!(flow["exchange"]["response"]["body_bytes"], 9);
+        runtime.shutdown().unwrap();
+        assert_eq!(std::fs::read_dir(directory).unwrap().count(), 1); // manager.lock only
+    }
+}
+
+#[test]
+fn realtime_h2_alpn_hpack_interleaved_streams_and_cached_decode() {
+    use base64::Engine;
+    let f = Fixture::new();
+    let runtime = crate::protocol::Runtime::new(proxylane_protocol::cache::CacheConfig {
+        root: f.path.join("payload"),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut m = f.session();
+    m.enable_protocol(
+        runtime.clone(),
+        proxylane_protocol::Connection {
+            id: "h2".into(),
+            pid: 123,
+            generation: 8,
+            ..Default::default()
+        },
+    );
+    let (mut app, mut origin) = f.endpoints_alpn(false, true, b"h2");
+    for _ in 0..30 {
+        exchange(&mut m, &mut app, &mut origin, 3).unwrap();
+    }
+    assert_eq!(app.alpn_protocol(), Some(b"h2".as_slice()));
+    // Fixture generated by Python's independent h2/HPACK implementation.
+    for line in include_str!("../../ProxyLaneProtocol/fixtures/demo.jsonl").lines() {
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        if event["connection_id"] != "fixture-h2" || event["type"] != "data" {
+            continue;
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(event["data_base64"].as_str().unwrap())
+            .unwrap();
+        if event["direction"] == "client" {
+            app.writer().write_all(&bytes).unwrap();
+        } else {
+            origin.writer().write_all(&bytes).unwrap();
+        }
+        for _ in 0..4 {
+            exchange(&mut m, &mut app, &mut origin, 11).unwrap();
+        }
+        let _ = app.reader().read_to_end(&mut Vec::new());
+        let _ = origin.reader().read_to_end(&mut Vec::new());
+    }
+    drop(m);
+    let result = runtime.query(&json!({"type":"poll"})).unwrap();
+    let records: Vec<_> = result["records"].as_array().unwrap().iter().filter(|r|r["type"]=="exchange").collect();
+    assert_eq!(records.len(), 2, "{result}");
+    assert_eq!(records[0]["exchange"]["id"], 3);
+    assert_eq!(records[1]["exchange"]["id"], 1);
+    for flow in records {
+        assert_eq!(flow["protocol"], "h2");
+        assert_eq!(flow["exchange"]["response"]["complete"], true);
+        assert_eq!(flow["exchange"]["response"]["decoding"], "ok");
+        let payload = runtime
+            .query(&json!({"type":"cache_decode", "run_id":runtime.run_id,
+            "cache_id":flow["exchange"]["cache"]["id"], "direction":"server"}))
+            .unwrap();
+        assert_eq!(
+            payload["payload"]["data_base64"],
+            flow["exchange"]["response"]["decoded_base64"]
+        );
+    }
+    runtime.shutdown().unwrap();
+}
+
+#[test]
 fn abrupt_tls_eof_reports_direction_once_and_never_fakes_clean_close() {
     for tls12 in [true, false] {
         for side in 0..2 {
@@ -402,7 +614,12 @@ fn ip_san_without_sni_and_untrusted_issuer() {
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
-        .with_cert_resolver(Arc::new(Resolver(f.context.ca.leaf("127.0.0.1").unwrap())));
+        .with_cert_resolver(Arc::new(Resolver(
+            f.context
+                .ca
+                .leaf("127.0.0.1", f.context.crl.port())
+                .unwrap(),
+        )));
     let mut origin = ServerConnection::new(Arc::new(config)).unwrap();
     let mut m = Session::new(f.context.clone(), "127.0.0.1".into(), json!({}), false).unwrap();
     for _ in 0..30 {
@@ -415,6 +632,7 @@ fn ip_san_without_sni_and_untrusted_issuer() {
     assert!(!app.is_handshaking());
 
     let untrusted = Arc::new(Context {
+        crl: f.context.ca.serve_crl().unwrap(),
         ca: f.context.ca.clone(),
         roots: Arc::new(RootCertStore::empty()),
     });
@@ -429,4 +647,117 @@ fn ip_san_without_sni_and_untrusted_issuer() {
     }
     assert!(error.unwrap().contains("UnknownIssuer"));
     assert!(app.peer_certificates().is_none());
+}
+
+#[test]
+fn opaque_tls_and_passthrough_use_the_shared_stream_cache() {
+    use base64::Engine;
+    let f = Fixture::new();
+    for (tls, bypass) in [(false, false), (false, true), (true, false), (true, true)] {
+        let runtime = crate::protocol::Runtime::new(proxylane_protocol::cache::CacheConfig {
+            root: f.path.join("streams"), ..Default::default()
+        }).unwrap();
+        let mut m = f.session();
+        if bypass { m.skip_verification_for_test(); }
+        m.enable_protocol(runtime.clone(), proxylane_protocol::Connection { id: "opaque".into(), ..Default::default() });
+        if tls {
+            let (mut app, mut origin) = f.endpoints_alpn(false, true, b"mqtt");
+            for _ in 0..30 { exchange(&mut m, &mut app, &mut origin, 3).unwrap(); }
+            assert_eq!(app.alpn_protocol(), Some(b"mqtt".as_slice()));
+            app.writer().write_all(b"\x00PING").unwrap();
+            origin.writer().write_all(b"\x00PONG").unwrap();
+            for _ in 0..8 { exchange(&mut m, &mut app, &mut origin, 7).unwrap(); }
+            app.send_close_notify(); origin.send_close_notify();
+            for _ in 0..8 { exchange(&mut m, &mut app, &mut origin, 7).unwrap(); }
+        } else {
+            m.feed(0, b"\x00PING").unwrap(); m.feed(1, b"\x00PONG").unwrap();
+            m.input_eof(0).unwrap(); m.input_eof(1).unwrap();
+        }
+        drop(m);
+        let result = runtime.query(&json!({"type":"poll","limit":64})).unwrap();
+        let last = result["records"].as_array().unwrap().iter().rev().find(|r|r["type"]=="stream").unwrap();
+        assert_eq!(last["type"], "stream");
+        assert_eq!(last["protocol"], if tls {"tls_stream"} else {"tcp"});
+        assert_eq!(last["connection"]["upstream_verification_skipped"], tls && bypass);
+        if !tls {
+            for row in result["records"].as_array().unwrap() {
+                assert_ne!(row["upstream_verification_skipped"], true);
+                assert_ne!(row["connection"]["upstream_verification_skipped"], true);
+            }
+        }
+        assert_eq!(last["stream"]["complete"], true);
+        for (side, expected) in [("client", b"\x00PING"), ("server", b"\x00PONG")] {
+            let reply = runtime.query(&json!({"type":"cache_read","run_id":runtime.run_id,
+                "cache_id":last["stream"]["cache"]["id"], "direction":side,"length":65536})).unwrap();
+            assert_eq!(base64::engine::general_purpose::STANDARD.decode(reply["payload"]["data_base64"].as_str().unwrap()).unwrap(), expected);
+        }
+        runtime.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn certificate_bypass_is_session_scoped_and_idle_tls_has_lifecycle() {
+    let f = Fixture::new();
+    let untrusted = Fixture::new();
+    for tls12 in [false, true] {
+        let runtime = crate::protocol::Runtime::new(proxylane_protocol::cache::CacheConfig {
+            root:f.path.join("lifecycle"), ..Default::default()
+        }).unwrap();
+        let mut session = f.session();
+        session.skip_verification_for_test();
+        session.enable_protocol(runtime.clone(), proxylane_protocol::Connection {id:"idle".into(), ..Default::default()});
+        let initial=runtime.query(&json!({"type":"poll"})).unwrap();
+        assert_eq!(initial["records"][0]["status"],"Connecting");
+        let (mut app, _) = f.endpoints(tls12,true);
+        let (_, mut origin) = untrusted.endpoints(tls12,false); // both untrusted issuer and wrong hostname
+        for _ in 0..40 { exchange(&mut session,&mut app,&mut origin,7).unwrap(); }
+        assert!(session.ready());
+        let idle=runtime.query(&json!({"type":"poll","after":initial["next"]})).unwrap();
+        let established=idle["records"].as_array().unwrap().iter().find(|r|r["status"]=="Established").unwrap();
+        assert_eq!(established["protocol"],"http1");
+        assert_eq!(established["upstream_verification_skipped"],true);
+        assert!(idle["records"].as_array().unwrap().iter().all(|r|r["type"]=="connection"));
+        assert_eq!(runtime.query(&json!({"type":"stats"})).unwrap()["cache"]["retained_bytes"].as_u64().unwrap_or(0),0);
+        drop(session);
+        assert!(runtime.query(&json!({"type":"poll","after":idle["next"]})).unwrap()["records"].as_array().unwrap().iter().any(|r|r["status"]=="Closed"));
+        let mut strict=f.session(); // bypass did not change other/new sessions
+        strict.enable_protocol(runtime.clone(),proxylane_protocol::Connection {id:"failed".into(),..Default::default()});
+        let (mut app,_)=f.endpoints(tls12,true);let (_,mut origin)=untrusted.endpoints(tls12,false);
+        let error=(0..40).find_map(|_|exchange(&mut strict,&mut app,&mut origin,7).err()).expect("strict verification must reject");
+        strict.fail(error);drop(strict);
+        let result=runtime.query(&json!({"type":"poll","limit":64})).unwrap();
+        assert!(result["records"].as_array().unwrap().iter().any(|r|r["connection"]["id"]=="failed" && r["status"]=="Failed"));
+        runtime.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn realtime_tls_h2_doh_get_post_and_gzip() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let f=Fixture::new();
+    let runtime=crate::protocol::Runtime::new(proxylane_protocol::cache::CacheConfig {
+        root:f.path.join("doh-h2"),..Default::default()
+    }).unwrap();
+    let mut m=f.session();
+    m.enable_protocol(runtime.clone(),proxylane_protocol::Connection {id:"doh-h2".into(),pid:123,..Default::default()});
+    let (mut app,mut origin)=f.endpoints_alpn(false,true,b"h2");
+    for _ in 0..30 {exchange(&mut m,&mut app,&mut origin,7).unwrap();}
+    // Independent Python hyper-h2/HPACK fixture; includes GET, POST and gzip replies.
+    for line in include_str!("../testdata/doh-http2.jsonl").lines() {
+        let event:serde_json::Value=serde_json::from_str(line).unwrap();
+        let bytes=STANDARD.decode(event["data"].as_str().unwrap()).unwrap();
+        if event["side"]==0 {app.writer().write_all(&bytes).unwrap();}else{origin.writer().write_all(&bytes).unwrap();}
+        for _ in 0..4 {exchange(&mut m,&mut app,&mut origin,11).unwrap();}
+        let _=app.reader().read_to_end(&mut Vec::new());let _=origin.reader().read_to_end(&mut Vec::new());
+    }
+    let result=runtime.query(&json!({"type":"poll","limit":64})).unwrap();
+    let rows:Vec<_>=result["records"].as_array().unwrap().iter().filter(|r|r["type"]=="exchange").collect();
+    assert_eq!(rows.len(),2);
+    for row in rows {
+        assert_eq!(row["protocol"],"h2");assert_eq!(row["connection"]["pid"],123);assert!(row.get("doh").is_some());
+        let reply=runtime.query(&json!({"type":"doh_read","run_id":runtime.run_id,"cache_id":row["exchange"]["cache"]["id"],"direction":"server"})).unwrap();
+        assert!(reply["text"].as_str().unwrap().contains("1.2.3.4"));
+        if row["exchange"]["request"]["method"]=="GET" {assert!(row["doh"]["request_get"].as_str().unwrap().contains("a."));}
+    }
+    drop(m);runtime.shutdown().unwrap();
 }

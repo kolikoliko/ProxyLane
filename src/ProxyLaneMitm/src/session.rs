@@ -20,9 +20,32 @@ pub const HIGH_WATER: usize = 256 * 1024;
 const HELLO_LIMIT: usize = 64 * 1024;
 const CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 
+// Only certificate trust/name/time checks are bypassed. TLS handshake signatures remain verified.
+#[derive(Debug)]
+struct SkipCertificateTrust;
+impl rustls::client::danger::ServerCertVerifier for SkipCertificateTrust {
+    fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime)
+        -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, message: &[u8], cert: &rustls::pki_types::CertificateDer<'_>, dss: &rustls::DigitallySignedStruct)
+        -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, message: &[u8], cert: &rustls::pki_types::CertificateDer<'_>, dss: &rustls::DigitallySignedStruct)
+        -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &rustls::crypto::ring::default_provider().signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+    }
+}
+
 pub struct Context {
     pub ca: Arc<Authority>,
     pub roots: Arc<RootCertStore>,
+    pub crl: crate::pki::CrlServer,
 }
 impl Context {
     pub fn open() -> Result<Arc<Self>> {
@@ -33,10 +56,11 @@ impl Context {
         if added == 0 {
             return Err(format!("No system trust roots: {:?}", native.errors));
         }
-        ca.serve_crl()?;
+        let crl = ca.serve_crl()?;
         Ok(Arc::new(Self {
             ca,
             roots: Arc::new(roots),
+            crl,
         }))
     }
 }
@@ -80,6 +104,10 @@ pub struct Session {
     pub observer: Option<(Observer, usize)>,
     context: Arc<Context>,
     host: String,
+    skip_upstream_verify: bool,
+    handshake_seconds: u64,
+    lifecycle: Option<(Arc<crate::protocol::Runtime>, proxylane_protocol::Connection)>,
+    last_status: String,
     // 0 sniffing, 1 passthrough, 2 collecting hello, 3 upstream TLS, 4 downstream TLS/active.
     pub state: u8,
     sniff: Vec<u8>,
@@ -95,6 +123,11 @@ pub struct Session {
     started: Instant,
     pub error: String,
     capture: Option<Capture>,
+    protocol_source: Option<(
+        Arc<crate::protocol::Runtime>,
+        proxylane_protocol::Connection,
+    )>,
+    protocol: Option<crate::protocol::Tap>,
 }
 
 impl Session {
@@ -134,6 +167,10 @@ impl Session {
             observer: None,
             context,
             host,
+            skip_upstream_verify: crate::SKIP_UPSTREAM_VERIFY.load(std::sync::atomic::Ordering::Acquire),
+            handshake_seconds: crate::options::current().handshake_seconds,
+            lifecycle: None,
+            last_status: String::new(),
             state: 0,
             sniff: vec![],
             hello_bytes: 0,
@@ -148,7 +185,48 @@ impl Session {
             started: Instant::now(),
             error: String::new(),
             capture: log,
+            protocol_source: None,
+            protocol: None,
         })
+    }
+
+    pub fn enable_protocol(
+        &mut self,
+        runtime: Arc<crate::protocol::Runtime>,
+        mut identity: proxylane_protocol::Connection,
+    ) {
+        // This connection may turn out to be SSH or another passthrough stream.
+        // Record certificate bypass only after entering the upstream TLS path.
+        identity.upstream_verification_skipped = false;
+        self.lifecycle = Some((runtime.clone(), identity.clone()));
+        self.protocol_source = Some((runtime, identity));
+        self.status("Connecting", "");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn skip_verification_for_test(&mut self) { self.skip_upstream_verify = true; }
+    pub fn transport_result(&mut self, error: usize) {
+        if error == 0 { if self.state == 0 { self.status("Established", ""); } }
+        else { self.fail(format!("TCP connection failed: {error}")); }
+    }
+    fn status(&mut self, state: &str, problem: &str) {
+        if state == self.last_status { return; }
+        self.last_status = state.into();
+        if let Some((runtime, identity)) = &mut self.lifecycle {
+            identity.server_name = self.host.clone();
+            identity.decrypted = self.state >= 2;
+            identity.upstream_verification_skipped = self.skip_upstream_verify && self.state >= 3;
+            let alpn = self.connections[1].as_ref().and_then(|c| c.alpn_protocol());
+            let protocol = if self.state < 2 { "tcp" } else { match alpn { Some(b"h2") => "h2", Some(b"http/1.1") => "http1", _ => "tls_stream" } };
+            runtime.lifecycle(identity, state, protocol, problem, identity.upstream_verification_skipped);
+        }
+    }
+    fn passthrough_data(&mut self, side: usize, bytes: &[u8]) {
+        self.status("Established", "");
+        if let Some((runtime, identity)) = self.protocol_source.take() {
+            self.protocol = runtime.tap_transport(identity, None, false);
+        }
+        if let Some(tap) = &mut self.protocol { tap.data(side, bytes); }
     }
 
     fn event(&mut self, value: Value) -> Result<()> {
@@ -171,6 +249,9 @@ impl Session {
     }
     pub fn fail(&mut self, error: String) {
         if self.error.is_empty() {
+            // Close means capture stopped, never fabricate a clean TLS EOF.
+            self.status("Failed", &error);
+            self.protocol.take();
             let _ = self.event(json!({"event":"error", "message":error}));
             self.error = error;
         }
@@ -195,9 +276,9 @@ impl Session {
         // Idle/server-first protocols are allowed. Only a partial handshake has a deadline.
         if !self.ready()
             && (self.state != 0 || !self.sniff.is_empty())
-            && self.started.elapsed() > Duration::from_secs(15)
+            && self.started.elapsed() > Duration::from_secs(self.handshake_seconds)
         {
-            return Err("TLS detection/handshake exceeded 15 seconds".into());
+            return Err(format!("TLS detection/handshake exceeded {} seconds",self.handshake_seconds));
         }
         Ok(())
     }
@@ -227,6 +308,7 @@ impl Session {
                 if !plausible {
                     self.state = 1;
                     let bytes = std::mem::take(&mut self.sniff);
+                    self.passthrough_data(0, &bytes);
                     self.observe(3, &bytes);
                     self.output[1].extend(bytes);
                     self.event(json!({"event":"passthrough"}))?;
@@ -236,12 +318,14 @@ impl Session {
                     return Ok(());
                 }
                 self.state = 2;
+                self.status("TLS handshaking", "");
                 self.acceptor = Some(Acceptor::default());
                 let bytes = std::mem::take(&mut self.sniff);
                 return self.hello(&bytes);
             }
         }
         if self.state == 1 {
+            self.passthrough_data(side, data);
             self.observe(side as u32 + 3, data);
             self.output[1 - side].extend(data);
             return Ok(());
@@ -293,6 +377,7 @@ impl Session {
                 .map_err(|e| e.to_string())?
                 .with_root_certificates(self.context.roots.clone())
                 .with_no_client_auth();
+        if self.skip_upstream_verify { config.dangerous().set_certificate_verifier(Arc::new(SkipCertificateTrust)); }
         config.alpn_protocols = hello
             .alpn()
             .map(|p| p.map(|p| p.to_vec()).collect())
@@ -313,7 +398,7 @@ impl Session {
         let upstream = self.connections[1].as_ref().unwrap();
         let alpn = upstream.alpn_protocol().map(|p| p.to_vec());
         let version = format!("{:?}", upstream.protocol_version());
-        let leaf = self.context.ca.leaf(&self.host)?;
+        let leaf = self.context.ca.leaf(&self.host, self.context.crl.port())?;
         let mut config =
             ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
@@ -332,7 +417,12 @@ impl Session {
         server.set_buffer_limit(Some(HIGH_WATER));
         self.connections[0] = Some(Connection::Server(server));
         self.state = 4;
-        self.event(json!({"event":"upstream_verified", "tls":version, "alpn":alpn.map(|p| String::from_utf8_lossy(&p).to_string()), "server_name":self.host}))?;
+        if let Some((runtime, mut identity)) = self.protocol_source.take() {
+            identity.server_name = self.host.clone();
+            identity.upstream_verification_skipped = self.skip_upstream_verify;
+            self.protocol = runtime.tap(identity, alpn.clone());
+        }
+        self.event(json!({"event":if self.skip_upstream_verify {"upstream_verification_skipped"} else {"upstream_verified"}, "tls":version, "alpn":alpn.map(|p| String::from_utf8_lossy(&p).to_string()), "server_name":self.host}))?;
         let deferred = std::mem::take(&mut self.deferred);
         if !deferred.is_empty() {
             self.feed_tls(0, &deferred)?;
@@ -363,13 +453,24 @@ impl Session {
         if self.state < 3 {
             return Ok(());
         }
+        if self.ready() { self.status("Established", ""); }
         for side in 0..2 {
             if let Some(c) = self.connections[side].as_mut() {
                 let mut buf = [0u8; 16384];
                 while self.plaintext[1 - side].len() < HIGH_WATER {
                     match c.reader().read(&mut buf) {
-                        Ok(0) => break,
+                        Ok(0) => {
+                            // rustls Reader returns 0 only after buffered plaintext
+                            // has been drained and authenticated close_notify seen.
+                            if let Some(tap) = &mut self.protocol {
+                                tap.eof(side, true);
+                            }
+                            break;
+                        }
                         Ok(n) => {
+                            if let Some(tap) = &mut self.protocol {
+                                tap.data(side, &buf[..n]);
+                            }
                             if let Some((callback, user)) = self.observer {
                                 callback(user, side as u32 + 1, buf.as_ptr(), n);
                             }
@@ -384,6 +485,7 @@ impl Session {
                 }
             }
         }
+        if self.ready() { self.status("Established", ""); }
         for side in 0..2 {
             if let Some(c) = self.connections[side].as_mut() {
                 if !c.is_handshaking() {
@@ -438,6 +540,9 @@ impl Session {
             self.state = 1;
         }
         if self.state != 1 && !self.eof[side] {
+            if let Some(tap) = &mut self.protocol {
+                tap.eof(side, false);
+            }
             return Err(format!(
                 "TLS truncated: {} TCP EOF without close_notify ({})",
                 Self::side_name(side),
@@ -449,6 +554,9 @@ impl Session {
                     "during transfer"
                 }
             ));
+        }
+        if self.state == 1 {
+            if let Some(tap) = &mut self.protocol { tap.eof(side, true); }
         }
         self.eof[side] = true;
         self.pump()
@@ -474,6 +582,7 @@ impl Session {
 }
 impl Drop for Session {
     fn drop(&mut self) {
+        if self.error.is_empty() { self.status("Closed", ""); }
         let _ = self.event(json!({"event":"closed", "state":self.state, "error":self.error}));
     }
 }

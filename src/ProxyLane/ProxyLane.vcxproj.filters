@@ -60,6 +60,12 @@
     <ClCompile Include="Page3.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="Page4Protocol.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="ProtocolViewModel.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="Page4.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
@@ -128,6 +134,12 @@
     <ClInclude Include="Page3.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="ProtocolViewModel.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="MitmSettings.h"><Filter>头文件</Filter></ClInclude>
+    <ClInclude Include="ByteHexView.h" />
+    <ClInclude Include="ProtocolRawView.h" />
     <ClInclude Include="Page4.h">
       <Filter>头文件</Filter>
     </ClInclude>

@@ -5,6 +5,8 @@
 #include "UdpAssociationPolicy.h"
 #include <list>
 #include <vector>
+#include <memory>
+class CProtocolTap;
 
 class CProxyUDPTaskMgr;
 
@@ -60,6 +62,7 @@ private:
 		_SockAddr applicationEndpoint;
 		BOOL hasApplicationEndpoint;
 		BOOL firstDatagramLogged;
+		std::shared_ptr<CProtocolTap> capture;
 	};
 	typedef std::list<UdpRoute> UdpRouteList;
 	UdpRouteList m_routes;

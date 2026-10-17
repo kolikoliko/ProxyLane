@@ -715,10 +715,28 @@ BOOL CPage1::GetSettings(OUT LPProxyInfo lpPI)
 	pi.strProxyPass = szPass;
 	pi.reserved = transportMode;
 
+	if (szType.CompareNoCase(_T("NOPROXY")) == 0)
+	{
+		// Keep the explicit profile type, but discard irrelevant proxy settings.
+		pi.strProxyHost = _T("");
+		pi.nProxyPort = 0;
+		pi.strProxyUser = _T("");
+		pi.strProxyPass = _T("");
+		pi.reserved = PROXY_TRANSPORT_PLAIN;
+		SecureZeroMemory(pi.strTransportPsk.szbuf, sizeof(pi.strTransportPsk.szbuf));
+		*lpPI = pi;
+		return TRUE;
+	}
+
 	if (!szHost.GetLength() || !szPort.GetLength() || !_ttoi(szPort))
 		return FALSE;
 	if (transportMode == PROXY_TRANSPORT_GONC_TLS_PSK)
 	{
+		if (!ProxySupportsOptionalModules())
+		{
+			m_settingsValidationKey = _T("profile.secure_transport_unavailable");
+			return FALSE;
+		}
 		if (!ProxyTransportPolicy::SupportsGoncTlsPsk(pi.GetProxyType()))
 		{
 			m_settingsValidationKey = _T("profile.secure_transport_unsupported");
@@ -835,12 +853,25 @@ void CPage1::UpdateTransportEnable()
 	ProxyInfo selectedProxy;
 	selectedProxy.strProxyType = proxyType;
 	const int selectedProxyType = selectedProxy.GetProxyType();
+	const BOOL direct = proxyType.CompareNoCase(_T("NOPROXY")) == 0;
+	m_edit_HostName.EnableWindow(!direct);
+	m_edit_Port.EnableWindow(!direct);
+	m_edit_User.EnableWindow(!direct);
+	m_edit_Pass.EnableWindow(!direct);
+	m_btnHookTCP.SetWindowText(Localization::Get(direct
+		? _T("page1.direct_tcp") : _T("page1.proxy_tcp")));
+	m_btnHookUDP.SetWindowText(Localization::Get(direct
+		? _T("page1.direct_udp") : _T("page1.proxy_udp")));
+	m_btnBlockUDP.SetWindowText(Localization::Get(direct
+		? _T("page1.direct_block_udp") : _T("page1.block_udp")));
 	const BOOL supportsSecureTransport =
 		ProxyTransportPolicy::SupportsGoncTlsPsk(selectedProxyType);
-	if (!supportsSecureTransport)
+	// Preserve an encrypted profile on unsupported hosts; never silently downgrade it.
+	const BOOL supportsModules = ProxySupportsOptionalModules();
+	if (direct || (supportsModules && !supportsSecureTransport))
 		m_cbTransport.SetCurSel(PROXY_TRANSPORT_PLAIN);
-	m_cbTransport.EnableWindow(supportsSecureTransport);
-	m_editTransportPsk.EnableWindow(supportsSecureTransport &&
+	m_cbTransport.EnableWindow(supportsModules && supportsSecureTransport);
+	m_editTransportPsk.EnableWindow(supportsModules && supportsSecureTransport &&
 		m_cbTransport.GetCurSel() == PROXY_TRANSPORT_GONC_TLS_PSK);
 	if (m_btnHookUDP.GetSafeHwnd())
 	{
@@ -1628,6 +1659,8 @@ void CPage1::UILoadCfg( CfgProxyItem *item )
 		szType = item->pi.strProxyType;
 		szHost = item->pi.strProxyHost;
 		szPort.Format(_T("%d"), item->pi.nProxyPort);
+		if (szType.CompareNoCase(_T("NOPROXY")) == 0 && !item->pi.nProxyPort)
+			szPort.Empty();
 		szUser = item->pi.strProxyUser;
 		szPass = item->pi.strProxyPass;
 
@@ -1679,6 +1712,11 @@ void CPage1::UIGetCfg( CfgProxyItem *item )
 		PROXY_TRANSPORT_GONC_TLS_PSK ? PROXY_TRANSPORT_GONC_TLS_PSK :
 		PROXY_TRANSPORT_PLAIN;
 	m_editTransportPsk.GetWindowText(item->strTransportPsk);
+	if (item->pi.GetProxyType() == PROXYTYPE_NOPROXY)
+	{
+		item->nTransportMode = PROXY_TRANSPORT_PLAIN;
+		item->strTransportPsk.Empty();
+	}
 
 	item->bHookTCP = m_btnHookTCP.GetCheck() == BST_CHECKED;
 	item->bHookUDP = m_btnHookUDP.GetCheck() == BST_CHECKED;

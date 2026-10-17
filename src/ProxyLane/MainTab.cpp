@@ -224,7 +224,8 @@ void CMainTab::OnPaint()
 		CString navigationText = Localization::Get(kNavigationKeys[i]);
 		dc.DrawText(navigationText, label, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
-		if (i == m_attentionPage && !selected)
+		const bool monitoring = i == PAGE_MONITOR && m_page4.IsMonitoring();
+		if (monitoring || (i == m_attentionPage && !selected))
 		{
 			const int dotSize = UiTheme::ScaleForWindow(m_hWnd, 7);
 			CRect dot(
@@ -232,8 +233,9 @@ void CMainTab::OnPaint()
 				item.CenterPoint().y - dotSize / 2,
 				item.right - UiTheme::ScaleForWindow(m_hWnd, 17) + dotSize,
 				item.CenterPoint().y - dotSize / 2 + dotSize);
-			CBrush dotBrush(UiTheme::Accent());
-			CPen dotPen(PS_SOLID, 1, UiTheme::Accent());
+			const COLORREF dotColor = monitoring ? UiTheme::Success() : UiTheme::Accent();
+			CBrush dotBrush(dotColor);
+			CPen dotPen(PS_SOLID, 1, dotColor);
 			CBrush* oldDotBrush = dc.SelectObject(&dotBrush);
 			CPen* oldDotPen = dc.SelectObject(&dotPen);
 			dc.Ellipse(dot);

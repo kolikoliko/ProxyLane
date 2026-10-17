@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "AsyncSecureSocketLayer.h"
 #include "..\ProxyLog.h"
+#include "..\PlatformSupport.h"
 
 namespace
 {
@@ -70,6 +71,11 @@ CAsyncSecureSocketLayer::~CAsyncSecureSocketLayer()
 BOOL CAsyncSecureSocketLayer::Configure(const CStringA& psk,
 	const CStringA& serverName)
 {
+	if (!ProxySupportsOptionalModules())
+	{
+		WSASetLastError(WSAEOPNOTSUPP);
+		return FALSE;
+	}
 	if (psk.IsEmpty())
 	{
 		WSASetLastError(WSAEINVAL);
@@ -82,6 +88,11 @@ BOOL CAsyncSecureSocketLayer::Configure(const CStringA& psk,
 
 BOOL CAsyncSecureSocketLayer::LoadTransport()
 {
+	if (!ProxySupportsOptionalModules())
+	{
+		m_transportLoadError = ERROR_NOT_SUPPORTED;
+		return FALSE;
+	}
 	if (m_hTransport)
 		return TRUE;
 	m_transportLoadError = 0;
@@ -93,13 +104,8 @@ BOOL CAsyncSecureSocketLayer::LoadTransport()
 	TCHAR* slash = _tcsrchr(path, _T('\\'));
 	if (!slash)
 		return FALSE;
-#ifdef _WIN64
 	_tcscpy_s(slash + 1, _countof(path) - (slash + 1 - path),
 		_T("ProxyLaneSecureTransport64.dll"));
-#else
-	_tcscpy_s(slash + 1, _countof(path) - (slash + 1 - path),
-		_T("ProxyLaneSecureTransport32.dll"));
-#endif
 	m_hTransport = LoadLibrary(path);
 	if (!m_hTransport)
 	{

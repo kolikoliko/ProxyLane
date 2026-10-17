@@ -58,6 +58,11 @@ public:
 	virtual int ManageCA(CaAction action, char* output, size_t capacity) = 0;
 	virtual BOOL SetEnabled(BOOL enabled, char* error, size_t capacity) = 0;
 	virtual BOOL IsEnabled() = 0;
+	// Passive HTTP reconstruction/cache, independent of GUI monitoring. UTF-8
+	// JSON request/reply. Consumer thread only: may wait for analysis/disk work.
+	// Returns required capacity INCLUDING NUL (undersized buffer untouched),
+	// or -1 with error text. Non-destructive polls use a sequence cursor.
+	virtual int QueryProtocol(const char* request, char* output, size_t capacity) = 0;
 protected:
 	virtual ~IProxyTlsControl() {}
 };
@@ -233,6 +238,9 @@ public:
 	virtual void EnumTask(IProxyTaskMgr *pCallBack) = 0;
 	virtual void OnEachTask(const LPPRCClient lpC, const LPProxyInfo lpPI) = 0;
 	virtual BOOL GetTaskCount(DWORD *pCount) = 0;
+    // Snapshot only this manager's existing tasks; commit is consumed by its network-thread timer.
+    virtual DWORD PrepareReconnect(BOOL decrypt) { return 0; }
+    virtual void CompleteReconnect(BOOL disconnect) {}
 };
 
 

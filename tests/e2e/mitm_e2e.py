@@ -1,7 +1,7 @@
 """Real injected Schannel curl -> ProxyLane -> SOCKS5/CONNECT -> local TLS origin.
 
 Installs a UNIQUE temporary CurrentUser CA, removes that exact CA in finally.
-Requires Python cryptography and compiled bin/mitm_host{32,64}.exe.
+Requires Python cryptography and compiled build/tools/mitm_host64.exe.
 No proxy profiles, existing certificates, or revocation-cache settings are changed.
 """
 import argparse
@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shutil
 import socket
 import socketserver
 import ssl
@@ -161,19 +162,34 @@ def main():
             if not inherited.gp_UnhookWinsock():
                 raise RuntimeError("Could not isolate inherited hooks in test controller")
     parser = argparse.ArgumentParser()
-    parser.add_argument("--arch", choices=["32", "64"], default="64")
+    parser.add_argument("--arch", choices=["32", "64"], default="64", help="Target curl architecture; the proxy host is always x64")
     parser.add_argument("--binary-directory", default="bin")
+    parser.add_argument("--tool-directory", default="build/tools")
     parser.add_argument("--external-ifconfig", action="store_true", help="Optional live reproduction against ifconfig.io")
+    parser.add_argument("--protocol", action="store_true", help="Also verify live HTTP reconstruction and bounded payload cache")
+    parser.add_argument("--multi-instance", action="store_true", help="Verify shared CA, separate CRL listeners and Schannel revocation")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     work = root / "build" / "qa" / ("mitm-" + uuid.uuid4().hex[:12])
     work.mkdir(parents=True)
     env = dict(os.environ, PROXYLANE_MITM="0", PROXYLANE_MITM_HOME=str(work / "pki"), PROXYLANE_MITM_CRL_PORT=str(free_port()))
+    env["PROXYLANE_PROTOCOL_CACHE_ROOT"] = str(work / "protocol-cache")
+    if args.protocol:
+        env["PROXYLANE_TEST_PROTOCOL"] = "1"
     for key in list(env):
         if key.lower() in ("http_proxy", "https_proxy", "all_proxy"): del env[key]
-    binary_directory = (root / args.binary_directory).resolve()
-    ca_tool = binary_directory / ("ProxyLaneMitm" + args.arch + ".exe")
-    host = binary_directory / ("mitm_host" + args.arch + ".exe")
+    # Stage test hosts beside their runtime DLLs in this run's private directory.
+    runtime_source = (root / args.binary_directory).resolve()
+    tool_source = (root / args.tool_directory).resolve()
+    binary_directory = work / "runtime"
+    binary_directory.mkdir()
+    for source in runtime_source.glob("*.dll"):
+        shutil.copy2(source, binary_directory/source.name)
+    for pattern in ("mitm_host*.exe", "ProxyLaneMitm*.exe"):
+        for source in tool_source.glob(pattern):
+            shutil.copy2(source, binary_directory/source.name)
+    ca_tool = binary_directory / "ProxyLaneMitm64.exe"
+    host = binary_directory / "mitm_host64.exe"
     curl = Path(os.environ["WINDIR"]) / ("SysWOW64" if args.arch == "32" else "System32") / "curl.exe"
     def ca(action):
         return json.loads(subprocess.check_output([str(ca_tool), action], env=env, text=True))
@@ -234,6 +250,9 @@ def main():
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
             (work / (label + ".log")).write_bytes(result.stdout + result.stderr)
             child_pids.add(int(re.search(br"CHILD pid=(\d+)", result.stderr).group(1)))
+            if args.protocol:
+                from realtime_protocol import check_original
+                check_original(result, label, encrypted and label not in ("gui-disabled", "invalid-name"), work)
             if label == "invalid-name":
                 assert result.returncode != 0, "upstream name mismatch must be rejected"
             else:
@@ -297,6 +316,13 @@ def main():
             (work / "ifconfig.log").write_bytes(result.stdout + result.stderr)
             assert b"GUI_EVENT" in result.stderr, "External reproduction must pass through MITM"
             print("ifconfig", result.returncode, result.stderr.decode(errors="replace"), flush=True)
+        if args.protocol and args.arch == "64":
+            from realtime_protocol import run
+            run(host, env, work, proxy, start, servers)
+        if args.multi_instance:
+            from mitm_multi_instance import run as run_multi_instance
+            run_multi_instance(binary_directory, env, work, proxy, tls, authority)
+        assert not list((work / "protocol-cache").glob("run-*")), "Normal host exit must remove its payload cache"
         assert not (work / "pki" / "captures").exists(), "Default MITM must not create disk captures"
         (work / "results.json").write_text(json.dumps(results, indent=2))
         print("PASS", work, flush=True)

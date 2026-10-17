@@ -78,8 +78,9 @@ BOOL CProxyProfileStore::Load(CfgProxyItem& item) const
 	item.strTransportPsk = m_ini.GetString(section, _T("PSK"));
 
 	const CString proxyType = (CString)item.pi.strProxyType;
-	const BOOL supportedType = item.pi.GetProxyType() != PROXYTYPE_NOPROXY
-		|| proxyType.CompareNoCase(_T("NOPROXY")) == 0;
+	if (proxyType.CompareNoCase(_T("NOPROXY")) == 0)
+		return TRUE; // Direct profiles have no upstream proxy endpoint.
+	const BOOL supportedType = item.pi.GetProxyType() != PROXYTYPE_NOPROXY;
 
 	return supportedType
 		&& item.pi.nProxyPort != 0

@@ -366,6 +366,7 @@
     <ClInclude Include="PRCTcpPeer.h" />
     <ClInclude Include="MitmBridge.h" />
     <ClInclude Include="MitmControl.h" />
+    <ClInclude Include="PlatformSupport.h" />
     <ClInclude Include="ProxyMonitor.h" />
     <ClInclude Include="PRCTcpServer.h" />
     <ClInclude Include="PRCUdpPeer.h" />

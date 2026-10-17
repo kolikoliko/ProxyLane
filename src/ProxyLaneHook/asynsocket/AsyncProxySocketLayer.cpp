@@ -119,6 +119,7 @@ Version history
 
 #include "stdafx.h"
 #include "..\Socks5UdpCodec.h"
+#include "..\PlatformSupport.h"
 #include "types.h"
 #include "AsyncProxySocketLayer.h"
 #include "AsyncSecureSocketLayer.h"
@@ -1471,6 +1472,11 @@ BOOL CAsyncProxySocketLayer::GetPeerName(SOCKADDR* lpSockAddr, int* lpSockAddrLe
 
 BOOL CAsyncProxySocketLayer::SetSecureTransport(const CStringA& psk)
 {
+	if (!ProxySupportsOptionalModules())
+	{
+		WSASetLastError(WSAEOPNOTSUPP);
+		return FALSE;
+	}
 	if (psk.IsEmpty() || m_ProxyData.nProxyType != PROXYTYPE_SOCKS5)
 	{
 		WSASetLastError(WSAEINVAL);

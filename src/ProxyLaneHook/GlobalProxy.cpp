@@ -36,6 +36,8 @@ CGlobalProxy::CGlobalProxy(void)
 
 CGlobalProxy::~CGlobalProxy(void)
 {
+	// GUI exits call DisableProxy first; release any remaining idle service.
+	CMitmControl::Instance().ShutdownProtocol();
 	delete m_pProxyLog;
 	delete m_pProxySettings;
 	delete m_pProxyTesterMgr;
@@ -110,6 +112,7 @@ BOOL CGlobalProxy::DisableProxy()
 	delete m_pProxyRC;
 	m_pProxyRC = NULL;
 	m_bProxyEnaled = FALSE;
+	CMitmControl::Instance().ShutdownProtocol();
 
 	return TRUE;
 }

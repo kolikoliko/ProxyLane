@@ -46,7 +46,9 @@ public:
 	BOOL OnDeleteTask(CTcpProxyTask *pTask);
 	VOID OnTimer(UINT_PTR nIDEvent);
 
-	VOID RemoveAllTasks();
+	DWORD PrepareReconnect(BOOL decrypt) override;
+    void CompleteReconnect(BOOL disconnect) override;
+    VOID RemoveAllTasks();
 
 	void EnumTask(IProxyTaskMgr *pCallBack);
 	virtual BOOL GetTaskCount(DWORD *pCount);

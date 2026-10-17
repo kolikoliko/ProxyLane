@@ -10,6 +10,7 @@
 #include "ProxyLog.h"
 #include "UdpAssociationPolicy.h"
 #include "ProxyReceptionCentre.h"
+#include "MitmBridge.h"
 
 static const DWORD UDP_ASSOCIATION_IDLE_TIMEOUT = 5 * 60 * 1000;
 
@@ -415,11 +416,9 @@ VOID CUdpProxyTask::OnServerWritable()
 		m_pTaskmgr->m_pPRC->RecordTraffic(m_ProxyInfo, false, sent);
 	}
 
-	for (UdpRouteList::iterator it = m_routes.begin(); it != m_routes.end(); ++it)
-	{
-		if (it->peer && it->peer->GetValidDataLen() > 0)
-			it->peer->TransferSend();
-	}
+	// ForwardClientDatagram owns each packet, including the first direct
+	// packet queued during synchronous activation. The peer's receive buffer
+	// is still populated on that call stack; resending it duplicates traffic.
 	FlushPendingReplies();
 }
 
@@ -547,6 +546,9 @@ BOOL CUdpProxyTask::ForwardClientDatagram(CPRCUdpPeer *routePeer,
 	{
 		if (it->peer == routePeer)
 		{
+			if (!CProtocolTap::Enabled()) it->capture.reset();
+			else if (!it->capture) it->capture = std::make_shared<CProtocolTap>(it->client, true);
+			if (it->capture) it->capture->Data(0, data, length);
 			it->applicationEndpoint = application;
 			it->hasApplicationEndpoint = TRUE;
 			if (!it->firstDatagramLogged)
@@ -632,6 +634,8 @@ BOOL CUdpProxyTask::ForwardServerDatagram(_SockAddr source,
 		return FALSE;
 	m_lastActivity = GetTickCount();
 
+	if (!CProtocolTap::Enabled()) selected->capture.reset();
+	if (selected->capture) selected->capture->Data(1, data, length);
 	_SockAddr application = selected->hasApplicationEndpoint ?
 		selected->applicationEndpoint : selected->client.srcAddr;
 	if (application.IsAny())
@@ -732,6 +736,7 @@ VOID CUdpProxyTask::EndTask()
 	m_upstreamState = UdpAssociationPolicy::UPSTREAM_CLOSING;
 	for (UdpRouteList::iterator it = m_routes.begin(); it != m_routes.end(); ++it)
 	{
+		it->capture.reset();
 		if (it->peer)
 		{
 			it->peer->Close();
@@ -758,8 +763,10 @@ VOID CUdpProxyTask::CloseTask()
 	m_pendingReplies.clear();
 	m_pendingReplyBytes = 0;
 	for (UdpRouteList::iterator it = m_routes.begin(); it != m_routes.end(); ++it)
-		if (it->peer)
-			it->peer->Close();
+	{
+		it->capture.reset();
+		if (it->peer) it->peer->Close();
+	}
 	if(m_pServer)
 	{
 		m_pServer->Close();

@@ -53,6 +53,7 @@ ProxyLane uses user-mode process injection and API hooking to intercept and redi
 - For a child process that must be proxied, the Hook module is loaded and initialized in that process's main-thread context. The main thread resumes only after initialization succeeds, ensuring the network hooks are ready before the application opens connections.
 - The main application manages proxy profiles, filtering rules, and logs. The Hook module monitors child-process creation and network activity. The entire workflow runs in user mode.
 - Win32 and x64 components are provided for compatibility with Windows XP through Windows 11.
+- The 32-bit host and Windows XP / Server 2003 retain core proxy features without data monitoring, HTTPS decryption or gonc secure transport. A supported 64-bit host provides these features for both 32-bit and 64-bit target applications.
 
 ## Build Environment
 
@@ -68,7 +69,7 @@ For a SOCKS5 profile, select `gonc TLS-PSK` under **Transport** and enter the sa
 
 In this initial format, the PSK is stored as plaintext in the profile's `PSK=` field. Protect access to `ProxyLane.ini` accordingly. Secure transport is available only for SOCKS5, and plain HTTP/SOCKS5 profiles do not load the secure component.
 
-The secure implementation is isolated in the optional `ProxyLaneSecureTransport32.dll` and `ProxyLaneSecureTransport64.dll`. The application and Hook DLLs remain built with `v141_xp`, and the secure DLLs are not loaded unless the profile selects secure transport. Build them with the Rust MSVC toolchain:
+Secure transport runs in the 64-bit host through `ProxyLaneSecureTransport64.dll` and supports both 32-bit and 64-bit target applications. The 32-bit host retains plain proxy support, without secure transport or data monitoring. The application and Hook DLLs remain built with `v141_xp`, and the secure DLL is not loaded unless the profile selects secure transport. Build them with the Rust MSVC toolchain:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-secure-transport.ps1
@@ -93,15 +94,17 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check-locales.ps1
 
 ## HTTPS Inspection and Data Monitoring (Experimental)
 
-ProxyLane lets you inspect HTTPS requests and responses from selected processes for development and debugging. Applications do not need to use the system proxy, and TLS connections on ports other than 443 are supported. Data Monitor identifies the process, destination, and traffic direction, with text and HEX views.
+ProxyLane lets you inspect HTTPS requests and responses from selected processes for development and debugging. Applications do not need to use the system proxy, and TLS connections on ports other than 443 are supported. Data Monitor lists sessions with their process identity: view HTTP/1.1 and HTTP/2 headers and decompressed bodies, bidirectional byte streams for ordinary TCP and non-HTTP TLS, or individual UDP datagrams. DNS queries and responses are reconstructed, and QUIC v1/v2 handshake details are available (HTTP/3 payload decryption is not yet supported). Filter by process, PID or address and switch between Raw and HexView. Ordinary TCP/UDP only requires Start monitoring; no CA installation is needed. Enable UDP in the proxy profile to capture it.
+
+To monitor traffic without an external proxy, select `NOPROXY`; no host or port is required. Enable **Intercept TCP / Intercept UDP**, disable **Block UDP**, start ProxyLane's proxy service, then attach the target application and start monitoring.
 
 1. Open **Data Monitor** and enable **Decrypt HTTPS**.
 2. On first use, choose **Trust for this user** in **CA management**, then close the dialog to enable decryption.
 3. Start the proxy, select the target process, and have the application establish new connections to view decrypted traffic.
 
-Decrypted connections show plaintext; other connections show raw data. Monitoring keeps recent data in memory without automatically saving traffic files. You can pause or clear the monitor and remove certificate trust through CA management.
+Request payloads use a size-limited temporary cache, with truncation and eviction notices; the cache is cleaned up on exit. You can pause or clear the list and remove certificate trust through CA management.
 
-This is a simple data viewer; structured protocol analysis is not yet available. Some applications with their own certificate checks may reject decryption. QUIC/HTTP3 is not supported yet.
+This is a simple session viewer. Some applications with their own certificate checks may reject decryption. HTTP/3 payload decryption is not supported yet.
 
 ## Packaging a Release
 
@@ -111,7 +114,7 @@ Build the Win32 and x64 Release configurations, then run the following command f
 powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 ```
 
-The script reads version information from the application and Hook binaries, verifies that they have the same version, and creates `dist/ProxyLane-version-Windows.zip`. The archive contains the Win32 and x64 applications, matching Hook DLLs, both secure-transport DLLs, both MITM DLLs and CA command-line tools, the sample configuration, and both README files.
+The script reads version information from the application and Hook binaries, verifies that they have the same version, and creates `dist/ProxyLane-version-Windows.zip`. The archive contains the Win32 and x64 applications, matching Hook DLLs, the 64-bit secure-transport and MITM DLLs, the sample configuration, licenses, and both README files. Test executables and command-line helpers are excluded.
 
 The sample configuration is stored at `examples/ProxyLane.ini` and is copied to the package root as `ProxyLane.ini`.
 

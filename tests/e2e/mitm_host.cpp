@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
+#include <vector>
 #include "../../src/ProxyLaneHook/ProxyModule.h"
 
 class Settings : public IProxySettings {
@@ -30,6 +31,68 @@ public:
     void OnConnectionEvent(ConnectionEvent event, const LPPRCClient c, LPCWSTR) { fprintf(stderr, "ROUTE pid=%lu event=%d\n", c->dwPid, event); }
     void OnConnectionFailure(const LPPRCClient c, LPCWSTR, ConnectionStage stage, DWORD error) { fprintf(stderr, "FAIL pid=%lu stage=%d error=%lu\n", c->dwPid, stage, error); }
 };
+static std::string ProtocolQuery(IProxyTlsControl* tls, const std::string& request) {
+    std::vector<char> buffer(4096);
+    for (int attempt = 0; attempt != 4; ++attempt) {
+        int result = tls->QueryProtocol(request.c_str(), buffer.data(), buffer.size());
+        if (result < 0) { fprintf(stderr, "PROTOCOL_QUERY_ERROR %s\n", buffer.data()); return ""; }
+        if (result <= (int)buffer.size()) { printf("PROTOCOL_JSON %s\n", buffer.data()); return buffer.data(); }
+        if (result > 8 * 1024 * 1024) ExitProcess(30);
+        buffer.resize(result);
+    }
+    ExitProcess(31); return "";
+}
+static void DumpProtocol(IProxyTlsControl* tls) {
+    char sentinel = '!';
+    if (tls->QueryProtocol("{\"type\":\"stats\"}", &sentinel, 1) <= 1 || sentinel != '!') ExitProcess(32);
+    std::string stats = ProtocolQuery(tls, "{\"type\":\"stats\"}");
+    ProtocolQuery(tls, "{\"type\":\"poll\",\"limit\":64}");
+    const std::string key = "\"run_id\":\"";
+    size_t start = stats.find(key);
+    if (start == std::string::npos) return;
+    start += key.size();
+    std::string run = stats.substr(start, stats.find('"', start) - start);
+    for (int id = 1; id <= 8; ++id) {
+        std::string base = "\"run_id\":\"" + run + "\",\"cache_id\":" + std::to_string(id);
+        ProtocolQuery(tls, "{\"type\":\"cache_status\"," + base + "}");
+        if (id <= 4) {
+            ProtocolQuery(tls, "{\"type\":\"cache_read\",\"direction\":\"server\",\"offset\":0,\"length\":65536," + base + "}");
+            ProtocolQuery(tls, "{\"type\":\"cache_decode\",\"direction\":\"server\"," + base + "}");
+        }
+    }
+}
+static bool WaitTestGate(const wchar_t* path) {
+    if (!path[0]) return true;
+    fprintf(stderr, "CRL_TEST_WAITING\n"); fflush(stderr);
+    DWORD start = GetTickCount();
+    while (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        if (GetTickCount() - start > 90000) return false;
+        Sleep(20);
+    }
+    return true;
+}
+static bool AttachChild(const PROCESS_INFORMATION& child, const char* pipe) {
+#ifdef _WIN64
+    BOOL wow64=FALSE;
+    if (IsWow64Process(child.hProcess,&wow64) && wow64) {
+        // Match the GUI's cross-bitness path: a 32-bit helper injects Hook32,
+        // while the proxy service and optional TLS modules remain in this host.
+        wchar_t windows[MAX_PATH]={},host[MAX_PATH]={},command[2048]={};
+        GetWindowsDirectoryW(windows,MAX_PATH);GetModuleFileNameW(NULL,host,MAX_PATH);
+        wchar_t* slash=wcsrchr(host,L'\\');if(!slash)return false;*slash=0;
+        _snwprintf_s(command,_countof(command),_TRUNCATE,
+            L"\"%s\\SysWOW64\\rundll32.exe\" \"%s\\ProxyLaneHook32.dll\",AttachTo --pid=%lu --tid=%lu --pipe=%hs",
+            windows,host,child.dwProcessId,child.dwThreadId,pipe);
+        STARTUPINFOW startup={sizeof(startup)};PROCESS_INFORMATION helper={};
+        if(!CreateProcessW(NULL,command,NULL,NULL,FALSE,CREATE_NO_WINDOW,NULL,NULL,&startup,&helper))return false;
+        DWORD code=0;
+        if(WaitForSingleObject(helper.hProcess,15000)==WAIT_OBJECT_0)GetExitCodeProcess(helper.hProcess,&code);
+        else TerminateProcess(helper.hProcess,1);
+        CloseHandle(helper.hThread);CloseHandle(helper.hProcess);return code==0xFF01;
+    }
+#endif
+    return AttachToI(child.dwProcessId,child.dwThreadId,pipe)==0xFF01;
+}
 int wmain(int argc, wchar_t** argv) {
     IGlobalProxy* proxy = GetGlobalProxyInstance();
     IProxyTlsControl* tls = proxy->GetTlsControl();
@@ -83,7 +146,21 @@ int wmain(int argc, wchar_t** argv) {
     if (tls->IsEnabled()) return 9; // Test GUI API without the legacy env switch.
     if (!tls->SetEnabled(TRUE, error, sizeof(error))) { fprintf(stderr, "%s\n", error); return 10; }
     if (!tls->IsEnabled()) return 11;
-    monitor->SetEnabled(TRUE);
+    char skipTest[8] = {};
+    if (GetEnvironmentVariableA("PROXYLANE_TEST_SKIP_UPSTREAM", skipTest, sizeof(skipTest))) {
+        if (tls->QueryProtocol("{\"type\":\"mitm_options\",\"skip_upstream_verify\":true}", error, sizeof(error)) < 0) return 37;
+    }
+    char crlTest[8] = {};
+    if (GetEnvironmentVariableA("PROXYLANE_TEST_CRL", crlTest, sizeof(crlTest))) {
+        char details[4096] = {};
+        if (tls->ManageCA(IProxyTlsControl::QueryCA, details, sizeof(details)) < 0) return 34;
+        fprintf(stderr, "CRL_TEST_CA\n%s\n", details); fflush(stderr);
+    }
+    char protocolMode[8] = {}, monitorOff[8] = {};
+    bool protocolTest = GetEnvironmentVariableA("PROXYLANE_TEST_PROTOCOL", protocolMode, sizeof(protocolMode)) != 0;
+    bool noMonitor = GetEnvironmentVariableA("PROXYLANE_TEST_NO_MONITOR", monitorOff, sizeof(monitorOff)) != 0;
+    if (protocolTest && !noMonitor && tls->QueryProtocol("{\"type\":\"monitor_start\"}", error, sizeof(error)) < 0) return 38;
+    monitor->SetEnabled(!noMonitor);
     char disabled[8] = {};
     bool disableBeforeConnect = GetEnvironmentVariableA("PROXYLANE_MITM_TEST_DISABLED", disabled, sizeof(disabled)) != 0;
     if (disableBeforeConnect) tls->SetEnabled(FALSE, NULL, 0);
@@ -95,6 +172,11 @@ int wmain(int argc, wchar_t** argv) {
     if (!proxy->EnableProxy()) return 4;
     char pipe[MAX_PATH] = {0};
     if (!proxy->GetPRCInstance()->GetPRCPipeName(pipe, sizeof(pipe))) return 5;
+    wchar_t repeatGate[MAX_PATH] = {}, holdGate[MAX_PATH] = {};
+    GetEnvironmentVariableW(L"PROXYLANE_TEST_REPEAT_GATE", repeatGate, _countof(repeatGate));
+    GetEnvironmentVariableW(L"PROXYLANE_TEST_HOLD_GATE", holdGate, _countof(holdGate));
+    DWORD code = 8;
+    for (int attempt = 0; attempt < (repeatGate[0] ? 2 : 1); ++attempt) {
     STARTUPINFOW startup = {sizeof(startup)};
     startup.dwFlags = STARTF_USESTDHANDLES;
     startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
@@ -103,7 +185,7 @@ int wmain(int argc, wchar_t** argv) {
     PROCESS_INFORMATION child = {0};
     std::wstring command(argv[3]);
     if (!CreateProcessW(NULL, &command[0], NULL, NULL, TRUE, CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, NULL, &startup, &child)) return 6;
-    bool injected = proxy->GetPRCInstance()->AuthorizeProcessPipeAccess(child.hProcess) && AttachToI(child.dwProcessId, child.dwThreadId, pipe) == 0xFF01;
+    bool injected = proxy->GetPRCInstance()->AuthorizeProcessPipeAccess(child.hProcess) && AttachChild(child, pipe);
     if (!injected) { TerminateProcess(child.hProcess, 7); return 7; }
     fprintf(stderr, "CHILD pid=%lu\n", child.dwProcessId);
     ResumeThread(child.hThread);
@@ -128,7 +210,7 @@ int wmain(int argc, wchar_t** argv) {
                 e.client.dwPid, e.client.processCreateTime, e.connection, e.kind, e.length,
                 bytes.find("GET /probe") != std::string::npos, bytes.find("HTTP/1.1 200") != std::string::npos);
             // Switching off must not interrupt an already established TLS stream.
-            if (!toggled && e.kind == 1) { tls->SetEnabled(FALSE, NULL, 0); toggled = true; }
+            if (!protocolTest && !toggled && e.kind == 1) { tls->SetEnabled(FALSE, NULL, 0); toggled = true; }
         }
     };
     while (WaitForSingleObject(child.hProcess, 10) != WAIT_OBJECT_0) {
@@ -145,9 +227,19 @@ int wmain(int argc, wchar_t** argv) {
         Sleep(10);
     }
     drain();
-    DWORD code = 8; GetExitCodeProcess(child.hProcess, &code);
+    GetExitCodeProcess(child.hProcess, &code);
     CloseHandle(child.hThread); CloseHandle(child.hProcess);
-    proxy->DisableProxy(); settings.Detach(); log.Detach(); ReleaseGlobalProxyInstance(); WSACleanup();
+    if (code) break;
+    if (attempt == 0 && !WaitTestGate(repeatGate)) { code = 35; break; }
+    }
+    if (holdGate[0]) {
+        tls->SetEnabled(FALSE, NULL, 0);
+        if (!WaitTestGate(holdGate)) code = 36;
+    }
+    if (protocolTest) DumpProtocol(tls);
+    proxy->DisableProxy();
+    if (protocolTest && ProtocolQuery(tls, "{\"type\":\"stats\"}") != "{\"type\":\"inactive\"}") return 33;
+    settings.Detach(); log.Detach(); ReleaseGlobalProxyInstance(); WSACleanup();
     if (monitor->TakeDroppedCount()) return 13;
     monitor->SetEnabled(FALSE);
     return (int)code;

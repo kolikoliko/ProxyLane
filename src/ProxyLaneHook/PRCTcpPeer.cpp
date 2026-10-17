@@ -283,6 +283,7 @@ void CPRCTcpPeer::OnReceive(int nErrorCode)
 			break;
 		}else if(nRetVal == 0)
 		{
+			if (m_pNotify->m_pProtocol) m_pNotify->m_pProtocol->Eof(m_pProxyLayer ? 1 : 0);
 			m_bConnShutted = TRUE;
 			m_bReadClosed = TRUE;
 			AsyncSelect(FD_WRITE | FD_CLOSE);
@@ -291,6 +292,7 @@ void CPRCTcpPeer::OnReceive(int nErrorCode)
 			break;
 		}
 
+		if (m_pNotify->m_pProtocol) m_pNotify->m_pProtocol->Data(m_pProxyLayer ? 1 : 0, m_recvbuf + m_recvbufpos, nRetVal);
 		nRecvd += nRetVal;
 		m_recvbufpos += nRetVal;
 		m_DataLenRecvd += nRetVal;
@@ -487,6 +489,8 @@ void CPRCTcpPeer::OnSend(int nErrorCode)
 
 void CPRCTcpPeer::OnConnect(int nErrorCode)
 {
+    if (m_pNotify->m_pMitm) m_pNotify->m_pMitm->Connected(nErrorCode);
+    if (m_pNotify->m_pProtocol) m_pNotify->m_pProtocol->Connected(nErrorCode);
 	m_ppi.errcode = nErrorCode;
 	m_ppi.datafrom = 1;
 	m_ppi.pData = NULL;

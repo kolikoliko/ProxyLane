@@ -13,8 +13,12 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 use time::OffsetDateTime;
 use zeroize::Zeroizing;
@@ -35,10 +39,38 @@ pub struct Authority {
     pub directory: PathBuf,
     pub der: CertificateDer<'static>,
     pub id: String,
+    /// Persisted preference only. Never advertise it before a successful bind.
     pub port: u16,
     issuer: Certificate,
     key: KeyPair,
-    leaves: Mutex<VecDeque<(String, OffsetDateTime, Arc<CertifiedKey>)>>,
+    leaves: Mutex<VecDeque<CachedLeaf>>,
+}
+
+struct CachedLeaf {
+    name: String,
+    port: u16,
+    expires: OffsetDateTime,
+    cert: Arc<CertifiedKey>,
+}
+
+/// Owned by the process TLS Context, not by the monitor or enable checkbox.
+pub struct CrlServer {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+impl CrlServer {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+impl Drop for CrlServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 pub fn directory() -> Result<PathBuf> {
@@ -121,7 +153,7 @@ impl Authority {
                 .parse::<u16>()
                 .map_err(err)?;
             if port == 0 {
-                return Err("CRL port must be stable and nonzero".into());
+                return Err("Preferred CRL port must be nonzero".into());
             }
             let stored = Stored {
                 certificate: STANDARD.encode(cert.der()),
@@ -163,30 +195,38 @@ impl Authority {
         })
     }
 
-    pub fn leaf(&self, name: &str) -> Result<Arc<CertifiedKey>> {
+    pub fn leaf(&self, name: &str, crl_port: u16) -> Result<Arc<CertifiedKey>> {
+        if crl_port == 0 {
+            return Err("CRL listener must be bound before issuing a certificate".into());
+        }
         let name = name.to_ascii_lowercase();
         let now = OffsetDateTime::now_utc();
         let mut cache = self.leaves.lock().map_err(err)?;
-        cache.retain(|(_, expiry, _)| *expiry > now + time::Duration::minutes(5));
-        if let Some((_, _, cert)) = cache.iter().find(|(n, _, _)| n == &name) {
-            return Ok(cert.clone());
+        cache.retain(|entry| entry.expires > now + time::Duration::minutes(5));
+        if let Some(entry) = cache
+            .iter()
+            .find(|entry| entry.name == name && entry.port == crl_port)
+        {
+            return Ok(entry.cert.clone());
         }
         let key = KeyPair::generate().map_err(err)?;
         let mut p = CertificateParams::new(vec![name.clone()]).map_err(err)?;
         p.distinguished_name.push(DnType::CommonName, name.clone());
-        p.is_ca = IsCa::ExplicitNoCa;
+        // rcgen 0.13 ExplicitNoCa encodes the DEFAULT FALSE boolean explicitly,
+        // which strict DER readers reject. Empty SEQUENCE means the same CA=false.
+        p.is_ca = IsCa::NoCa;
+        let mut constraints = CustomExtension::from_oid_content(&[2, 5, 29, 19], vec![0x30, 0x00]);
+        constraints.set_criticality(true);
+        p.custom_extensions.push(constraints);
         p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         p.use_authority_key_identifier_extension = true;
         p.serial_number = Some(serial()?);
         p.not_before = now - time::Duration::minutes(5);
-        let expiry = (now + time::Duration::days(1)).min(self.issuer.params().not_after);
+        let expiry = (now + time::Duration::days(14)).min(self.issuer.params().not_after);
         p.not_after = expiry;
         p.crl_distribution_points = vec![CrlDistributionPoint {
-            uris: vec![format!(
-                "http://127.0.0.1:{}/pki/{}.crl",
-                self.port, self.id
-            )],
+            uris: vec![format!("http://127.0.0.1:{}/pki/{}.crl", crl_port, self.id)],
         }];
         let cert = p.signed_by(&key, &self.issuer, &self.key).map_err(err)?;
         let private = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
@@ -201,7 +241,12 @@ impl Authority {
         if cache.len() >= 256 {
             cache.pop_front();
         }
-        cache.push_back((name, expiry, certified.clone()));
+        cache.push_back(CachedLeaf {
+            name,
+            port: crl_port,
+            expires: expiry,
+            cert: certified.clone(),
+        });
         Ok(certified)
     }
 
@@ -221,24 +266,50 @@ impl Authority {
         Ok(crl.der().to_vec())
     }
 
-    pub fn serve_crl(self: &Arc<Self>) -> Result<()> {
-        // Fail explicitly on a port collision. Do not advertise an unreachable CDP.
-        let listener = TcpListener::bind(("127.0.0.1", self.port)).map_err(|e| {
-            format!(
-                "CRL listener {}: {e}; only one MITM host may run for this CA",
-                self.port
-            )
-        })?;
+    pub fn serve_crl(self: &Arc<Self>) -> Result<CrlServer> {
+        // Bind port 0 directly; probing a free port then rebinding is racy.
+        // No port is written back to the shared CA file.
+        let listener = TcpListener::bind(("127.0.0.1", self.port))
+            .or_else(|e| {
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                ) {
+                    TcpListener::bind(("127.0.0.1", 0))
+                } else {
+                    Err(e)
+                }
+            })
+            .map_err(|e| {
+                format!(
+                    "Cannot start local CRL listener (preferred port {}): {e}",
+                    self.port
+                )
+            })?;
+        let port = listener.local_addr().map_err(err)?.port();
+        listener.set_nonblocking(true).map_err(err)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
         let ca = self.clone();
-        std::thread::Builder::new().name("ProxyLane CRL".into()).spawn(move || {
+        let worker = std::thread::Builder::new().name("ProxyLane CRL".into()).spawn(move || {
             let path = format!("/pki/{}.crl", ca.id);
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            while !stopped.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(stream) => stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20)); continue;
+                    }
+                    Err(_) => break,
+                };
+                let _ = stream.set_nonblocking(false);
                 let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                let deadline = Instant::now() + Duration::from_secs(2);
                 let mut request = Vec::new();
                 let mut chunk = [0u8; 1024];
                 while request.len() < 8192 && !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() || stopped.load(Ordering::Acquire) { break; }
+                    let _ = stream.set_read_timeout(Some(remaining));
                     match stream.read(&mut chunk) { Ok(0) | Err(_) => break, Ok(n) => request.extend_from_slice(&chunk[..n]) }
                 }
                 let first = String::from_utf8_lossy(&request);
@@ -250,6 +321,10 @@ impl Authority {
                 let _ = stream.write_all(header.as_bytes()).and_then(|_| stream.write_all(&body));
             }
         }).map_err(err)?;
-        Ok(())
+        Ok(CrlServer {
+            port,
+            stop,
+            worker: Some(worker),
+        })
     }
 }

@@ -8,6 +8,7 @@
 #include "ProxyDataHandle.h"
 #include "MitmControl.h"
 #include "ProxyMonitor.h"
+#include "PlatformSupport.h"
 #include <atomic>
 #include <mutex>
 #include <algorithm>
@@ -15,10 +16,13 @@
 namespace {
     std::mutex moduleLock;
     std::atomic<int> enabledMode(-1);
+    std::atomic<bool> streamMonitoring(false);
     std::atomic<ULONGLONG> connectionSequence(0);
+    std::atomic<PLM_PROTOCOL_FN> protocolQuery(NULL);
     // Kept loaded for process lifetime: the Rust context owns the CRL listener.
     HMODULE LoadMitm()
     {
+        if (!ProxySupportsOptionalModules()) { SetLastError(ERROR_NOT_SUPPORTED); return NULL; }
         std::lock_guard<std::mutex> guard(moduleLock);
         static HMODULE module = NULL;
         if (module) return module;
@@ -27,12 +31,13 @@ namespace {
         if (!n || n >= _countof(path)) return NULL;
         TCHAR* slash = _tcsrchr(path, _T('\\'));
         if (!slash) return NULL;
-#ifdef _WIN64
         _tcscpy_s(slash + 1, _countof(path) - (slash + 1 - path), _T("ProxyLaneMitm64.dll"));
-#else
-        _tcscpy_s(slash + 1, _countof(path) - (slash + 1 - path), _T("ProxyLaneMitm32.dll"));
-#endif
         module = LoadLibrary(path);
+        if (module) {
+            PLM_VERSION_FN version = (PLM_VERSION_FN)GetProcAddress(module, "plm_abi_version");
+            if (version && version() == PLM_ABI_VERSION)
+                protocolQuery.store((PLM_PROTOCOL_FN)GetProcAddress(module, "plm_protocol"));
+        }
         return module;
     }
     CStringA Address(const _SockAddr& address)
@@ -56,6 +61,7 @@ CMitmControl& CMitmControl::Instance()
 
 BOOL CMitmControl::IsEnabled()
 {
+    if (!ProxySupportsOptionalModules()) return FALSE;
     int mode = enabledMode.load();
     if (mode >= 0) return mode != 0;
     TCHAR value[8] = {0};
@@ -63,6 +69,10 @@ BOOL CMitmControl::IsEnabled()
 }
 int CMitmControl::ManageCA(CaAction action, char* output, size_t capacity)
 {
+    if (!ProxySupportsOptionalModules()) {
+        if (output && capacity) _snprintf_s(output, capacity, _TRUNCATE, "MITM requires a supported Windows version and the 64-bit ProxyLane host.");
+        return -1;
+    }
     HMODULE module = LoadMitm();
     PLM_VERSION_FN version = module ? (PLM_VERSION_FN)GetProcAddress(module, "plm_abi_version") : NULL;
     PLM_CA_FN ca = module ? (PLM_CA_FN)GetProcAddress(module, "plm_ca") : NULL;
@@ -79,6 +89,49 @@ BOOL CMitmControl::SetEnabled(BOOL enabled, char* error, size_t capacity)
     if (enabled && ManageCA(PrepareCA, error, capacity) < 0) return FALSE;
     enabledMode.store(enabled ? 1 : 0);
     return TRUE;
+}
+int CMitmControl::QueryProtocol(const char* request, char* output, size_t capacity)
+{
+    if (!ProxySupportsOptionalModules()) {
+        if (output && capacity) _snprintf_s(output, capacity, _TRUNCATE, "MITM and protocol monitoring require a supported Windows version and the 64-bit ProxyLane host.");
+        return -1;
+    }
+    if (request && (strcmp(request, "{\"type\":\"monitor_start\"}") == 0 ||
+        strcmp(request, "{\"type\":\"monitor_stop\"}") == 0)) {
+        const bool enabled = strstr(request, "monitor_start") != NULL;
+        if (enabled) {
+            LoadMitm();
+            if (!protocolQuery.load()) {
+                if (output && capacity) _snprintf_s(output, capacity, _TRUNCATE, "Cannot load compatible protocol module.");
+                return -1;
+            }
+        }
+        if (enabled && !streamMonitoring.load()) {
+            char response[256] = {};
+            if (protocolQuery.load()("{\"type\":\"analysis_start\"}", response, sizeof(response)) < 0) {
+                if (output && capacity) _snprintf_s(output, capacity, _TRUNCATE, "%s", response);
+                return -1;
+            }
+        }
+        streamMonitoring.store(enabled);
+        const char reply[] = "{\"type\":\"monitor\"}";
+        if (output && capacity >= sizeof(reply)) memcpy(output, reply, sizeof(reply));
+        return sizeof(reply);
+    }
+    if (request && strstr(request, "mitm_options")) LoadMitm();
+    PLM_PROTOCOL_FN query = protocolQuery.load();
+    if (query) return query(request, output, capacity);
+    const char inactive[] = "{\"type\":\"inactive\"}";
+    if (output && capacity >= sizeof(inactive)) memcpy(output, inactive, sizeof(inactive));
+    return sizeof(inactive);
+}
+void CMitmControl::ShutdownProtocol()
+{
+    PLM_PROTOCOL_FN query = protocolQuery.load();
+    if (!query) return; // Do not load Rust merely to shut down an unused service.
+    char error[1024] = {};
+    if (query("{\"type\":\"shutdown\"}", error, sizeof(error)) < 0)
+        PrintText(_T("Protocol cache cleanup failed: %hs\r\n"), error);
 }
 void __cdecl CMitmBridge::Observe(uintptr_t user, uint32_t kind, const uint8_t* data, size_t length)
 {
@@ -117,8 +170,8 @@ bool CMitmBridge::Initialize()
     CStringA host = c.szDomainName[0] ? CStringA(c.szDomainName) : target;
     CStringA metadata;
     // Only numeric/address fields go into this JSON; host is a separate UTF-8 argument.
-    metadata.Format("{\"pid\":%lu,\"process_create_time\":%I64u,\"socket_generation\":%I64u,\"socket\":%I64u,\"destination\":\"%s\",\"port\":%d,\"source\":\"%s\",\"source_port\":%d,\"effective_destination\":\"%s\"}",
-        c.dwPid, c.processCreateTime, c.socketGeneration, c.s, (LPCSTR)target,
+    metadata.Format("{\"connection_id\":%I64u,\"pid\":%lu,\"process_create_time\":%I64u,\"socket_generation\":%I64u,\"socket\":%I64u,\"destination\":\"%s\",\"port\":%d,\"source\":\"%s\",\"source_port\":%d,\"effective_destination\":\"%s\"}",
+        m_connection, c.dwPid, c.processCreateTime, c.socketGeneration, c.s, (LPCSTR)target,
         c.dstAddr.GetPort(), (LPCSTR)source, c.srcAddr.GetPort(), (LPCSTR)effective);
     char error[1024] = {0};
     if (create(host, metadata, &m_session, error, sizeof(error)) != 0) {
@@ -130,6 +183,14 @@ bool CMitmBridge::Initialize()
     return true;
 }
 
+void CMitmBridge::Connected(int error)
+{
+    if (m_session) m_io(m_session, PLM_CONNECTED, 0, NULL, error);
+}
+void CProtocolTap::Connected(int error)
+{
+    if (m_handle) m_io(m_handle, 4, 0, NULL, error);
+}
 void CMitmBridge::Fail(int error)
 {
     if (m_failed) return;
@@ -225,3 +286,30 @@ void CMitmBridge::OnRead(CPRCTcpPeer* peer, int error)
 }
 
 void CMitmBridge::OnWritable() { Pump(); }
+
+bool CProtocolTap::Enabled() { return streamMonitoring.load(); }
+CProtocolTap::CProtocolTap(CTcpProxyTask* task) : CProtocolTap(task->m_PRCClient, false) {}
+CProtocolTap::CProtocolTap(const PRCClient& c, bool udp) : m_handle(NULL), m_io(NULL), m_udp(udp) {
+    HMODULE module = LoadMitm();
+    if (!module || !protocolQuery.load()) return;
+    auto open = (PLM_STREAM_OPEN_FN)GetProcAddress(module, "plm_stream_open");
+    m_io = (PLM_STREAM_IO_FN)GetProcAddress(module, "plm_stream_io");
+    if (!open || !m_io) return;
+    CStringA target = Address(c.dstAddr);
+    CStringA host = c.szDomainName[0] ? CStringA(c.szDomainName) : target;
+    CStringA metadata;
+    metadata.Format("{\"connection_id\":%I64u,\"pid\":%lu,\"process_create_time\":%I64u,\"socket_generation\":%I64u,\"socket\":%I64u,\"destination\":\"%s\",\"port\":%d}",
+        ++connectionSequence, c.dwPid, c.processCreateTime, c.socketGeneration, c.s, (LPCSTR)target, c.dstAddr.GetPort());
+    if (udp) { metadata.Delete(metadata.GetLength() - 1); metadata += ",\"transport\":\"udp\"}"; }
+    m_handle = open(host, metadata);
+    m_active.store(m_handle != NULL);
+}
+CProtocolTap::~CProtocolTap() { if (m_handle) {
+    if (m_udp) { Eof(0); Eof(1); }
+    m_io(m_handle, 2, 0, NULL, 0);
+} }
+void CProtocolTap::Data(unsigned side, const void* bytes, size_t length) {
+    if (!Enabled()) { if (m_handle) m_io(m_handle, 2, 0, NULL, 0); m_handle = NULL; m_active.store(false); }
+    if (m_handle) m_io(m_handle, m_udp ? 3 : 0, side, (const uint8_t*)bytes, length);
+}
+void CProtocolTap::Eof(unsigned side) { if (m_handle) m_io(m_handle, 1, side, NULL, 0); }

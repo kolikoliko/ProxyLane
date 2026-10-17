@@ -1,4 +1,4 @@
-<h1 align="center">ProxyLane</h1>
+﻿<h1 align="center">ProxyLane</h1>
 
 <p align="center">
   <strong>Windows 应用进程级透明代理 · 免 TUN · 独立代理配置 · 子进程自动继承</strong>
@@ -54,6 +54,7 @@ ProxyLane 采用纯用户态的进程注入与 API Hook 技术，对应用程序
 - 对需要代理的子进程，Hook 模块的加载和初始化会在该子进程的主线程上下文中完成；初始化成功后才恢复主线程执行，使网络 Hook 在应用程序发起网络连接前就绪，从而可靠地拦截其后续网络行为。
 - 主程序负责代理配置、过滤规则和日志展示，Hook 模块负责监控子进程创建及网络行为。整个过程均在用户态完成。
 - 同时提供 Win32 和 x64 组件，兼容范围从 Windows XP 到 Windows 11。
+- 32 位主程序及 Windows XP / Server 2003 保留主体代理功能，不支持数据监视、HTTPS 解密和 gonc 加密传输；支持这些功能的 64 位主程序可处理 32/64 位目标应用。
 
 ## 构建环境
 
@@ -71,7 +72,7 @@ SOCKS5、HTTP10 和 HTTP11 配置都可以在“加密模式”中选择 `gonc T
 
 PSK 按初版设计以明文写入所选 profile 的 `PSK=` 字段，请妥善限制 `ProxyLane.ini` 的访问权限。标准（不加密）模式不加载加密组件。
 
-加密实现位于可选的 `ProxyLaneSecureTransport32.dll` 和 `ProxyLaneSecureTransport64.dll`。主程序及 Hook DLL 仍使用 `v141_xp` 构建，未选择加密模式时不会加载这两个 DLL。构建加密组件需要 Rust MSVC 工具链：
+加密传输由 64 位主程序中的 `ProxyLaneSecureTransport64.dll` 提供，也支持代理 32 位应用。32 位主程序保留普通代理功能，不支持加密传输。主程序及 Hook DLL 仍使用 `v141_xp` 构建，未选择加密模式时不会加载此 DLL。构建加密组件需要 Rust MSVC 工具链：
 
 ```bat
 src\build-secure-transport.bat
@@ -85,15 +86,17 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build-secure-transport.ps1
 
 ### HTTPS 解密与数据监视（试验功能）
 
-ProxyLane 可以查看目标进程的 HTTPS 请求和响应，方便开发调试。应用无需使用系统代理，也支持非 443 端口的 TLS 连接。数据监视会标明所属进程、目标地址和收发方向，支持文本及 HEX 显示。
+64 位 ProxyLane 可以查看 32 位和 64 位目标进程的 HTTPS 请求和响应，方便开发调试。应用无需使用系统代理，也支持非 443 端口的 TLS 连接。数据监视按进程列出会话：HTTP/1.1、HTTP/2 可查看请求/响应头和解压正文，普通 TCP 和非 HTTP 的 TLS 可查看双向字节流，UDP 可逐个查看收发数据报。支持 DNS 查询与响应还原，以及 QUIC v1/v2 握手信息查看（暂不解密 HTTP/3 正文）。支持进程/PID/地址过滤，以及 Raw、HexView 两种视图。普通 TCP/UDP 只需勾选“开始监视”，不需要安装 CA；UDP 需在代理配置中启用。
+
+只想监视、不使用外部代理时，选择 `NOPROXY`，无需填写地址和端口。勾选“接管 TCP / 接管 UDP”，取消“禁止 UDP”，启动后将目标程序接入并开启数据监视。
 
 1. 进入 **数据监视**，勾选 **解密 HTTPS**。
 2. 首次使用时，按提示在 **CA 管理** 中点击 **安装到当前用户**，关闭窗口后自动开启解密。
 3. 启动代理并选择目标进程，让应用重新建立连接，即可查看解密后的数据。
 
-已解密连接显示明文，其他连接显示原始数据。监视仅保留近期数据，不自动保存流量文件；可随时暂停或清空，也可在 CA 管理中移除证书信任。
+请求载荷使用有容量限制的临时缓存，截断或淘汰时会提示，退出后清理。可随时暂停或清空列表，也可在 CA 管理中移除证书信任。
 
-目前提供简单的数据查看，尚不支持专业的协议结构分析。部分使用独立证书校验的应用可能无法解密，暂不支持 QUIC/HTTP3。
+目前提供简单的会话查看，暂不提供专业协议分析功能。部分使用独立证书校验的应用可能无法解密，暂不支持 HTTP/3 正文解密。
 
 ## 界面语言
 
@@ -116,7 +119,7 @@ ProxyLane 内置简体中文和英文。默认跟随 Windows 界面语言，也�
 powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 ```
 
-脚本会从程序文件属性读取版本号，检查主程序与 Hook DLL 的版本是否一致，并生成 `dist/ProxyLane-版本-Windows.zip`。压缩包包含 Win32/x64 主程序、对应的 Hook DLL、两个加密传输 DLL、样例配置以及中英文 README。
+脚本会从程序文件属性读取版本号，检查主程序与 Hook DLL 的版本是否一致，并生成 `dist/ProxyLane-版本-Windows.zip`。压缩包包含 Win32/x64 主程序、对应的 Hook DLL、64 位加密传输和 MITM DLL、样例配置、许可证以及中英文 README。测试和命令行辅助工具不进入发行包。
 
 样例配置保存在 `examples/ProxyLane.ini`，打包后会以 `ProxyLane.ini` 放在压缩包根目录。
 

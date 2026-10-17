@@ -5,7 +5,8 @@
 // Dynamically loaded; all sessions belong to the caller's PRC event thread.
 // side 0 = application, side 1 = original destination (after proxy negotiation).
 // Caller must preserve unsent output: peek, Send, consume only Send's byte count.
-#define PLM_ABI_VERSION 3u
+#define PLM_ABI_VERSION 7u
+#define PLM_CONNECTED 5u
 #define PLM_FEED 0u
 #define PLM_PEEK 1u
 #define PLM_CONSUME 2u
@@ -23,7 +24,12 @@ typedef int (__cdecl *PLM_IO_FN)(void*, uint32_t, uint32_t, uint8_t*, size_t);
 typedef void (__cdecl *PLM_ERROR_FN)(void*, char*, size_t);
 typedef void (__cdecl *PLM_FREE_FN)(void*);
 typedef int (__cdecl *PLM_CA_FN)(uint32_t, char*, size_t);
+typedef int (__cdecl *PLM_PROTOCOL_FN)(const char*, char*, size_t);
 // Observer: 0 = a single UTF-8 error (no handshake JSON), 1/2 = decrypted
 // application/upstream bytes, 3/4 = classified non-TLS application/upstream bytes.
 typedef void (__cdecl *PLM_OBSERVER)(uintptr_t, uint32_t, const uint8_t*, size_t);
 typedef void (__cdecl *PLM_OBSERVE_FN)(void*, PLM_OBSERVER, uintptr_t);
+
+// Internal passive capture ABI; not exported by ProxyLaneHook.
+typedef void* (__cdecl *PLM_STREAM_OPEN_FN)(const char*, const char*);
+typedef void (__cdecl *PLM_STREAM_IO_FN)(void*, uint32_t, uint32_t, const uint8_t*, size_t);

@@ -1,7 +1,7 @@
 """Exercise a disposable GUI under 128 MiB of real injected TCP traffic.
 
 Uses a unique profile and localhost SOCKS relay, without CA or user settings
-changes. Measures log size, private memory and window response during transfer.
+changes. Verifies one live TCP session, bounded cache/HEX display and memory/responsiveness.
 """
 import argparse
 import ctypes as c
@@ -26,7 +26,7 @@ BLOCKS = 8192
 
 def client(port, output):
     with socket.create_connection(('203.0.113.10', port), 20) as stream:
-        stream.sendall(b'GET /monitor-load HTTP/1.1\r\nHost: monitor.test\r\n\r\n')
+        stream.sendall(b'\x00STREAM-TEST\r\n\r\n')
         result = hashlib.sha256(); size = 0
         while True:
             data = stream.recv(65536)
@@ -92,7 +92,8 @@ def main():
     config = config.replace('Port=1080', 'Port='+str(relay.server_address[1]))
     config = config.replace('[options]', '[options]\nlanguage=zh-CN')
     (work/'ProxyLane.ini').write_text(config)
-    env = dict(os.environ, PROXYLANE_MITM='0', PROXYLANE_MITM_HOME=str(work/'pki'))
+    env = dict(os.environ, PROXYLANE_MITM='0', PROXYLANE_MITM_HOME=str(work/'pki'), PROXYLANE_PROTOCOL_CACHE_ROOT=str(work/'cache'),
+        PROXYLANE_PROTOCOL_ENTRY_BYTES=str(1024*1024), PROXYLANE_PROTOCOL_TOTAL_BYTES=str(2*1024*1024))
     process = subprocess.Popen([str(work/'ProxyLane64.exe')], cwd=work, env=env)
     launch = None
     try:
@@ -116,7 +117,8 @@ def main():
             if u.GetDlgItem(hwnd, 1005) and u.GetDlgItem(hwnd, 1): pages['proxy'] = hwnd
             return True
         u.EnumChildWindows(nav, find, 0)
-        page = pages['monitor']; edit = u.GetDlgItem(page, 1000)
+        page = pages['monitor']; edit = u.GetDlgItem(page, 1100)
+        assert not u.GetDlgItem(page, 1000) and not u.GetDlgItem(page, 1097)
         def activate(index):
             x, y = round(50*scale), round((78+index*44+20)*scale)
             send(nav, 0x201, 1, (y<<16)|x); send(nav, 0x202, 0, (y<<16)|x)
@@ -125,7 +127,7 @@ def main():
             send(control, 0xF1, int(enabled)); send(page, 0x111, ident, control)
         send(pages['proxy'], 0x111, 1, u.GetDlgItem(pages['proxy'], 1))
         time.sleep(.5)
-        activate(3); check(1011, True); check(1012, True)
+        activate(3); check(1011, True)
         baseline = memory(process)
         output = work/'client-result.json'
         launch = subprocess.Popen([str(work/'ProxyLane64.exe'), '--auto', '--profile', profile,
@@ -139,30 +141,39 @@ def main():
             began = time.perf_counter(); send(hwnd, 0)
             max_latency = max(max_latency, time.perf_counter()-began)
             chars = send(edit, 0xE); max_chars = max(max_chars, chars)
-            assert chars <= 128*1024, ('Text limit exceeded', chars)
+            assert chars == 0, ('Raw bytes entered protocol details', chars)
             peak = max(peak, memory(process)); samples += 1
             time.sleep(.1)
-        check(1011, False)  # Freeze capture for format and replay checks.
+        time.sleep(1.5)
+        check(1011, False)
         result = json.loads(output.read_text())
         expected = hashlib.sha256()
         for _ in range(BLOCKS): expected.update(PAYLOAD)
         assert result == {'bytes': len(PAYLOAD)*BLOCKS, 'sha256': expected.hexdigest()}, result
-        log = text(edit)
-        assert '[Raw]' in log and '|................|' in log and '00 01 02 03' in log, log[-2000:]
         assert peak-baseline < 48*1024*1024, ('Memory grew excessively', baseline, peak)
         assert max_latency < 1, ('Window stalled', max_latency)
-        assert max_chars > 80*1024 and samples > 50, (max_chars, samples)
-        scroll = Scroll(); scroll.size = c.sizeof(scroll); scroll.mask = 0x17
-        u.GetScrollInfo.argtypes = [w.HWND, c.c_int, c.POINTER(Scroll)]
-        assert u.GetScrollInfo(edit, 1, c.byref(scroll))
-        screenshot(hwnd, work/'monitor-hex-load.png')
-        assert scroll.position + scroll.page >= scroll.maximum, ('Live view stopped following the tail', scroll.position, scroll.page, scroll.maximum)
-        assert u.GetScrollInfo(edit, 0, c.byref(scroll)) and scroll.position == 0, 'Byte offsets scrolled out of view'
-        # Hidden-page draining and format changes must not lose the retained view.
-        activate(0); check(1012, False); time.sleep(.2); activate(3); time.sleep(2)
-        assert '[Raw]' in text(edit)
-        check(1012, True); time.sleep(5)
-        assert '|................|' in text(edit)
+        assert max_chars == 0 and samples > 50, (max_chars, samples)
+        assert send(u.GetDlgItem(page,1098), 0x1004) == 1, 'One TCP connection must stay one row across progress updates'
+        assert not (work/'pki'/'ca.json').exists(), 'Plain TCP monitoring must not create a CA'
+        assert not u.IsWindowEnabled(u.GetDlgItem(page,1102)), 'HEX needs a selected body'
+        listing = u.GetDlgItem(page,1098)
+        send(listing, 0x100, 0x24)  # Home selects first session.
+        deadline = time.monotonic()+8
+        while 'STREAM-TEST' not in text(edit) and time.monotonic()<deadline: time.sleep(.1)
+        assert text(edit) == '.STREAM-TEST\r\n\r\n', repr(text(edit))
+        tabs = u.GetDlgItem(page,1099)
+        # Native tab mouse input sends its standard selection notification.
+        x, y = round(80*scale), round(12*scale)
+        send(tabs,0x201,1,(y<<16)|x); send(tabs,0x202,0,(y<<16)|x)
+        time.sleep(.3)
+        detail = text(edit)
+        assert 'Connection' not in detail and len(detail) > 60000, detail[:1500]
+        assert 'per-exchange payload limit' in text(u.GetDlgItem(page,1101))
+        views = u.GetDlgItem(page,1102)
+        send(views,0x201,1,(y<<16)|x); send(views,0x202,0,(y<<16)|x)
+        assert u.IsWindowVisible(u.GetDlgItem(page,1103)), 'Native HexView not shown'
+        assert len(detail) < 400000, len(detail)
+        screenshot(hwnd, work/'monitor-stream-load.png')
         send(page, 0x111, 1021, u.GetDlgItem(page, 1021))
         assert not text(edit), 'Clear did not empty the view'
         metrics = dict(result, samples=samples, maximum_characters=max_chars,

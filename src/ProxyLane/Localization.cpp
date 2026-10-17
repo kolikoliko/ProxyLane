@@ -4,13 +4,7 @@
 #include "resource.h"
 #include <stdarg.h>
 
-namespace
-{
-	CMapStringToString g_strings;
-	CString g_currentLanguage;
-	CString g_preferredLanguage;
-
-	CString SettingsPath()
+CString Localization::SettingsPath()
 	{
 		TCHAR path[MAX_PATH] = { 0 };
 		GetModuleFileName(NULL, path, _countof(path));
@@ -20,6 +14,13 @@ namespace
 		int dot = result.ReverseFind(_T('.'));
 		return (dot >= 0 ? result.Left(dot) : result) + _T(".ini");
 	}
+
+namespace
+{
+	CMapStringToString g_strings;
+	CString g_currentLanguage;
+	CString g_preferredLanguage;
+
 
 	void SkipWhitespace(const CString& text, int& position)
 	{

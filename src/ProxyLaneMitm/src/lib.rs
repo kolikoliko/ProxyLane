@@ -1,4 +1,9 @@
 pub mod pki;
+pub mod protocol;
+mod options;
+mod dns;
+mod doh;
+mod quic_probe;
 pub mod session;
 #[cfg(test)]
 mod tests;
@@ -11,7 +16,19 @@ use std::{
     ptr, slice,
     sync::{Arc, Mutex},
 };
+pub(crate) static SKIP_UPSTREAM_VERIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CONTEXT: Mutex<Option<Arc<Context>>> = Mutex::new(None);
+static PROTOCOL: Mutex<Option<Arc<protocol::Runtime>>> = Mutex::new(None);
+
+fn protocol_runtime() -> Result<Arc<protocol::Runtime>, String> {
+    let mut slot = PROTOCOL.lock().map_err(|e| e.to_string())?;
+    if let Some(runtime) = slot.as_ref() {
+        return Ok(runtime.clone());
+    }
+    let runtime = protocol::Runtime::configured()?;
+    *slot = Some(runtime.clone());
+    Ok(runtime)
+}
 
 fn context() -> Result<Arc<Context>, String> {
     let mut slot = CONTEXT.lock().map_err(|e| e.to_string())?;
@@ -38,7 +55,7 @@ unsafe fn write_error(output: *mut c_char, capacity: usize, error: &str) {
 }
 #[no_mangle]
 pub extern "C" fn plm_abi_version() -> u32 {
-    3
+    7
 }
 
 #[no_mangle]
@@ -73,9 +90,25 @@ pub unsafe extern "C" fn plm_ca(action: u32, output: *mut c_char, capacity: usiz
             }
             context()?;
         }
-        Ok((1 | if trusted { 2 } else { 0 }, format!(
-            "SHA-256: {}\r\nCertificate: {}\r\nCurrentUser ROOT: {}\r\nCRL: http://127.0.0.1:{}/pki/{}.crl",
-            ca.id, path.join("proxylane-ca.cer").display(), trusted, ca.port, ca.id)))
+        // Status must not initialize a listener or show a different instance's
+        // preferred port as if it were this process's running endpoint.
+        let crl = CONTEXT
+            .lock()
+            .map_err(|e| e.to_string())?
+            .as_ref()
+            .filter(|context| context.ca.id == ca.id)
+            .map(|context| format!("http://127.0.0.1:{}/pki/{}.crl", context.crl.port(), ca.id))
+            .unwrap_or_else(|| "not started in this instance".into());
+        Ok((
+            1 | if trusted { 2 } else { 0 },
+            format!(
+                "SHA-256: {}\r\nCertificate: {}\r\nCurrentUser ROOT: {}\r\nCRL: {}",
+                ca.id,
+                path.join("proxylane-ca.cer").display(),
+                trusted,
+                crl
+            ),
+        ))
     }));
     match result {
         Ok(Ok((flags, info))) => {
@@ -125,9 +158,14 @@ pub unsafe extern "C" fn plm_create(
     let result = catch_unwind(AssertUnwindSafe(|| {
         let host = text(host)?.to_owned();
         let metadata = serde_json::from_str(text(metadata)?).map_err(|e| e.to_string())?;
-        // The GUI consumes bounded in-memory observer events. Normal sessions
-        // must neither create capture files nor depend on a writable log path.
-        Session::new(context()?, host, metadata, false)
+        // GUI logging remains memory-only. The separate protocol cache is
+        // bounded/temporary and failure must not affect network forwarding.
+        let identity = protocol::identity(&metadata, &host);
+        let mut session = Session::new(context()?, host, metadata, false)?;
+        if let (Ok(runtime), Ok(identity)) = (protocol_runtime(), identity) {
+            session.enable_protocol(runtime, identity);
+        }
+        Ok::<_, String>(session)
     }));
     match result {
         Ok(Ok(session)) => {
@@ -143,6 +181,39 @@ pub unsafe extern "C" fn plm_create(
             -1
         }
     }
+}
+
+// Passive TCP capture: no CA, listener, TLS handshake or forwarding changes.
+#[no_mangle]
+/// # Safety
+/// Strings are NUL terminated UTF-8; returned tap is exclusively owned by caller.
+pub unsafe extern "C" fn plm_stream_open(host: *const c_char, metadata: *const c_char) -> *mut protocol::Tap {
+    catch_unwind(AssertUnwindSafe(|| {
+        let host = text(host).ok()?;
+        let metadata = serde_json::from_str(text(metadata).ok()?).ok()?;
+        let identity = protocol::identity(&metadata, host).ok()?;
+        protocol_runtime().ok()?.tap_transport(identity, None, false).map(|tap| Box::into_raw(Box::new(tap)))
+    })).ok().flatten().unwrap_or(ptr::null_mut())
+}
+#[no_mangle]
+/// # Safety
+/// Tap must be live and exclusively accessed; bytes readable for len. op 0 data,
+/// 1 clean direction EOF, 2 destroy. Capture errors never affect forwarding.
+pub unsafe extern "C" fn plm_stream_io(handle: *mut protocol::Tap, op: u32, side: u32, bytes: *const u8, len: usize) {
+    if handle.is_null() { return; }
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if op == 2 { drop(Box::from_raw(handle)); }
+        else if side < 2 {
+            if op == 4 { (*handle).transport_result(len); }
+            else if op == 1 { (*handle).eof(side as usize, true); }
+            else if op == 3 && !bytes.is_null() && len <= 65535 {
+                (*handle).datagram(side as usize, slice::from_raw_parts(bytes, len));
+            }
+            else if op == 0 && !bytes.is_null() && len <= 65536 {
+                (*handle).data(side as usize, slice::from_raw_parts(bytes, len));
+            }
+        }
+    }));
 }
 
 fn call(session: &mut Session, f: impl FnOnce(&mut Session) -> Result<i32, String>) -> i32 {
@@ -213,6 +284,7 @@ pub unsafe extern "C" fn plm_io(
                     | (i32::from(s.eof[1]) << 4)
                     | (i32::from(s.ready()) << 5))
             }
+            5 => { s.transport_result(len); Ok(0) },
             _ => Err("invalid operation".into()),
         }
     })
@@ -233,5 +305,74 @@ pub unsafe extern "C" fn plm_error(handle: *mut Session, output: *mut c_char, ca
 pub unsafe extern "C" fn plm_free(handle: *mut Session) {
     if !handle.is_null() {
         let _ = catch_unwind(AssertUnwindSafe(|| drop(Box::from_raw(handle))));
+    }
+}
+
+#[no_mangle]
+/// # Safety
+/// UTF-8 NUL-terminated request, writable output of capacity bytes. Consumer
+/// thread only. Returns required bytes INCLUDING NUL; undersized buffers are
+/// untouched and queries are non-destructive, so callers can retry. Negative
+/// means invalid input/operation, with a bounded error string when possible.
+/// Shutdown is internal host lifecycle, after all sessions have been freed.
+pub unsafe extern "C" fn plm_protocol(
+    request: *const c_char,
+    output: *mut c_char,
+    capacity: usize,
+) -> i32 {
+    let result = catch_unwind(AssertUnwindSafe(|| -> Result<String, String> {
+        let input = text(request)?;
+        if input.len() > 4096 {
+            return Err("protocol query exceeds 4 KiB".into());
+        }
+        let request: serde_json::Value = serde_json::from_str(input).map_err(|e| e.to_string())?;
+        if request["type"] == "mitm_options" {
+            use std::sync::atomic::Ordering;
+            let validate_only=request["validate_only"].as_bool().unwrap_or(false);
+            let skip=request.get("skip_upstream_verify").map(|v|v.as_bool().ok_or("invalid verification option")).transpose()?;
+            let settings=if let Some(value)=request.get("settings") { options::update(value,validate_only)? } else {options::current()};
+            if !validate_only { if let Some(value) = skip {
+                SKIP_UPSTREAM_VERIFY.store(value, Ordering::Release);
+            }
+            }
+            return Ok(serde_json::json!({"skip_upstream_verify":SKIP_UPSTREAM_VERIFY.load(Ordering::Acquire),"settings":settings}).to_string());
+        }
+        if request["type"] == "analysis_start" {
+            let mut slot=PROTOCOL.lock().map_err(|e|e.to_string())?;
+            let changed=slot.as_ref().is_some_and(|r| !r.options.same_analysis(&options::current()));
+            if changed { if let Some(runtime)=slot.take() {runtime.shutdown()?;} }
+            return Ok(serde_json::json!({"type":"analysis_started","reset":changed}).to_string());
+        }
+        if request["type"] == "shutdown" {
+            let runtime = PROTOCOL.lock().map_err(|e| e.to_string())?.take();
+            if let Some(runtime) = runtime {
+                runtime.shutdown()?;
+            }
+            return Ok("{\"type\":\"stopped\"}".into());
+        }
+        let runtime = PROTOCOL.lock().map_err(|e| e.to_string())?.clone();
+        let value = if let Some(runtime) = runtime {
+            runtime.query(&request)?
+        } else {
+            serde_json::json!({"type":"inactive"})
+        };
+        serde_json::to_string(&value).map_err(|e| e.to_string())
+    }));
+    match result {
+        Ok(Ok(json)) => {
+            let required = json.len() + 1;
+            if capacity >= required && !output.is_null() {
+                write_error(output, capacity, &json);
+            }
+            required as i32
+        }
+        Ok(Err(e)) => {
+            write_error(output, capacity, &e);
+            -1
+        }
+        Err(_) => {
+            write_error(output, capacity, "protocol query panicked");
+            -1
+        }
     }
 }

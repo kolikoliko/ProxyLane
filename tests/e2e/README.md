@@ -51,14 +51,13 @@ cargo test --manifest-path src/ProxyLaneMitm/Cargo.toml --locked
 cargo clippy --manifest-path src/ProxyLaneMitm/Cargo.toml --locked --all-targets -- -D warnings
 ```
 
-Compile `mitm_host.cpp` in an x64 Visual Studio developer prompt:
+Compile `mitm_host.cpp` in an x64 Visual Studio developer prompt (create `build/tools` first). Test executables stay outside `bin`; the runner stages them with runtime DLLs in its own `build/qa` directory:
 
 ```bat
-cl /nologo /EHsc /O2 /DUNICODE /D_UNICODE tests\e2e\mitm_host.cpp /Fo:build\qa\mitm_host64.obj /Fe:bin\mitm_host64.exe /link /LIBPATH:bin\x64\Release ProxyLaneHook.lib ws2_32.lib user32.lib
+cl /nologo /EHsc /O2 /DUNICODE /D_UNICODE tests\e2e\mitm_host.cpp /Fo:build\qa\mitm_host64.obj /Fe:build\tools\mitm_host64.exe /link /LIBPATH:bin\x64\Release ProxyLaneHook.lib ws2_32.lib user32.lib
 ```
 
-For Win32 use an x86 developer prompt, output `mitm_host32.exe` and link
-`bin\Win32\Release\ProxyLaneHook.lib` (also use a different `/Fo` path).
+Only the x64 host is built. `--arch 32` selects a 32-bit target curl, still handled by `mitm_host64.exe` with `ProxyLaneHook32.dll` injection.
 Then run with Python 3 and `cryptography` installed:
 
 ```powershell
@@ -70,7 +69,7 @@ The test creates a unique CA in `build/qa/mitm-<id>/pki`, installs that exact
 CA in CurrentUser ROOT, and removes it in `finally`. It does not change existing
 proxy profiles, other certificates, or revocation caches. If the test is forcibly
 killed, set `PROXYLANE_MITM_HOME` to the printed test directory's `pki` subdirectory
-and run `bin/ProxyLaneMitm64.exe remove` to remove that test CA.
+and run `build/tools/ProxyLaneMitm64.exe remove` to remove that test CA.
 
 The test controller removes any inherited ProxyLane hooks **inside its own
 process** before creating threads and children, so an already-running developer
@@ -105,8 +104,8 @@ process-associated plaintext to the memory observer. Temporary CA removal is
 checked after every run.
 
 Manual GUI check: open Data monitoring, enable HTTPS decryption, install the CA
-when prompted, and reconnect an injected application. Verify plaintext-only
-TLS records, raw records for ordinary connections, HEX view, pause, clear, and CA removal. These interactive
+when prompted, and reconnect an injected application. Verify process-associated requests, request/response headers and decoded bodies,
+per-request HEX, pause, clear, and CA removal. The request view has no raw-log tab. These interactive
 checks are separate from the backend API tests.
 
 These small Go and Python programs provide controlled endpoints for testing the
@@ -214,8 +213,9 @@ directions, duplicate counting, and inclusion of SOCKS framing fail the test.
 After building x64 Release, compile in an x64 Visual Studio developer prompt:
 
 ```bat
-cl /nologo /EHsc /O2 /DUNICODE /D_UNICODE tests\e2e\traffic_statistics.cpp /Fo:build\qa\traffic_statistics.obj /Fe:bin\traffic_statistics.exe /link /LIBPATH:bin\x64\Release ProxyLaneHook.lib ws2_32.lib user32.lib
-python tests\TrafficStatisticsE2ETests.py --probe bin\traffic_statistics.exe --socks-server build\qa\go\socks5_e2e_server.exe
+cl /nologo /EHsc /O2 /DUNICODE /D_UNICODE tests\e2e\traffic_statistics.cpp /Fo:build\qa\traffic_statistics.obj /Fe:build\qa\traffic_statistics.exe /link /LIBPATH:bin\x64\Release ProxyLaneHook.lib ws2_32.lib user32.lib
+copy bin\*.dll build\qa\
+python tests\TrafficStatisticsE2ETests.py --probe build\qa\traffic_statistics.exe --socks-server build\qa\go\socks5_e2e_server.exe
 ```
 
 For Win32, use an x86 developer prompt and `bin\Win32\Release` as the library
@@ -260,15 +260,30 @@ python tests/MonitorTrafficE2ETests.py --binary-directory bin
 
 The traffic test launches a disposable GUI with a unique profile and transfers
 128 MiB through an injected child and a local SOCKS5 relay. It verifies complete
-delivery by SHA-256 while HEX logging stays below 128 Ki characters, private
-memory growth stays below 48 MiB, and window message latency stays below one
-second. It also checks tail following, hidden-page replay, HEX switching and
-clearing. Screenshots and measurements remain in `build/qa/monitor-traffic-*`.
-No user profiles or CA trust are changed. `mitm_host32.exe monitor-queue` and
-`mitm_host64.exe monitor-queue` test queue overflow order, clear, and pause.
+delivery by SHA-256, one TCP session across progress updates, directional HEX
+preview and cache truncation, without creating a CA. Private memory growth stays
+below 48 MiB and window message latency below one second. ProtocolPageHarness
+covers per-session HEX, stream row updates and clearing during asynchronous queries. Screenshots and measurements remain in `build/qa/monitor-traffic-*`.
+No user profiles or CA trust are changed. `mitm_host64.exe monitor-queue`
+tests queue overflow order, clear, and pause.
 The queue checks also cover capture through the existing data-handler interface
 without GUI callbacks, and service lifetime across proxy owner recreation.
 The ordinary native tests cover HEX byte formatting and text budget boundaries.
+
+Host architecture checks (build Release/Win32 and Release/x64 first):
+
+```powershell
+scripts/test-legacy-host.ps1
+python tests/e2e/mitm_host_arch.py
+```
+
+The first builds a test-only 32-bit GUI with x64 bootstrap forwarding bypassed,
+then verifies disabled controls, preserved/rejected encrypted profiles, ignored
+MITM settings and ordinary proxy startup. It does not emulate Windows XP.
+The second requires the existing user CA to be trusted and `build/tools/mitm_host64.exe`
+to be built; it checks both x86/x64 curl through an x64 host with only the x64
+MITM DLL. It neither installs nor removes certificates. Only its disposable
+host bypasses validation of the local test origin; curl validates the MITM leaf normally.
 
 ## Alternate-user process creation
 
