@@ -444,6 +444,18 @@ public:
         Require(page.m_hexView.Bytes()==priorHex && page.m_protocol->pendingDisplay,"Hex drag defers refresh");
         ReleaseCapture();page.TickProtocolView();
         Require(page.m_hexView.Bytes().size()>priorHex.size(),"Hex refresh resumes after capture release");
+        Require((page.m_detail.GetStyle()&WS_VISIBLE)==0 && page.m_hexView.IsWindowVisible(),"background Raw refresh must not uncover Raw over HexView");
+        CRect afterRefresh;page.m_hexView.GetWindowRect(afterRefresh);page.ScreenToClient(afterRefresh);
+        page.m_hexView.MoveWindow(afterRefresh.left,afterRefresh.top,300,220);
+        if(nativeScroll) {
+            DragThumb(page.m_hexView,SB_VERT);DragThumb(page.m_hexView,SB_HORZ);
+        }
+        for(int refresh=0;refresh<3;++refresh) {
+            rawSide.packets.push_back(packetBytes("more UDP payload"));page.ShowProtocolDetail();
+            Require((page.m_detail.GetStyle()&WS_VISIBLE)==0 && page.m_hexView.IsWindowVisible(),"repeated UDP updates keep Raw hidden");
+        }
+        page.m_hexView.MoveWindow(afterRefresh);
+
         page.m_viewTabs.SetCurSel(0);page.OnView(nullptr,&ignored);
         ++flow.sequence;flow.quic=true;flow.protocol="QUIC v1";
         page.m_protocol->history.Add(flow);

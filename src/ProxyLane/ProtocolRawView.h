@@ -51,7 +51,10 @@ public:
         if(GetScrollInfo(SB_HORZ,&info)) scroll.x=info.nPos;
         if(GetScrollInfo(SB_VERT,&info)) scroll.y=info.nPos;
         int first,last;GetSel(first,last);
-        m_updating=true; SetRedraw(FALSE); SetReadOnly(FALSE);
+        // WM_SETREDRAW(TRUE) adds WS_VISIBLE. A hidden Raw view must never
+        // receive that pair while HexView owns the same screen rectangle.
+        const bool redraw=(GetStyle()&WS_VISIBLE)!=0;
+        m_updating=true;if(redraw) SetRedraw(FALSE);SetReadOnly(FALSE);
         const bool append=preserve && ranges.size()>=m_ranges.size() && text.GetLength()>=m_text.GetLength() && text.Left(m_text.GetLength())==m_text;
         const int from=append ? m_text.GetLength() : 0;
         if(append) {SetSel(from,from,TRUE);ReplaceSel(text.Mid(from),FALSE);}
@@ -75,7 +78,7 @@ public:
             // Older RichEdit implementations may truncate scroll coordinates.
             if(GetFirstVisibleLine()!=top) LineScroll(top-GetFirstVisibleLine());
         } else {POINT origin={};SendMessage(EM_SETSCROLLPOS,0,(LPARAM)&origin);}
-        SetRedraw(TRUE);Invalidate(FALSE);m_updating=false;
+        if(redraw) SetRedraw(TRUE);Invalidate(FALSE);m_updating=false;
     }
 protected:
     LRESULT WindowProc(UINT message, WPARAM wp, LPARAM lp) override {

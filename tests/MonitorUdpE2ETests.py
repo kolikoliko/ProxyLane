@@ -224,6 +224,9 @@ def main():
                     if '.ONE' in text(edit):
                         assert 'TWO' not in text(edit)
                         send(edit,0xB1,1,3)
+                        views=u.GetDlgItem(page,1102)
+                        x,y=round(80*scale),round(12*scale)
+                        send(views,0x201,1,(y<<16)|x);send(views,0x202,0,(y<<16)|x)
                         Path(str(output)+'.continue').touch()
             peak = max(peak, memory(process)); samples += 1
             time.sleep(.1)
@@ -233,6 +236,9 @@ def main():
             while 'TWO' not in text(edit) and time.monotonic()<deadline:time.sleep(.1)
             assert '.ONE' in text(edit) and 'TWO' in text(edit), 'Live Raw did not accumulate packets'
             assert send(edit,0xB0)==((3<<16)|1), 'Live refresh replaced the selection'
+            assert not u.IsWindowVisible(edit) and u.IsWindowVisible(u.GetDlgItem(page,1103)), 'Live background Raw update must not overlap HexView'
+            views=u.GetDlgItem(page,1102);x,y=round(25*scale),round(12*scale)
+            send(views,0x201,1,(y<<16)|x);send(views,0x202,0,(y<<16)|x)
         check(1011, False)
         result = json.loads(output.read_text())
         if args.dns_quic:
