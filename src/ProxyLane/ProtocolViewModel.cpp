@@ -2,6 +2,7 @@
 #include "stdafx.h"
 #endif
 #include "ProtocolViewModel.h"
+#include <chrono>
 #include <windows.h>
 #include <wincrypt.h>
 #include <algorithm>
@@ -146,7 +147,7 @@ void History::Add(Row row) {
         (existing.connectionRow && existing.run == row.run &&
         Str(Object(existing.record,"connection"),"id") == Str(Object(row.record,"connection"),"id"))) {
         if (row.sequence <= existing.sequence) return;
-        row.hex = existing.hex; row.number = existing.number;
+        row.hex = existing.hex; row.number = existing.number; row.firstSeenSeconds = existing.firstSeenSeconds;
         row.datagram[0] = existing.datagram[0]; row.datagram[1] = existing.datagram[1];
         bytes -= existing.bytes; bytes += row.bytes; existing = std::move(row);
         while (!rows.empty() && bytes > metadataLimit) { bytes -= rows.front().bytes; rows.pop_front(); ++discarded; }
@@ -156,6 +157,7 @@ void History::Add(Row row) {
         bytes -= rows.front().bytes; rows.pop_front(); ++discarded;
     }
     row.number = nextNumber++;
+    row.firstSeenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     bytes += row.bytes; rows.push_back(std::move(row));
 }
 void History::Clear() { rows.clear(); bytes = 0; discarded = 0; nextNumber = 1; }
@@ -260,6 +262,11 @@ Detail ReadDetail(const Query& query, const Row& row, size_t previewLimit) {
         std::to_string(connection.value("generation", uint64_t(0))) + "\r\n";
     if (row.connectionRow) {
         detail.note = Str(row.record,"detail");
+        // rustls diagnostics are prefixed with the TLS endpoint by Session::feed.
+        // A client rejecting our CA or a transport failure must not suggest bypassing the target check.
+        detail.targetCertificateRejected = row.status == "Failed" &&
+            !row.record.value("upstream_verification_skipped",false) &&
+            detail.note.find("upstream TLS: invalid peer certificate:") == 0;
         if (row.protocol.find("TLS") == 0 && row.record.value("upstream_verification_skipped",false)) detail.note += " Target certificate verification skipped.";
         return detail;
     }

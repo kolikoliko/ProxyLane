@@ -19,15 +19,20 @@ use std::{
 pub(crate) static SKIP_UPSTREAM_VERIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CONTEXT: Mutex<Option<Arc<Context>>> = Mutex::new(None);
 static PROTOCOL: Mutex<Option<Arc<protocol::Runtime>>> = Mutex::new(None);
+static MONITORING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Serialize control requests, without holding the runtime slot during stop/drain.
+static PROTOCOL_CONTROL: Mutex<()> = Mutex::new(());
 
-fn protocol_runtime() -> Result<Arc<protocol::Runtime>, String> {
+fn protocol_runtime() -> Result<(Arc<protocol::Runtime>, u64), String> {
     let mut slot = PROTOCOL.lock().map_err(|e| e.to_string())?;
+    if !MONITORING.load(std::sync::atomic::Ordering::Acquire) { return Err("monitoring stopped".into()); }
     if let Some(runtime) = slot.as_ref() {
-        return Ok(runtime.clone());
+        return Ok((runtime.clone(), runtime.capture_epoch()));
     }
     let runtime = protocol::Runtime::configured()?;
     *slot = Some(runtime.clone());
-    Ok(runtime)
+    let epoch = runtime.capture_epoch();
+    Ok((runtime, epoch))
 }
 
 fn context() -> Result<Arc<Context>, String> {
@@ -162,8 +167,8 @@ pub unsafe extern "C" fn plm_create(
         // bounded/temporary and failure must not affect network forwarding.
         let identity = protocol::identity(&metadata, &host);
         let mut session = Session::new(context()?, host, metadata, false)?;
-        if let (Ok(runtime), Ok(identity)) = (protocol_runtime(), identity) {
-            session.enable_protocol(runtime, identity);
+        if let (Ok((runtime, epoch)), Ok(identity)) = (protocol_runtime(), identity) {
+            session.enable_protocol_at(runtime, identity, epoch);
         }
         Ok::<_, String>(session)
     }));
@@ -192,7 +197,8 @@ pub unsafe extern "C" fn plm_stream_open(host: *const c_char, metadata: *const c
         let host = text(host).ok()?;
         let metadata = serde_json::from_str(text(metadata).ok()?).ok()?;
         let identity = protocol::identity(&metadata, host).ok()?;
-        protocol_runtime().ok()?.tap_transport(identity, None, false).map(|tap| Box::into_raw(Box::new(tap)))
+        let (runtime, epoch) = protocol_runtime().ok()?;
+        runtime.tap_at(epoch, identity, None, false).map(|tap| Box::into_raw(Box::new(tap)))
     })).ok().flatten().unwrap_or(ptr::null_mut())
 }
 #[no_mangle]
@@ -337,16 +343,31 @@ pub unsafe extern "C" fn plm_protocol(
             }
             return Ok(serde_json::json!({"skip_upstream_verify":SKIP_UPSTREAM_VERIFY.load(Ordering::Acquire),"settings":settings}).to_string());
         }
-        if request["type"] == "analysis_start" {
-            let mut slot=PROTOCOL.lock().map_err(|e|e.to_string())?;
-            let changed=slot.as_ref().is_some_and(|r| !r.options.same_analysis(&options::current()));
-            if changed { if let Some(runtime)=slot.take() {runtime.shutdown()?;} }
-            return Ok(serde_json::json!({"type":"analysis_started","reset":changed}).to_string());
-        }
-        if request["type"] == "shutdown" {
-            let runtime = PROTOCOL.lock().map_err(|e| e.to_string())?.take();
+        if request["type"] == "analysis_start" || request["type"] == "analysis_stop" || request["type"] == "shutdown" {
+            use std::sync::atomic::Ordering;
+            let _control = PROTOCOL_CONTROL.lock().map_err(|e| e.to_string())?;
+            if request["type"] == "analysis_start" {
+                let (changed, old) = {
+                    let mut slot = PROTOCOL.lock().map_err(|e| e.to_string())?;
+                    let changed = slot.as_ref().is_some_and(|r| !r.options.same_analysis(&options::current()));
+                    let old = if changed { slot.take() } else { None };
+                    if let Some(runtime) = slot.as_ref() { runtime.start_capture(); }
+                    (changed, old)
+                };
+                if let Some(runtime) = old { runtime.shutdown()?; }
+                MONITORING.store(true, Ordering::Release);
+                return Ok(serde_json::json!({"type":"analysis_started","reset":changed}).to_string());
+            }
+            let runtime = {
+                let mut slot = PROTOCOL.lock().map_err(|e| e.to_string())?;
+                // Proxy shutdown clears resources, but preserves the selected
+                // monitoring mode for a later proxy restart.
+                if request["type"] == "analysis_stop" { MONITORING.store(false, Ordering::Release); }
+                if request["type"] == "shutdown" { slot.take() } else { slot.clone() }
+            };
             if let Some(runtime) = runtime {
-                runtime.shutdown()?;
+                if request["type"] == "shutdown" { runtime.shutdown()?; }
+                else { runtime.stop_capture()?; }
             }
             return Ok("{\"type\":\"stopped\"}".into());
         }

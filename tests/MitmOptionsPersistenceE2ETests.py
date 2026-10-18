@@ -30,7 +30,9 @@ def main():
         for source in (root/'bin').glob(pattern):shutil.copy2(source,work/source.name)
     ini=work/'ProxyLane.ini';ini.write_text((root/'examples/ProxyLane.ini').read_text().replace('[options]', '[options]\nlanguage='+args.language),encoding='utf-8')
     env=dict(os.environ,PROXYLANE_MITM='0',PROXYLANE_MITM_HOME=str(work/'pki'))
-    for phase,(expected,new_value) in enumerate([(False,True),(True,False),(False,None)]):
+    for phase,(expected,new_value,action) in enumerate([
+        (False,True,'cancel'),(False,True,'close'),(False,True,'save'),
+        (True,False,'cancel'),(True,False,'save'),(False,None,'cancel')]):
         process=subprocess.Popen([str(work/'ProxyLane64.exe')],cwd=work,env=env)
         def windows():
             found=[]
@@ -45,7 +47,7 @@ def main():
             nav=u.GetDlgItem(main_window,0x1006);pages=[]
             @CALLBACK
             def find(hwnd,_):
-                if u.GetDlgItem(hwnd,1085):pages.append(hwnd)
+                if u.GetDlgItem(hwnd,1086):pages.append(hwnd)
                 return True
             u.EnumChildWindows(nav,find,0);page=pages[0]
             scale=u.GetDpiForWindow(nav)/96;x,y=round(50*scale),round((78+3*44+20)*scale)
@@ -54,24 +56,29 @@ def main():
             dialog=wait(lambda:next((h for h in windows() if u.GetDlgItem(h,1107) and u.IsWindowEnabled(u.GetDlgItem(h,1))),None),'MITM options missing')
             control=u.GetDlgItem(dialog,1107)
             assert send(control,0xF0)==int(expected),('Restored preference mismatch',phase,expected)
+            original=ini.read_bytes()
             if new_value is not None:
                 send(control,0xF1,int(new_value));send(dialog,0x111,1107,control)
                 assert send(control,0xF0)==int(new_value)
-                saved=configparser.ConfigParser();saved.read(ini,encoding='utf-8-sig')
-                assert saved.getboolean('options','MitmSkipUpstreamVerify')==new_value
-                assert saved.get('options','lastselected')=='Test','Other settings overwritten'
+                assert ini.read_bytes()==original,'Draft must not change INI'
             screenshot(dialog,work/('options-phase-'+str(phase)+'.png'))
             if phase==0:
                 send(dialog,0x111,1300,u.GetDlgItem(dialog,1300))
                 screenshot(dialog,work/'options-expanded.png')
-            assert u.PostMessageW(dialog,0x111,1,0)
+            assert u.PostMessageW(dialog,0x10 if action=='close' else 0x111,1301 if action=='save' else 1,0)
             wait(lambda:not u.IsWindow(dialog),'options did not close')
+            if action=='save':
+                saved=configparser.ConfigParser();saved.read(ini,encoding='utf-8-sig')
+                assert saved.getboolean('options','MitmSkipUpstreamVerify')==new_value
+                assert saved.get('options','lastselected')=='Test','Other settings overwritten'
+            else:
+                assert ini.read_bytes()==original,'Cancel/X must not save any draft'
             assert not (work/'pki/ca.json').exists(),'Preference must not initialize/install CA'
         finally:
             for hwnd in windows():u.PostMessageW(hwnd,0x10,0,0)
             try:process.wait(timeout=8)
             except subprocess.TimeoutExpired:process.kill();process.wait()
         assert process.returncode==0,('GUI exit failed',process.returncode)
-    print('PASS MITM preference: default strict, save enabled, restart restore, save disabled, restart strict',work,flush=True)
+    print('PASS MITM options: drafts, Cancel/X discard, save and close, restart restore',work,flush=True)
 
 if __name__=='__main__':main()

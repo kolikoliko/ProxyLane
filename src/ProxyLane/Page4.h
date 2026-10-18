@@ -22,6 +22,7 @@ public:
 protected:
     virtual void DoDataExchange(CDataExchange* dx);
     virtual BOOL OnInitDialog();
+    virtual BOOL PreTranslateMessage(MSG* message);
     afx_msg void OnSize(UINT type, int cx, int cy);
     afx_msg void OnShowWindow(BOOL show, UINT status);
     afx_msg void OnTimer(UINT_PTR id);
@@ -39,15 +40,15 @@ protected:
     afx_msg void OnCaptureChanged(CWnd*);
     afx_msg void OnClear();
     afx_msg void OnCA();
-    afx_msg void OnDecrypt();
     afx_msg void OnRequestSelected(NMHDR*, LRESULT*);
+    afx_msg void OnRequestInfoTip(NMHDR*, LRESULT*);
     afx_msg void OnDetailTab(NMHDR*, LRESULT*);
     DECLARE_MESSAGE_MAP()
 private:
     void LayoutControls(int cx, int cy);
-    void SetDecryptStatus();
+    void SetMonitorControls(bool busy);
     void OpenCA(bool enableAfterClose);
-    void StartDecryption();
+    void StartMonitoring();
     bool PrepareReconnect(bool decrypt);
     void CompleteReconnect(bool commit);
     bool m_reconnectPrepared = false, m_reconnectAccepted = false;
@@ -59,6 +60,7 @@ private:
     void TickProtocolView();
     void ClearProtocolView();
     void ShowProtocolDetail();
+    void UpdateDetailTooltip();
     void RebuildRequests();
     bool CanFollowLatest();
     CTabCtrl m_detailTabs, m_viewTabs;
@@ -72,12 +74,14 @@ private:
     CListCtrl m_requests;
     CProtocolRawView m_detail;
     CStatic m_detailStatus;
+    CToolTipCtrl m_detailTooltip;
+    CString m_detailStatusText;
     std::shared_ptr<ProtocolPageData> m_protocol;
-    CButton m_monitor, m_decrypt;
+    CButton m_monitor;
     CModernButton m_clear, m_ca;
     CFont m_font;
     IProxyTlsControl* m_tls;
     bool m_recording;
     bool m_mitmSupported = ProxySupportsOptionalModules();
-    std::shared_ptr<MitmJob> m_job;
+    std::shared_ptr<MitmJob> m_job, m_stopJob;
 };

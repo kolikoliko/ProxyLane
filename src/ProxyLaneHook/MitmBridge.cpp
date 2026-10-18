@@ -12,9 +12,10 @@
 #include <atomic>
 #include <mutex>
 #include <algorithm>
+#include "../../third_party/nlohmann/json.hpp"
 
 namespace {
-    std::mutex moduleLock;
+    std::mutex moduleLock, monitorControlLock;
     std::atomic<int> enabledMode(-1);
     std::atomic<bool> streamMonitoring(false);
     std::atomic<ULONGLONG> connectionSequence(0);
@@ -35,7 +36,10 @@ namespace {
         module = LoadLibrary(path);
         if (module) {
             PLM_VERSION_FN version = (PLM_VERSION_FN)GetProcAddress(module, "plm_abi_version");
-            if (version && version() == PLM_ABI_VERSION)
+            bool complete = version && version() == PLM_ABI_VERSION;
+            for (auto name : {"plm_create","plm_io","plm_error","plm_free","plm_observe","plm_stream_open","plm_stream_io"})
+                complete = complete && GetProcAddress(module,name)!=NULL;
+            if (complete)
                 protocolQuery.store((PLM_PROTOCOL_FN)GetProcAddress(module, "plm_protocol"));
         }
         return module;
@@ -96,24 +100,41 @@ int CMitmControl::QueryProtocol(const char* request, char* output, size_t capaci
         if (output && capacity) _snprintf_s(output, capacity, _TRUNCATE, "MITM and protocol monitoring require a supported Windows version and the 64-bit ProxyLane host.");
         return -1;
     }
-    if (request && (strcmp(request, "{\"type\":\"monitor_start\"}") == 0 ||
-        strcmp(request, "{\"type\":\"monitor_stop\"}") == 0)) {
-        const bool enabled = strstr(request, "monitor_start") != NULL;
-        if (enabled) {
+    auto command = nlohmann::json::parse(request ? request : "", nullptr, false);
+    const bool start = command.is_object() && command.value("type", nlohmann::json()) == "monitor_start";
+    const bool stop = command.is_object() && command.value("type", nlohmann::json()) == "monitor_stop";
+    if (start || stop) {
+        std::lock_guard<std::mutex> control(monitorControlLock);
+        if (stop) {
+            // Existing bridges keep their TLS state; only new connections stop MITM.
+            enabledMode.store(0);
+            streamMonitoring.store(false);
+        }
+        bool decrypt = IsEnabled() != FALSE; // Compatibility for internal callers without a mode.
+        if (start) {
+            if (command.contains("decrypt")) {
+                if (!command["decrypt"].is_boolean()) {
+                    if (output && capacity) _snprintf_s(output,capacity,_TRUNCATE,"Invalid HTTPS decryption option.");
+                    return -1;
+                }
+                decrypt = command["decrypt"].get<bool>();
+                if (decrypt && ManageCA(PrepareCA,output,capacity)<0) return -1;
+            }
             LoadMitm();
             if (!protocolQuery.load()) {
                 if (output && capacity) _snprintf_s(output, capacity, _TRUNCATE, "Cannot load compatible protocol module.");
                 return -1;
             }
         }
-        if (enabled && !streamMonitoring.load()) {
-            char response[256] = {};
-            if (protocolQuery.load()("{\"type\":\"analysis_start\"}", response, sizeof(response)) < 0) {
+        PLM_PROTOCOL_FN query = protocolQuery.load();
+        if (query && (stop || !streamMonitoring.load())) {
+            char response[1024] = {};
+            if (query(start ? "{\"type\":\"analysis_start\"}" : "{\"type\":\"analysis_stop\"}", response, sizeof(response)) < 0) {
                 if (output && capacity) _snprintf_s(output, capacity, _TRUNCATE, "%s", response);
                 return -1;
             }
         }
-        streamMonitoring.store(enabled);
+        if (start) { enabledMode.store(decrypt ? 1 : 0); streamMonitoring.store(true); }
         const char reply[] = "{\"type\":\"monitor\"}";
         if (output && capacity >= sizeof(reply)) memcpy(output, reply, sizeof(reply));
         return sizeof(reply);
@@ -135,6 +156,7 @@ void CMitmControl::ShutdownProtocol()
 }
 void __cdecl CMitmBridge::Observe(uintptr_t user, uint32_t kind, const uint8_t* data, size_t length)
 {
+    if (!streamMonitoring.load()) return;
     CMitmBridge* bridge = reinterpret_cast<CMitmBridge*>(user);
     CProxyMonitor::Instance().Record(bridge->m_connection, bridge->m_task->m_PRCClient, kind, data, length);
 }
@@ -145,7 +167,7 @@ CMitmBridge::~CMitmBridge() { if (m_session && m_free) m_free(m_session); }
 
 bool CMitmBridge::Enabled()
 {
-    return CMitmControl::Instance().IsEnabled() != FALSE;
+    return streamMonitoring.load() && CMitmControl::Instance().IsEnabled() != FALSE;
 }
 
 bool CMitmBridge::Initialize()

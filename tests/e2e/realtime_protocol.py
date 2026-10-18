@@ -180,14 +180,14 @@ def run(host, env, work, proxy, start, servers):
             child = [str(Path(os.environ["WINDIR"]) / "SysWOW64" / "curl.exe"), "--silent", "--show-error", "--compressed",
                      "--noproxy", "*", "--max-time", "20", "--resolve", f"mitm.test:{port}:203.0.113.10",
                      "--output", str(work / "protocol-chunked32.body"), f"https://mitm.test:{port}/probe"]
-        case_env = dict(env, PROXYLANE_TEST_NO_MONITOR="1")
+        case_env = dict(env, PROXYLANE_TEST_NO_PREVIEW="1")
         if mode == "limits":
             case_env.update(PROXYLANE_PROTOCOL_ENTRY_BYTES=str(128 * 1024), PROXYLANE_PROTOCOL_TOTAL_BYTES=str(192 * 1024))
         result = subprocess.run([str(test_host), str(proxy.server_address[1]), "SOCKS5", subprocess.list2cmdline(child)],
                                 env=case_env, capture_output=True, timeout=45)
         (work / ("protocol-" + mode + ".log")).write_bytes(result.stdout + result.stderr)
         assert result.returncode == 0, (mode, result.returncode, result.stderr.decode(errors="replace"))
-        assert b"GUI_EVENT" not in result.stderr, "Protocol reconstruction must work with GUI monitor disabled"
+        assert b"GUI_EVENT" not in result.stderr, "Protocol reconstruction must work without the legacy preview observer"
         values, flows = records(result)
         check_identity(result, flows)
         exchanges = [r for r in flows if r["type"] == "exchange"]

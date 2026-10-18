@@ -171,11 +171,13 @@ VOID CProxyTCPTaskMgr::RemoveAllTasks()
 
 DWORD CProxyTCPTaskMgr::PrepareReconnect(BOOL decrypt)
 {
+    (void)decrypt;
     CTSList<CTcpProxyTask*>::critical lc = m_tasklist;
     DWORD count = 0;
     for (auto task : m_tasklist) {
-        task->m_reconnectSelected = !task->IsDeletePending() && !task->m_reconnectPending &&
-            (decrypt ? !task->m_pMitm : !task->m_pMitm && (!task->m_pProtocol || !task->m_pProtocol->IsActive()));
+        // A new monitoring run cannot resume any TCP capture across a gap,
+        // including TLS bridges kept alive after stopping the previous run.
+        task->m_reconnectSelected = !task->IsDeletePending() && !task->m_reconnectPending;
         if (task->m_reconnectSelected) ++count;
     }
     return count;

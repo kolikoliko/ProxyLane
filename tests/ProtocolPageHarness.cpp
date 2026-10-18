@@ -13,26 +13,35 @@ IGlobalProxy* g_GlobalProxy = nullptr;
 class FakeTls : public IProxyTlsControl {
 public:
     std::atomic<bool> evicted{false};
-    bool caOk=false, skipVerify=false;
+    bool caOk=false, skipVerify=false, enabled=false, moduleOk=true, prepareOk=true;
+    int caFlags=3;
+    std::atomic<unsigned> starts{0}, caQueries{0};
+    bool lastDecrypt=false;
     nlohmann::json settings;
     std::atomic<unsigned> count{2};
     std::atomic<unsigned> delay{0};
     std::atomic<bool> packetPayload{false};
     std::atomic<unsigned> queries{0};
     int ManageCA(CaAction, char* output, size_t capacity) override {
-        if(caOk) {if(output&&capacity) strcpy_s(output,capacity,"Test CA trusted");return 3;}
+        ++caQueries;
+        if(caOk) {if(output&&capacity) strcpy_s(output,capacity,"Test CA status");return caFlags;}
         if (output && capacity) strcpy_s(output,capacity,"Test CA load failure");
         return -1;
     }
-    BOOL SetEnabled(BOOL, char*, size_t) override { return FALSE; }
-    BOOL IsEnabled() override { return FALSE; }
+    BOOL SetEnabled(BOOL value, char*, size_t) override {enabled=value!=FALSE;return TRUE;}
+    BOOL IsEnabled() override { return enabled; }
     int QueryProtocol(const char* request, char* output, size_t capacity) override {
         ++queries;
         using J = ProtocolView::Json;
         if (delay.load()) Sleep(delay.load());
         auto command = J::parse(request); J reply;
         std::string type = command.at("type");
-        if (type == "mitm_options") {
+        if (type == "monitor_start") {
+            ++starts;lastDecrypt=command.value("decrypt",false);
+            if(!moduleOk || (lastDecrypt && !prepareOk)) {strcpy_s(output,capacity,"Injected dependency failure");return -1;}
+            enabled=lastDecrypt;reply={{"type","monitor"}};
+        } else if(type=="monitor_stop") {enabled=false;reply={{"type","monitor"}};}
+        else if (type == "mitm_options") {
             if(command.contains("settings") && !command.value("validate_only",false)) settings=command["settings"];
             if(command.contains("skip_upstream_verify") && !command.value("validate_only",false)) skipVerify=command["skip_upstream_verify"].get<bool>();
             reply={{"settings",settings},{"skip_upstream_verify",skipVerify}};
@@ -120,19 +129,37 @@ public:
         CPage4 page(&parent);
         Require(page.Create(IDD_Page4, &parent) != FALSE, "create page");
 #ifndef _WIN64
-        Require(!page.m_mitmSupported && !page.m_decrypt.IsWindowEnabled() && !page.m_monitor.IsWindowEnabled() && !page.m_ca.IsWindowEnabled(),"32-bit host disables MITM and monitoring controls");
+        Require(!page.m_mitmSupported && !page.m_monitor.IsWindowEnabled() && !page.m_ca.IsWindowEnabled(),"32-bit host disables MITM and monitoring controls");
         char unsupported[512]={};
         Require(page.m_tls->QueryProtocol("{\"type\":\"mitm_options\",\"skip_upstream_verify\":true}",unsupported,sizeof(unsupported))<0,"32-bit backend rejects persisted options");
         SetEnvironmentVariable(L"PROXYLANE_MITM",L"1");
         Require(!page.m_tls->IsEnabled(),"32-bit host ignores MITM environment setting");
         Require(!page.m_tls->SetEnabled(TRUE,unsupported,sizeof(unsupported)),"32-bit backend refuses enabling MITM");
         SetEnvironmentVariable(L"PROXYLANE_MITM",nullptr);
-        page.OnCA();page.OnDecrypt();page.OnMonitor();page.OnTimer(1);
+        page.OnCA();page.OnMonitor();page.OnTimer(1);
         Require(!GetModuleHandle(L"ProxyLaneMitm32.dll") && !GetModuleHandle(L"ProxyLaneMitm64.dll"),"32-bit host never loads MITM DLL");
         // Remaining view tests use an in-memory fake service, not a 32-bit Rust module.
         page.m_mitmSupported=true;
 #endif
+        Require(!page.GetDlgItem(IDC_MITM_ENABLE),"page exposes only one monitoring switch");
         page.m_tls = &fake;
+        auto waitJob=[](std::shared_ptr<MitmJob> job) {for(int i=0;i<200 && !job->done.load();++i) Sleep(10);Require(job->done.load(),"start worker completed");return job;};
+        fake.caOk=true;fake.caFlags=0;
+        auto start=waitJob(StartMonitorJob(&fake,true));
+        Require(start->needsCA && fake.starts==0 && !fake.enabled,"missing CA guides installation without starting plain monitoring");
+        fake.caOk=false;start=waitJob(StartMonitorJob(&fake,true));
+        Require(start->result<0 && !start->needsCA && fake.starts==0,"CA/module failure blocks requested decryption");
+        fake.caOk=true;fake.caFlags=3;fake.prepareOk=false;
+        start=waitJob(StartMonitorJob(&fake,true));
+        Require(start->result<0 && fake.lastDecrypt && !fake.enabled,"failed TLS preparation never falls back to plaintext monitoring");
+        fake.prepareOk=true;start=waitJob(StartMonitorJob(&fake,true));
+        Require(start->result>=0 && fake.enabled && fake.lastDecrypt,"valid decryption starts monitoring in the requested mode");
+        fake.enabled=false;fake.caOk=false;const auto caBefore=fake.caQueries.load();
+        start=waitJob(StartMonitorJob(&fake,false));
+        Require(start->result>=0 && !fake.enabled && !fake.lastDecrypt && fake.caQueries==caBefore,"plain monitoring needs no CA");
+        fake.moduleOk=false;start=waitJob(StartMonitorJob(&fake,false));
+        Require(start->result<0,"missing analysis module also blocks plain monitoring");fake.moduleOk=true;
+
         page.MoveWindow(0, 0, 960, 660); page.ShowWindow(SW_SHOW);
         parent.ShowWindow(SW_SHOWNOACTIVATE);
         page.m_recording = true;
@@ -242,7 +269,25 @@ public:
         page.m_viewTabs.SetCurSel(1); page.OnView(nullptr, &ignored);
         page.m_detailStatus.GetWindowText(text);
         Require(text.Find(L"certificate verification skipped")==-1,"plain TCP must not show target TLS verification warning");
+        const auto firstSeen = page.m_protocol->history.rows.front().firstSeenSeconds;
+        Require(firstSeen > 0, "row records its first appearance time");
+        POINT savedCursor; GetCursorPos(&savedCursor);
+        page.m_requests.SendMessage(WM_HSCROLL,SB_LEFT);page.m_requests.EnsureVisible(0,FALSE);
+        CRect numberRect; page.m_requests.GetSubItemRect(0,0,LVIR_BOUNDS,numberRect);
+        CPoint tipPoint(8,numberRect.CenterPoint().y);page.m_requests.ClientToScreen(&tipPoint);
+        SetCursorPos(tipPoint.x,tipPoint.y);
+        wchar_t tipText[128] = {};
+        NMLVGETINFOTIP tip = {};tip.iItem=0;tip.pszText=tipText;tip.cchTextMax=_countof(tipText);
+        page.OnRequestInfoTip((NMHDR*)&tip,&ignored);
+        if(!tipText[0]) {POINT actual;GetCursorPos(&actual);std::cerr<<"tooltip cursor "<<actual.x<<","<<actual.y<<" wanted "<<tipPoint.x<<","<<tipPoint.y<<"\n";}
+        Require(CString(tipText)==CTime((__time64_t)firstSeen).Format(L"%Y-%m-%d %H:%M:%S"),"number tooltip shows full local date and time");
+        page.m_requests.GetSubItemRect(0,1,LVIR_BOUNDS,numberRect);
+        tipPoint=numberRect.CenterPoint();page.m_requests.ClientToScreen(&tipPoint);SetCursorPos(tipPoint.x,tipPoint.y);
+        tipText[0]=0;page.OnRequestInfoTip((NMHDR*)&tip,&ignored);
+        Require(!tipText[0],"time tooltip is restricted to the number column");
+        SetCursorPos(savedCursor.x,savedCursor.y);
         flow.sequence = 702; flow.responseBytes = 100; page.m_protocol->history.Add(flow); page.RebuildRequests();
+        Require(page.m_protocol->history.rows.front().firstSeenSeconds==firstSeen,"row updates preserve the timestamp");
         Require(page.m_requests.GetItemCount() == 1 && page.m_requests.GetItemText(0,7) == L"0 / 100", "stream updates same row");
         Require(page.m_protocol->selected == flow.key && page.m_protocol->history.rows.front().hex, "stream selection/HEX preserved");
         page.m_detail.GetWindowText(text);
@@ -480,13 +525,13 @@ public:
             CPage4 legacy(&parent); legacy.m_mitmSupported=false;
             Require(legacy.Create(IDD_Page4,&parent)!=FALSE,"create legacy page");
             legacy.m_tls=&fake; legacy.ShowWindow(SW_SHOW);
-            Require(!legacy.m_monitor.IsWindowEnabled() && !legacy.m_decrypt.IsWindowEnabled() && !legacy.m_ca.IsWindowEnabled(),"legacy entry points disabled");
+            Require(!legacy.m_monitor.IsWindowEnabled() && !legacy.m_ca.IsWindowEnabled(),"legacy entry points disabled");
             const unsigned queries=fake.queries;
-            legacy.OnCA(); legacy.m_decrypt.SetCheck(BST_CHECKED); legacy.OnDecrypt();
+            legacy.OnCA();
             legacy.m_monitor.SetCheck(BST_CHECKED); legacy.OnMonitor(); legacy.UpdateMonitorStatus();
             for (int i=0;i<5;++i) legacy.OnTimer(1);
             Require(fake.queries==queries && !legacy.m_protocol->job && !legacy.m_job,"legacy actions and background timer never query module");
-            Require(legacy.m_monitor.GetCheck()==BST_UNCHECKED && legacy.m_decrypt.GetCheck()==BST_UNCHECKED,"legacy forced commands remain disabled");
+            Require(legacy.m_monitor.GetCheck()==BST_UNCHECKED,"legacy forced commands remain disabled");
             legacy.m_detailStatus.GetWindowText(text);
             Require(text==Localization::Get(ProxyIsLegacyWindows() ? L"mitm.legacy_unavailable" : L"mitm.x64_required"),"unsupported host explanation");
             legacy.KillTimer(1); legacy.DestroyWindow();
@@ -530,11 +575,45 @@ public:
             const CString path=Localization::SettingsPath();
             const auto original=MitmSettings::Load();
             wchar_t originalSkip[32]={};GetPrivateProfileString(L"options",L"MitmSkipUpstreamVerify",L"",originalSkip,32,path);
+            wchar_t originalDecrypt[32]={};GetPrivateProfileString(L"options",L"DecryptHTTPS",L"",originalDecrypt,32,path);
             const bool hadIni=GetFileAttributes(path)!=INVALID_FILE_ATTRIBUTES;
             fake.caOk=true;
+            // Hint follows an actual new decryption choice, never simply opening
+            // options during monitoring (including an already decrypted run).
+            auto hintVisible=[](CMitmCaDialog& dialog) {
+                for(CWnd* child=dialog.GetWindow(GW_CHILD);child;child=child->GetNextWindow()) {
+                    CString text;child->GetWindowText(text);
+                    if(text==Localization::Get(L"mitm.next_monitor")) return (child->GetStyle()&WS_VISIBLE)!=0;
+                }
+                throw std::runtime_error("missing restart hint control");
+            };
+            for(int state=0;state<4;++state) {
+                const bool monitoring=state!=0, active=state==2, saved=state>=2;
+                fake.enabled=active;Require(MitmSettings::SaveDecryptHTTPS(saved),"hint test preference");
+                CMitmCaDialog hint(&parent,&fake,monitoring);
+                Require(hint.Create(IDD_MITM_CA,&parent)!=FALSE,"hint options");hint.ShowWindow(SW_SHOW);
+                for(int n=0;n<40;++n){Sleep(10);hint.OnTimer(1);}
+                Require(!hintVisible(hint),"opening options never requests restart");
+                hint.CheckDlgButton(IDC_MITM_ENABLE,BST_UNCHECKED);
+                hint.SendMessage(WM_COMMAND,MAKEWPARAM(IDC_MITM_ENABLE,BN_CLICKED));
+                Require(!hintVisible(hint),"unchecked decryption hides hint");
+                hint.CheckDlgButton(IDC_MITM_ENABLE,BST_CHECKED);
+                hint.SendMessage(WM_COMMAND,MAKEWPARAM(IDC_MITM_ENABLE,BN_CLICKED));
+                for(int n=0;n<40;++n){Sleep(10);hint.OnTimer(1);}
+                Require(hintVisible(hint)==(monitoring&&!active),"only enabling decryption during plaintext monitoring requests restart");
+                hint.SendMessage(WM_COMMAND,MAKEWPARAM(1302,BN_CLICKED));
+                Require(!hintVisible(hint),"defaults hide restart hint");
+                hint.KillTimer(1);hint.DestroyWindow();
+            }
+            fake.enabled=false;Require(MitmSettings::SaveDecryptHTTPS(false),"restore off before options tests");
             CMitmCaDialog options(&parent,&fake);
             Require(options.Create(IDD_MITM_CA,&parent)!=FALSE,"create options dialog");options.ShowWindow(SW_SHOW);
             for(int n=0;n<40;++n){Sleep(10);options.OnTimer(1);}
+            Require(options.IsDlgButtonChecked(IDC_MITM_ENABLE)==BST_UNCHECKED,"HTTPS decryption defaults off");
+            options.CheckDlgButton(IDC_MITM_ENABLE,BST_CHECKED);
+            options.SendMessage(WM_COMMAND,MAKEWPARAM(IDC_MITM_ENABLE,BN_CLICKED));
+            for(int n=0;n<40;++n){Sleep(10);options.OnTimer(1);}
+            Require(!MitmSettings::DecryptHTTPS() && !fake.enabled,"changing the draft never enables MITM or saves it");
             Require(!options.GetDlgItem(1314)->IsWindowVisible(),"advanced settings initially collapsed");
             CRect collapsed;options.GetWindowRect(collapsed);
             options.SendMessage(WM_COMMAND,MAKEWPARAM(1300,BN_CLICKED));
@@ -542,37 +621,62 @@ public:
             Require(expanded.Height()>collapsed.Height() && options.GetDlgItem(1318)->IsWindowVisible(),"advanced settings expand");
             const MitmSettings::Values changed={{48,768,1024,128,8,64,16,512,30}};
             for(int i=0;i<9;++i) options.SetDlgItemInt(1310+i,changed[i]);
-            options.SendMessage(WM_COMMAND,MAKEWPARAM(1301,BN_CLICKED));
-            Require(MitmSettings::Load()==changed,"all nine settings persisted to ini");
-            Require(fake.settings==MitmSettings::Json(changed),"all nine settings applied to service");
             options.CheckDlgButton(IDC_MITM_SKIP_VERIFY,BST_CHECKED);
             options.SendMessage(WM_COMMAND,MAKEWPARAM(IDC_MITM_SKIP_VERIFY,BN_CLICKED));
+            Require(!fake.skipVerify && GetPrivateProfileInt(L"options",L"MitmSkipUpstreamVerify",0,path)==0,"verification checkbox stays draft until save");
+            options.SendMessage(WM_COMMAND,MAKEWPARAM(1301,BN_CLICKED));
+            Require(!options.IsWindowVisible(),"successful save closes options");
+            Require(MitmSettings::Load()==changed,"all nine settings persisted to ini");
+            Require(MitmSettings::DecryptHTTPS() && !fake.enabled,"Save persists decryption preference without starting interception");
+            Require(fake.settings==MitmSettings::Json(changed),"all nine settings applied to service");
+            options.KillTimer(1);options.DestroyWindow();
+            Require(options.Create(IDD_MITM_CA,&parent),"reopen after save");options.ShowWindow(SW_SHOW);
+            for(int n=0;n<40;++n){Sleep(10);options.OnTimer(1);}
             const unsigned beforeReset=fake.queries.load();
             options.SendMessage(WM_COMMAND,MAKEWPARAM(1302,BN_CLICKED));
             const auto defaults=MitmSettings::Defaults();
             for(int i=0;i<9;++i) Require(options.GetDlgItemInt(1310+i)==defaults[i],"restore drafts all nine defaults");
             Require(options.IsDlgButtonChecked(IDC_MITM_SKIP_VERIFY)==BST_UNCHECKED,"restore drafts strict verification");
+            Require(options.IsDlgButtonChecked(IDC_MITM_ENABLE)==BST_UNCHECKED && MitmSettings::DecryptHTTPS(),"restore drafts decryption off until Save");
             Require(fake.queries==beforeReset && fake.skipVerify && fake.settings==MitmSettings::Json(changed),"restore makes no service call");
             Require(MitmSettings::Load()==changed && GetPrivateProfileInt(L"options",L"MitmSkipUpstreamVerify",0,path)==1,"restore makes no ini changes");
             page.ApplyMonitorSettings();
             Require(page.m_protocol->history.rowLimit==1024 && page.m_protocol->history.metadataLimit==16*1024*1024 && page.m_protocol->previewLimit==128*1024,"display limits applied immediately");
+            options.SendMessage(WM_COMMAND,IDOK);
+            Require(!options.IsWindowVisible(),"cancel closes draft without applying defaults");
             options.KillTimer(1);options.DestroyWindow();
             CMitmCaDialog reopened(&parent,&fake);Require(reopened.Create(IDD_MITM_CA,&parent),"reopen saved options");
             for(int i=0;i<9;++i) Require(reopened.GetDlgItemInt(1310+i)==changed[i],"restore saved option values");
             Require(reopened.IsDlgButtonChecked(IDC_MITM_SKIP_VERIFY)==BST_CHECKED,"discard draft verification change on close");
-            reopened.SetDlgItemInt(1310,99);reopened.KillTimer(1);reopened.DestroyWindow();
+            for(int n=0;n<40;++n){Sleep(10);reopened.OnTimer(1);}
+            reopened.SetDlgItemInt(1310,99);
+            reopened.CheckDlgButton(IDC_MITM_SKIP_VERIFY,BST_UNCHECKED);
+            reopened.SendMessage(WM_COMMAND,MAKEWPARAM(IDC_MITM_SKIP_VERIFY,BN_CLICKED));
+            reopened.SendMessage(WM_CLOSE);
+            Require(fake.skipVerify && GetPrivateProfileInt(L"options",L"MitmSkipUpstreamVerify",0,path)==1,"X discards verification draft");
+            reopened.KillTimer(1);reopened.DestroyWindow();
             Require(MitmSettings::Load()==changed,"closing without save preserves settings");
             CMitmCaDialog reset(&parent,&fake);Require(reset.Create(IDD_MITM_CA,&parent),"open options for saved reset");
+            for(int n=0;n<40;++n){Sleep(10);reset.OnTimer(1);}
             reset.SendMessage(WM_COMMAND,MAKEWPARAM(1302,BN_CLICKED));
             reset.SendMessage(WM_COMMAND,MAKEWPARAM(1301,BN_CLICKED));
             Require(MitmSettings::Load()==defaults && fake.settings==MitmSettings::Json(defaults),"save applies and persists defaults");
+            Require(!MitmSettings::DecryptHTTPS(),"saved defaults disable decryption preference");
             Require(!fake.skipVerify && GetPrivateProfileInt(L"options",L"MitmSkipUpstreamVerify",1,path)==0,"save applies and persists strict verification");
             reset.KillTimer(1);reset.DestroyWindow();
             Require(MitmSettings::Save(original),"restore harness ini values");
             WritePrivateProfileString(L"options",L"MitmSkipUpstreamVerify",originalSkip[0] ? originalSkip : nullptr,path);
+            WritePrivateProfileString(L"options",L"DecryptHTTPS",originalDecrypt[0] ? originalDecrypt : nullptr,path);
             if(!hadIni) Require(DeleteFile(path)!=FALSE,"remove owned harness ini");
             page.ApplyMonitorSettings();fake.caOk=false;
         }
+        fake.delay=300;page.m_recording=true;page.m_monitor.SetCheck(BST_UNCHECKED);
+        const DWORD stopStarted=GetTickCount();page.UpdateMonitorStatus();
+        Require(GetTickCount()-stopStarted<200,"monitor stop does not wait for disk work on the UI thread");
+        Require(!page.IsMonitoring() && page.m_stopJob && !page.m_monitor.IsWindowEnabled(),"stop blocks rapid restart until drained");
+        Pump(page,[&] {return !page.m_stopJob;});
+        Require(page.m_monitor.IsWindowEnabled() && page.m_monitor.GetCheck()==BST_UNCHECKED,"stop completion restores controls without restarting capture");
+        fake.delay=0;
         page.DestroyWindow();parent.DestroyWindow();
         std::cout << "PASS actual page controls: saved process names, clean address, no raw log, per-request HEX, selection races, headers, decoded body, eviction, resize, bounds, clear\n";
     }

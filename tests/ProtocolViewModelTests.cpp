@@ -182,6 +182,18 @@ int main(int argc, char** argv) {
     f=Fixture();f.record["type"]="connection";f.record["status"]="TLS handshaking";f.record["protocol"]="tls_stream";
     auto placeholder=f.row();history.Clear();history.Add(placeholder);auto placeholderNumber=history.rows.front().number;
     detail=ReadDetail(f.query(),placeholder);assert(f.reads==0 && detail.request.body.empty() && detail.state==Detail::Ready);
+    f.record["status"]="Failed";
+    for(const auto& reason : {"UnknownIssuer","certificate expired: verification time 1","certificate not valid for name example.test"}) {
+        f.record["detail"]=std::string("upstream TLS: invalid peer certificate: ")+reason;
+        assert(ReadDetail(f.query(),f.row()).targetCertificateRejected);
+    }
+    for(const auto& reason : {"application TLS: invalid peer certificate: UnknownIssuer","TCP connection failed: 10060","upstream TLS: received fatal alert: UnknownCA"}) {
+        f.record["detail"]=reason;
+        assert(!ReadDetail(f.query(),f.row()).targetCertificateRejected);
+    }
+    f.record["detail"]="upstream TLS: invalid peer certificate: BadSignature";
+    f.record["upstream_verification_skipped"]=true;
+    assert(!ReadDetail(f.query(),f.row()).targetCertificateRejected);
     f=Fixture();f.record["sequence"]=2;f.record["connection"]["decrypted"]=true;f.record["doh"]=Json::object();f.record["exchange"]["response"]["headers"]=Json::array({Json::array({"content-type","application/dns-message"})});
     row=f.row();assert(row.protocol=="TLS/HTTP/2 / DoH" && Matches(row,"",5));
     history.Add(row);assert(history.rows.size()==1 && history.rows.front().number==placeholderNumber && !history.rows.front().connectionRow);

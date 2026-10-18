@@ -58,7 +58,7 @@ public:
 	virtual int ManageCA(CaAction action, char* output, size_t capacity) = 0;
 	virtual BOOL SetEnabled(BOOL enabled, char* error, size_t capacity) = 0;
 	virtual BOOL IsEnabled() = 0;
-	// Passive HTTP reconstruction/cache, independent of GUI monitoring. UTF-8
+	// Protocol reconstruction/cache, gated by monitor_start/monitor_stop. UTF-8
 	// JSON request/reply. Consumer thread only: may wait for analysis/disk work.
 	// Returns required capacity INCLUDING NUL (undersized buffer untouched),
 	// or -1 with error text. Non-destructive polls use a sequence cursor.

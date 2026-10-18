@@ -1,4 +1,4 @@
-"""Owned GUI/injected sockets: reconnect choices and idle lifecycle; no CA/trust changes."""
+"""Owned GUI/injected sockets: reconnect choices; uses an existing trusted CA without changing trust."""
 import ctypes as c
 from ctypes import wintypes as w
 import json, os, shutil, socket, socketserver, subprocess, sys, time, uuid
@@ -43,7 +43,11 @@ def main():
     profile='Reconnect'+uuid.uuid4().hex[:8]
     config=(root/'examples/ProxyLane.ini').read_text().replace('Test',profile).replace('Port=1080','Port='+str(relay.server_address[1]))
     (work/'ProxyLane.ini').write_text(config.replace('[options]','[options]\nlanguage=zh-CN'))
-    env=dict(os.environ,PROXYLANE_MITM='0',PROXYLANE_MITM_HOME=str(work/'pki'),PROXYLANE_PROTOCOL_CACHE_ROOT=str(work/'cache'))
+    ca=Path(os.environ['LOCALAPPDATA'])/'ProxyLane'
+    ca_snapshot=(ca/'ca.json').read_bytes()
+    with socket.socket() as reserve:
+        reserve.bind(('127.0.0.1',0));crl_port=reserve.getsockname()[1]
+    env=dict(os.environ,PROXYLANE_MITM='0',PROXYLANE_MITM_HOME=str(ca),PROXYLANE_MITM_CRL_PORT=str(crl_port),PROXYLANE_PROTOCOL_CACHE_ROOT=str(work/'cache'))
     process=subprocess.Popen([str(work/'ProxyLane64.exe')],cwd=work,env=env)
     launches=[]
     def windows():
@@ -62,7 +66,7 @@ def main():
         nav=u.GetDlgItem(hwnd,0x1006);pages={}
         @CALLBACK
         def find(h,_):
-            if u.GetDlgItem(h,1085):pages['monitor']=h
+            if u.GetDlgItem(h,1086):pages['monitor']=h
             if u.GetDlgItem(h,1005) and u.GetDlgItem(h,1):pages['proxy']=h
             return True
         u.EnumChildWindows(nav,find,0);page=pages['monitor']
@@ -70,6 +74,11 @@ def main():
         scale=u.GetDpiForWindow(nav)/96;x,y=round(50*scale),round((78+3*44+20)*scale)
         send(nav,0x201,1,(y<<16)|x);send(nav,0x202,0,(y<<16)|x)
         monitor=u.GetDlgItem(page,1011)
+        k.WritePrivateProfileStringW.argtypes=[w.LPCWSTR,w.LPCWSTR,w.LPCWSTR,w.LPCWSTR]
+        def decrypt(value):
+            assert k.WritePrivateProfileStringW('options','DecryptHTTPS',str(int(value)),str(work/'ProxyLane.ini'))
+        def settled(on):
+            wait(lambda:u.IsWindowEnabled(monitor) and send(monitor,0xF0)==int(on),'monitor did not settle')
         def toggle(on):
             send(monitor,0xF1,int(on));assert u.PostMessageW(page,0x111,1011,monitor)
         def prompt():
@@ -81,10 +90,21 @@ def main():
                 u.EnumChildWindows(h,label,0)
                 if all(u.GetDlgItem(h,button) for button in (6,7,2)) and any('是否断开这些连接' in text for text in labels):return h
             return None
+        decrypt(True);toggle(True);time.sleep(.2);settled(True)
+        assert not prompt() and len(windows())==1,'No connections must not prompt'
+        toggle(False);time.sleep(.2);settled(False)
+        decrypt(False)
         launch('old');time.sleep(.5)
+        toggle(True);time.sleep(.2);settled(True)
+        assert not prompt() and len(windows())==1,'Plain monitoring must not prompt for existing TCP connections'
+        assert not (work/'old-closed-0').exists(),'Plain monitoring disconnected existing TCP'
+        toggle(False);time.sleep(.2);settled(False)
+        decrypt(True)
         for choice in (7,2): # New only, then cancel: neither may close the existing connection.
             toggle(True);dialog=wait(prompt,'expected reconnect choice')
             assert send(dialog,0x400)==0x534B0007, 'Default button should be No'
+            title=c.create_unicode_buffer(128);u.GetWindowTextW(dialog,title,128)
+            assert title.value=='开始监视',title.value
             assert u.PostMessageW(dialog,0x111,choice,u.GetDlgItem(dialog,choice))
             wait(lambda:not u.IsWindow(dialog),'choice did not close');time.sleep(.4)
             assert not (work/'old-closed-0').exists()
@@ -99,8 +119,7 @@ def main():
         listing=u.GetDlgItem(page,1098)
         wait(lambda:send(listing,0x1004)==1,'idle reconnected socket missing or duplicated')
         screenshot(hwnd,work/'idle-session.png')
-        assert not (work/'pki/ca.json').exists(),'non-TLS test unexpectedly created CA'
-        print('PASS reconnect: new only, cancel, snapshot, new idle session',work,flush=True)
+        print('PASS reconnect: plain monitoring skips prompt; decryption prompts only with existing TCP; title, default No, cancel, snapshot',work,flush=True)
     finally:
         # Only the isolated GUI and its launched jobs belong to this test.
         for h in windows():u.PostMessageW(h,0x10,0,0)
@@ -110,6 +129,7 @@ def main():
             try:p.wait(timeout=5)
             except subprocess.TimeoutExpired:p.kill();p.wait()
         origin.shutdown();relay.shutdown()
+        assert (ca/'ca.json').read_bytes()==ca_snapshot,'CA identity changed'
 
 if __name__=='__main__':
     if len(sys.argv)>1 and sys.argv[1]=='--client':client(*sys.argv[2:])

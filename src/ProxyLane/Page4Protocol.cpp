@@ -60,7 +60,7 @@ struct ProtocolPageData {
     std::string rawContext, hexContext, locateContext;
     bool pendingDisplay = false;
 };
-LRESULT CPage4::OnMonitorSettings(WPARAM,LPARAM) {ApplyMonitorSettings();return 0;}
+LRESULT CPage4::OnMonitorSettings(WPARAM,LPARAM) {ApplyMonitorSettings();SetMonitorControls(m_job || m_stopJob);return 0;}
 void CPage4::ApplyMonitorSettings() {
     if(!m_protocol) return;
     auto settings=MitmSettings::Load();auto& state=*m_protocol;
@@ -75,7 +75,7 @@ void CPage4::InitProtocolView() {
     const DWORD child = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
     CRect empty;
     m_requests.Create(child | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, empty, this, IDC_PROTOCOL_REQUESTS);
-    m_requests.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+    m_requests.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_INFOTIP);
     m_requests.SetBkColor(UiTheme::PageBackground()); m_requests.SetTextBkColor(UiTheme::PageBackground());
     const LPCTSTR columns[] = {L"#", L"protocol.process", L"PID", L"protocol.version", L"protocol.method", L"protocol.address", L"protocol.status", L"protocol.size"};
     for (int i = 0; i < _countof(columns); ++i)
@@ -95,7 +95,12 @@ void CPage4::InitProtocolView() {
     m_detailTabs.InsertItem(1, Localization::Get(L"protocol.response"));
     m_viewTabs.Create(child | TCS_FOCUSNEVER, empty, this, IDC_PROTOCOL_VIEW_TABS);
     m_viewTabs.InsertItem(0, L"Raw"); m_viewTabs.InsertItem(1, L"HexView");
-    m_detailStatus.Create(L"", WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, empty, this, IDC_PROTOCOL_STATUS);
+    m_detailStatus.Create(L"", WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_LEFTNOWORDWRAP | SS_ENDELLIPSIS, empty, this, IDC_PROTOCOL_STATUS);
+    if(m_detailTooltip.Create(this,TTS_ALWAYSTIP | TTS_NOPREFIX)) {
+        m_detailTooltip.AddTool(&m_detailStatus,L" ");
+        m_detailTooltip.SetMaxTipWidth(UiTheme::ScaleForWindow(m_hWnd,640));
+        m_detailTooltip.Activate(FALSE);
+    }
     AfxInitRichEdit2();
     m_detail.Create(child | WS_BORDER | ES_MULTILINE | ES_READONLY | ES_AUTOHSCROLL | WS_VSCROLL | WS_HSCROLL,
         empty, this, IDC_PROTOCOL_DETAIL);
@@ -139,6 +144,7 @@ void CPage4::LayoutProtocolView(int x, int y, int width, int height) {
     m_detailTabs.MoveWindow(x,y,tabsWidth,s(26));
     m_viewTabs.MoveWindow(x+width-viewWidth,y,viewWidth,s(26)); y += s(29);
     m_detailStatus.MoveWindow(x,y,width,s(18)); y += s(21);
+    UpdateDetailTooltip();
     CRect body(x,y,x+width,max(y,m_protocolRect.bottom));
     m_detail.MoveWindow(body); m_hexView.MoveWindow(body);
 }
@@ -293,6 +299,12 @@ void CPage4::ShowProtocolDetail() {
             CString prefix = selected->dns ? Text("DNS server: " + selected->endpoint + " | " + selected->protocol) : Text(state.detail.note);
             if (!prefix.IsEmpty()) { if (!status.IsEmpty()) prefix += L" | " + status; status = prefix; }
         }
+        if(state.detail.targetCertificateRejected) {
+            // Keep the actionable hint first so the option path survives a narrow preview.
+            CString hint=Localization::Format(L"protocol.target_certificate_help",
+                (LPCWSTR)Localization::Get(L"mitm.ca"),(LPCWSTR)Localization::Get(L"mitm.skip_verify"));
+            status=hint+(status.IsEmpty() ? CString() : L" | "+status);
+        }
     }
     raw = CProtocolRawView::Normalize(raw);
     const std::string context = state.selected + ":" + std::to_string(m_detailTabs.GetCurSel());
@@ -322,7 +334,33 @@ void CPage4::ShowProtocolDetail() {
     state.hexContext=context;
     if (state.history.discarded || state.lost) status += Localization::Format(L"protocol.dropped", state.history.discarded + state.lost);
     if (!state.error.IsEmpty()) status += L" | " + state.error;
-    m_detailStatus.SetWindowText(status);
+    if(m_detailStatusText!=status) {
+        m_detailStatusText=status;
+        m_detailStatus.SetWindowText(status);
+        if(m_detailTooltip.GetSafeHwnd()) {
+            m_detailTooltip.Pop();
+            m_detailTooltip.UpdateTipText(m_detailStatusText,&m_detailStatus);
+        }
+    }
+    UpdateDetailTooltip();
+}
+void CPage4::UpdateDetailTooltip() {
+    if(!m_detailTooltip.GetSafeHwnd() || !m_detailStatus.GetSafeHwnd()) return;
+    CRect rect;m_detailStatus.GetClientRect(rect);
+    CClientDC dc(&m_detailStatus);
+    auto font=m_detailStatus.GetFont();auto old=font ? dc.SelectObject(font) : nullptr;
+    const bool overflow=!m_detailStatusText.IsEmpty() && rect.Width()>0 &&
+        (dc.GetTextExtent(m_detailStatusText).cx>rect.Width() || m_detailStatusText.Find(L'\n')>=0);
+    if(old) dc.SelectObject(old);
+    if(!overflow) m_detailTooltip.Pop();
+    m_detailTooltip.Activate(overflow);
+}
+BOOL CPage4::PreTranslateMessage(MSG* message) {
+    if(message && m_detailTooltip.GetSafeHwnd()) {
+        if(message->message==WM_MOUSEMOVE) UpdateDetailTooltip();
+        m_detailTooltip.RelayEvent(message);
+    }
+    return CModernDialog::PreTranslateMessage(message);
 }
 void CPage4::RebuildRequests() {
     auto& state = *m_protocol;
@@ -440,4 +478,19 @@ void CPage4::TickProtocolView() {
             job->done.store(true);
         }).detach();
     } catch (...) { job->error = "Unable to start protocol worker"; job->done.store(true); }
+}
+
+void CPage4::OnRequestInfoTip(NMHDR* header, LRESULT* result) {
+    *result = 0;
+    auto info = reinterpret_cast<NMLVGETINFOTIP*>(header);
+    if (!m_protocol || info->iItem < 0 || (size_t)info->iItem >= m_protocol->shownKeys.size() || !info->pszText || info->cchTextMax <= 0) return;
+    CPoint point; GetCursorPos(&point); m_requests.ScreenToClient(&point);
+    LVHITTESTINFO hit = {}; hit.pt = point;
+    if (m_requests.SubItemHitTest(&hit) != info->iItem || hit.iSubItem != 0) return;
+    const auto& key = m_protocol->shownKeys[info->iItem];
+    for (const auto& row : m_protocol->history.rows) if (row.key == key && row.firstSeenSeconds > 0) {
+        CString time = CTime((__time64_t)row.firstSeenSeconds).Format(L"%Y-%m-%d %H:%M:%S");
+        _tcsncpy_s(info->pszText, info->cchTextMax, time, _TRUNCATE);
+        return;
+    }
 }

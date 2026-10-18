@@ -40,6 +40,8 @@ def open_stream(number):
     return h
 
 try:
+    assert not open_stream(0), 'monitoring must default to off'
+    assert query({'type':'stats'})['type']=='inactive', 'disabled capture must not create a cache'
     original=query({'type':'mitm_options'})['settings']
     changed=dict(entry_mib=1,total_mib=16,history_rows=1024,preview_kib=128,
                  decode_mib=8,connections=2,pending_requests=16,udp_packets=512,handshake_seconds=30)
@@ -84,7 +86,27 @@ try:
     data=c.create_string_buffer(b'SSH-2.0-test\r\n')
     dll.plm_stream_io(first,0,0,data,len(data.value))
     assert not query({'type':'analysis_start'})['reset'], 'unchanged settings preserve the cache'
-    print('PASS release DLL: nine options, validation, deferred apply, run reset and live old taps',work)
+    query({'type':'analysis_stop'})
+    stopped=query({'type':'stats'})
+    assert stopped['active_connections']==0
+    assert not open_stream(6), 'new connections while stopped must not be captured'
+    for h in handles:
+        dll.plm_stream_io(h,0,0,data,len(data.value))
+        dll.plm_stream_io(h,4,0,None,0)
+    assert query({'type':'stats'})==stopped
+    query({'type':'analysis_start'})
+    for h in handles:dll.plm_stream_io(h,0,0,data,len(data.value))
+    assert query({'type':'stats'})==stopped, 'old captures must not resume after a gap'
+    assert open_stream(7), 'fresh connections resume capture'
+    query({'type':'analysis_stop'})
+    assert query({'type':'stats'})['run_id']==stopped['run_id'], 'stop must retain history and payloads'
+    query({'type':'shutdown'})
+    assert not open_stream(8), 'proxy restart must retain the stopped monitoring mode'
+    query({'type':'analysis_start'})
+    assert open_stream(9)
+    query({'type':'shutdown'})
+    assert open_stream(10), 'proxy restart must retain an enabled monitoring mode'
+    print('PASS release DLL: options, default-off, stop/drain, retained cache, restart and stale taps',work)
 finally:
     for h in handles:dll.plm_stream_io(h,2,0,None,0)
     query({'type':'shutdown'})

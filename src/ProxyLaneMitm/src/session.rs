@@ -108,6 +108,7 @@ pub struct Session {
     handshake_seconds: u64,
     lifecycle: Option<(Arc<crate::protocol::Runtime>, proxylane_protocol::Connection)>,
     last_status: String,
+    capture_epoch: u64,
     // 0 sniffing, 1 passthrough, 2 collecting hello, 3 upstream TLS, 4 downstream TLS/active.
     pub state: u8,
     sniff: Vec<u8>,
@@ -171,6 +172,7 @@ impl Session {
             handshake_seconds: crate::options::current().handshake_seconds,
             lifecycle: None,
             last_status: String::new(),
+            capture_epoch: 0,
             state: 0,
             sniff: vec![],
             hello_bytes: 0,
@@ -193,11 +195,17 @@ impl Session {
     pub fn enable_protocol(
         &mut self,
         runtime: Arc<crate::protocol::Runtime>,
-        mut identity: proxylane_protocol::Connection,
+        identity: proxylane_protocol::Connection,
     ) {
+        let epoch = runtime.capture_epoch();
+        self.enable_protocol_at(runtime, identity, epoch);
+    }
+    pub fn enable_protocol_at(&mut self, runtime: Arc<crate::protocol::Runtime>,
+        mut identity: proxylane_protocol::Connection, epoch: u64) {
         // This connection may turn out to be SSH or another passthrough stream.
         // Record certificate bypass only after entering the upstream TLS path.
         identity.upstream_verification_skipped = false;
+        self.capture_epoch = epoch;
         self.lifecycle = Some((runtime.clone(), identity.clone()));
         self.protocol_source = Some((runtime, identity));
         self.status("Connecting", "");
@@ -218,13 +226,13 @@ impl Session {
             identity.upstream_verification_skipped = self.skip_upstream_verify && self.state >= 3;
             let alpn = self.connections[1].as_ref().and_then(|c| c.alpn_protocol());
             let protocol = if self.state < 2 { "tcp" } else { match alpn { Some(b"h2") => "h2", Some(b"http/1.1") => "http1", _ => "tls_stream" } };
-            runtime.lifecycle(identity, state, protocol, problem, identity.upstream_verification_skipped);
+            runtime.lifecycle(self.capture_epoch, identity, state, protocol, problem, identity.upstream_verification_skipped);
         }
     }
     fn passthrough_data(&mut self, side: usize, bytes: &[u8]) {
         self.status("Established", "");
         if let Some((runtime, identity)) = self.protocol_source.take() {
-            self.protocol = runtime.tap_transport(identity, None, false);
+            self.protocol = runtime.tap_at(self.capture_epoch, identity, None, false);
         }
         if let Some(tap) = &mut self.protocol { tap.data(side, bytes); }
     }
@@ -420,7 +428,7 @@ impl Session {
         if let Some((runtime, mut identity)) = self.protocol_source.take() {
             identity.server_name = self.host.clone();
             identity.upstream_verification_skipped = self.skip_upstream_verify;
-            self.protocol = runtime.tap(identity, alpn.clone());
+            self.protocol = runtime.tap_at(self.capture_epoch, identity, alpn.clone(), true);
         }
         self.event(json!({"event":if self.skip_upstream_verify {"upstream_verification_skipped"} else {"upstream_verified"}, "tls":version, "alpn":alpn.map(|p| String::from_utf8_lossy(&p).to_string()), "server_name":self.host}))?;
         let deferred = std::mem::take(&mut self.deferred);

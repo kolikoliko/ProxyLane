@@ -17,28 +17,40 @@ struct MitmJob {
     char text[4096];
     MitmJob() : done(false), result(-1), needsCA(false) { text[0] = 0; }
 };
-static std::shared_ptr<MitmJob> StartMitmJob(IProxyTlsControl* tls, unsigned action, bool enable = false)
+static std::shared_ptr<MitmJob> StartMitmJob(IProxyTlsControl* tls, unsigned action)
 {
     auto job = std::make_shared<MitmJob>();
     try {
-        std::thread([job, tls, action, enable]() {
-            if (enable) {
-                // Missing/untrusted CA is an onboarding state, not an error.
-                // Query structured flags; never classify failures by their text.
-                job->result = tls->ManageCA(IProxyTlsControl::QueryCA, job->text, sizeof(job->text));
-                if (job->result >= 0) {
-                    job->needsCA = (job->result & 2) == 0;
-                    if (!job->needsCA)
-                        job->result = tls->SetEnabled(TRUE, job->text, sizeof(job->text)) ? 3 : -1;
-                }
-            } else {
-                job->result = tls->ManageCA(static_cast<IProxyTlsControl::CaAction>(action), job->text, sizeof(job->text));
-            }
+        std::thread([job, tls, action]() {
+            job->result = tls->ManageCA(static_cast<IProxyTlsControl::CaAction>(action), job->text, sizeof(job->text));
             job->done.store(true);
         }).detach();
-    } catch (...) {
-        strcpy_s(job->text, "Unable to start CA worker."); job->done.store(true);
-    }
+    } catch (...) { strcpy_s(job->text, "Unable to start CA worker."); job->done.store(true); }
+    return job;
+}
+static std::shared_ptr<MitmJob> StartMonitorJob(IProxyTlsControl* tls, bool decrypt)
+{
+    auto job = std::make_shared<MitmJob>();
+    const auto settings=MitmSettings::Load();
+    const bool skip=GetPrivateProfileInt(L"options",L"MitmSkipUpstreamVerify",0,Localization::SettingsPath())==1;
+    try {
+        std::thread([job,tls,decrypt,settings,skip]() {
+            try {
+                if(decrypt) {
+                    job->result=tls->ManageCA(IProxyTlsControl::QueryCA,job->text,sizeof(job->text));
+                    if(job->result>=0) job->needsCA=(job->result&2)==0;
+                    if(job->result<0 || job->needsCA) {job->done.store(true);return;}
+                }
+                auto options=nlohmann::json{{"type","mitm_options"},{"settings",MitmSettings::Json(settings)},{"skip_upstream_verify",skip}}.dump();
+                job->result=tls->QueryProtocol(options.c_str(),job->text,sizeof(job->text));
+                if(job->result>=0) {
+                    const char* request=decrypt ? "{\"type\":\"monitor_start\",\"decrypt\":true}" : "{\"type\":\"monitor_start\",\"decrypt\":false}";
+                    job->result=tls->QueryProtocol(request,job->text,sizeof(job->text));
+                }
+            } catch (...) { job->result=-1;strcpy_s(job->text,"Unable to prepare monitoring."); }
+            job->done.store(true);
+        }).detach();
+    } catch (...) {strcpy_s(job->text,"Unable to start monitor worker.");job->done.store(true);}
     return job;
 }
 static CString Utf8(const BYTE* bytes, size_t length)
@@ -71,11 +83,13 @@ class CMitmSectionHeader : public CStatic {
 class CMitmCaDialog : public CModernDialog {
     std::shared_ptr<MitmJob> m_job;
     CModernButton m_buttons[4], m_advanced, m_save, m_defaults;
-    CStatic m_labels[9],m_effective;
+    CStatic m_labels[9],m_effective,m_enableHint;
     CMitmSectionHeader m_caTitle,m_settingsTitle;
     CFont m_sectionFont;
     CEdit m_values[9];
     bool m_expanded=false, m_defaultsPending=false, m_savedSkip=false;
+    bool m_savedDecrypt=false, m_enablePending=false, m_saveAfterTrust=false, m_monitoring=false;
+    bool m_enableHintRequested=false;
     MitmSettings::Values m_saved;
     enum { AdvancedId=1300,SaveId=1301,DefaultsId=1302,EditBase=1310 };
     void Place(CWnd& control,int x,int y,int w,int h) {
@@ -98,6 +112,9 @@ class CMitmCaDialog : public CModernDialog {
             CString text;button.GetWindowText(text);return dc.GetTextExtent(text).cx+scale(20);
         };
         int y=margin;
+        GetDlgItem(IDC_MITM_ENABLE)->MoveWindow(margin,y,scale(150),line);
+        m_enableHint.MoveWindow(margin+scale(160),y,max(0,width-scale(160)),line);
+        y+=line+gap;
         const int headingHeight=line+scale(8);
         m_caTitle.MoveWindow(margin,y,width,headingHeight);y+=headingHeight+gap;
         CString status;GetDlgItemText(IDC_MITM_STATUS,status);
@@ -147,10 +164,21 @@ class CMitmCaDialog : public CModernDialog {
         const auto values=MitmSettings::Defaults();
         for(int i=0;i<9;++i) SetDlgItemInt(EditBase+i,values[i]);
         CheckDlgButton(IDC_MITM_SKIP_VERIFY,BST_UNCHECKED);
+        CheckDlgButton(IDC_MITM_ENABLE,BST_UNCHECKED);
         m_defaultsPending=true;
         m_effective.SetWindowText(Localization::Get(L"mitm.defaults_pending"));
     }
+    void UpdateEnableHint() {
+        // Opening options is not a mode change. Only a new unchecked->checked
+        // choice during plaintext monitoring needs a restart; active MITM does not.
+        const bool show=m_monitoring && m_enableHintRequested &&
+            IsDlgButtonChecked(IDC_MITM_ENABLE)==BST_CHECKED && !m_tls->IsEnabled();
+        m_enableHint.ShowWindow(show ? SW_SHOW : SW_HIDE);
+    }
     void SaveOptions() {
+        if(m_job) return;
+        const bool decrypt=IsDlgButtonChecked(IDC_MITM_ENABLE)==BST_CHECKED;
+        if(decrypt && !IsTrusted()) {m_enablePending=true;m_saveAfterTrust=true;Start(IProxyTlsControl::TrustCA);return;}
         auto values=m_saved;
         for(int i=0;i<9;++i) {
             CString text;m_values[i].GetWindowText(text);
@@ -167,36 +195,46 @@ class CMitmCaDialog : public CModernDialog {
         char response[4096]={};
         nlohmann::json request={{"type","mitm_options"},{"settings",MitmSettings::Json(values)},{"validate_only",true}};
         const bool skip=IsDlgButtonChecked(IDC_MITM_SKIP_VERIFY)==BST_CHECKED;
-        if(m_defaultsPending) request["skip_upstream_verify"]=skip;
+        request["skip_upstream_verify"]=skip;
         if(m_tls->QueryProtocol(request.dump().c_str(),response,sizeof(response))<0) {MessageBox(Utf8(response),Localization::Get(L"mitm.ca"),MB_ICONERROR);return;}
         if(!MitmSettings::Save(values)) {MessageBox(Localization::Get(L"mitm.save_failed"),Localization::Get(L"mitm.ca"),MB_ICONERROR);return;}
-        if(m_defaultsPending && !WritePrivateProfileString(L"options",L"MitmSkipUpstreamVerify",skip ? L"1":L"0",Localization::SettingsPath())) {
+        if(!WritePrivateProfileString(L"options",L"MitmSkipUpstreamVerify",skip ? L"1":L"0",Localization::SettingsPath())) {
             MitmSettings::Save(m_saved);
+            MessageBox(Localization::Get(L"mitm.save_failed"),Localization::Get(L"mitm.ca"),MB_ICONERROR);return;
+        }
+        if(!MitmSettings::SaveDecryptHTTPS(decrypt)) {
+            MitmSettings::Save(m_saved);
+            WritePrivateProfileString(L"options",L"MitmSkipUpstreamVerify",m_savedSkip ? L"1":L"0",Localization::SettingsPath());
             MessageBox(Localization::Get(L"mitm.save_failed"),Localization::Get(L"mitm.ca"),MB_ICONERROR);return;
         }
         request["validate_only"]=false;
         if(m_tls->QueryProtocol(request.dump().c_str(),response,sizeof(response))<0) {
             bool restored=MitmSettings::Save(m_saved);
-            if(m_defaultsPending) restored=WritePrivateProfileString(L"options",L"MitmSkipUpstreamVerify",m_savedSkip ? L"1":L"0",Localization::SettingsPath()) && restored;
+            restored=MitmSettings::SaveDecryptHTTPS(m_savedDecrypt) && restored;
+            restored=WritePrivateProfileString(L"options",L"MitmSkipUpstreamVerify",m_savedSkip ? L"1":L"0",Localization::SettingsPath()) && restored;
             CString error=Utf8(response);if(!restored) error+=L"\r\n"+Localization::Get(L"mitm.save_failed");
             MessageBox(error,Localization::Get(L"mitm.ca"),MB_ICONERROR);return;
         }
-        if(m_defaultsPending) m_savedSkip=skip;
-        m_defaultsPending=false;
+        m_savedSkip=skip;
+        m_defaultsPending=false;m_savedDecrypt=decrypt;
         m_saved=values;m_effective.SetWindowText(Localization::Get(L"mitm.settings_saved"));
         if(GetParent()) GetParent()->SendMessage(WM_APP+41);
+        EndDialog(IDOK);
     }
     IProxyTlsControl* m_tls;
     int m_flags;
+    unsigned m_action=IProxyTlsControl::QueryCA;
     CString m_details;
 public:
-    CMitmCaDialog(CWnd* parent, IProxyTlsControl* tls) : CModernDialog(IDD_MITM_CA, parent), m_tls(tls), m_flags(-1) {}
+    CMitmCaDialog(CWnd* parent, IProxyTlsControl* tls, bool monitoring=false) : CModernDialog(IDD_MITM_CA, parent), m_tls(tls), m_flags(-1), m_monitoring(monitoring) {}
     bool IsTrusted() const { return m_flags >= 0 && (m_flags & 2) != 0; }
     void Start(unsigned action) {
+        m_action=action;
         for (auto& button : m_buttons) button.EnableWindow(FALSE);
+        GetDlgItem(IDC_MITM_ENABLE)->EnableWindow(FALSE);m_save.EnableWindow(FALSE);m_defaults.EnableWindow(FALSE);
         SetDlgItemText(IDC_MITM_STATUS, Localization::Get(_T("mitm.busy")));
-        LayoutOptions();
         m_job = StartMitmJob(m_tls, action);
+        LayoutOptions();
     }
     BOOL OnInitDialog() override {
         CModernDialog::OnInitDialog();
@@ -211,6 +249,13 @@ public:
         SetDlgItemText(IDC_MITM_SKIP_HINT, Localization::Get(L"mitm.skip_hint"));
         m_saved=MitmSettings::Load();
         const DWORD child=WS_CHILD|WS_VISIBLE;
+        m_savedDecrypt=MitmSettings::DecryptHTTPS();
+        SetDlgItemText(IDC_MITM_ENABLE,Localization::Get(L"mitm.enable"));
+        CheckDlgButton(IDC_MITM_ENABLE,m_savedDecrypt ? BST_CHECKED:BST_UNCHECKED);
+        m_enableHint.Create(Localization::Get(L"mitm.next_monitor"),child|SS_LEFTNOWORDWRAP,CRect(),this);
+        m_enableHint.SetFont(&m_uiFont);
+        m_enableHintRequested=false;
+        m_enableHint.ShowWindow(SW_HIDE);
         UiTheme::CreateUiFont(m_sectionFont,m_hWnd,9,FW_SEMIBOLD);
         m_caTitle.SubclassDlgItem(IDC_CA_HINT,this);
         m_caTitle.ModifyStyle(SS_TYPEMASK,SS_OWNERDRAW);m_caTitle.SetWindowText(L"ProxyLane CA / TLS");
@@ -228,7 +273,8 @@ public:
         m_defaults.Create(Localization::Get(L"mitm.defaults"),child|WS_TABSTOP|BS_PUSHBUTTON,CRect(),this,DefaultsId);
         m_defaults.SetFont(&m_uiFont);
         m_effective.Create(Localization::Get(L"mitm.settings_effective"),child,CRect(),this);
-        m_advanced.SetFont(&m_uiFont);m_save.SetFont(&m_uiFont);m_effective.SetFont(&m_uiFont);LayoutOptions();
+        m_advanced.SetFont(&m_uiFont);m_save.SetFont(&m_uiFont);m_effective.SetFont(&m_uiFont);
+        SendMessage(DM_SETDEFID,SaveId);LayoutOptions();
         char options[4096] = {};
         if (m_tls->QueryProtocol("{\"type\":\"mitm_options\"}", options, sizeof(options)) > 0) {
             auto value = nlohmann::json::parse(options, nullptr, false);
@@ -240,31 +286,24 @@ public:
         UINT id = LOWORD(wParam);
         if(id==AdvancedId) {m_expanded=!m_expanded;LayoutOptions();return TRUE;}
         if(id==SaveId) {SaveOptions();return TRUE;}
-        if(id==DefaultsId) {RestoreDefaults();return TRUE;}
-        if (id == IDC_MITM_SKIP_VERIFY) {
-            if(m_defaultsPending) return TRUE; // Restore remains a draft until Save.
-            char result[4096] = {};
-            const bool skip = IsDlgButtonChecked(id) == BST_CHECKED;
-            const char* request = skip ? "{\"type\":\"mitm_options\",\"skip_upstream_verify\":true}" : "{\"type\":\"mitm_options\",\"skip_upstream_verify\":false}";
-            if (m_tls->QueryProtocol(request, result, sizeof(result)) < 0) {
-                CheckDlgButton(id, skip ? BST_UNCHECKED : BST_CHECKED);
-                MessageBox(Utf8(result), Localization::Get(L"mitm.ca"), MB_ICONERROR);
-            } else if (!WritePrivateProfileString(L"options", L"MitmSkipUpstreamVerify", skip ? L"1" : L"0", Localization::SettingsPath())) {
-                const DWORD error = GetLastError();
-                // Keep the displayed and running setting consistent with the last saved value.
-                m_tls->QueryProtocol(skip ? "{\"type\":\"mitm_options\",\"skip_upstream_verify\":false}" :
-                    "{\"type\":\"mitm_options\",\"skip_upstream_verify\":true}", result, sizeof(result));
-                CheckDlgButton(id, skip ? BST_UNCHECKED : BST_CHECKED);
-                CString message; message.Format(L"Cannot save MITM option to %s (Windows error %lu).", (LPCWSTR)Localization::SettingsPath(), error);
-                MessageBox(message, Localization::Get(L"mitm.ca"), MB_ICONERROR);
-            } else m_savedSkip=skip;
+        if(id==DefaultsId) {if(!m_job) {RestoreDefaults();m_enableHintRequested=false;UpdateEnableHint();}return TRUE;}
+        if(id==IDC_MITM_ENABLE) {
+            if(m_job) return TRUE;
+            m_enableHintRequested=IsDlgButtonChecked(id)==BST_CHECKED;
+            UpdateEnableHint();
+            if(IsDlgButtonChecked(id)==BST_CHECKED) {
+                m_enablePending=true;m_saveAfterTrust=false;
+                Start(IProxyTlsControl::QueryCA);
+            }
             return TRUE;
         }
+        if (id == IDC_MITM_SKIP_VERIFY) return TRUE; // Draft until Save.
         if (id == IDC_CA_REFRESH) {
             if (!m_job) MessageBox(m_details, Localization::Get(L"mitm.ca"), MB_OK);
             return TRUE;
         }
         if (id == IDC_CA_INSTALL || id == IDC_CA_REMOVE) {
+            if(id==IDC_CA_REMOVE && m_monitoring) return TRUE;
             if (!m_job) Start(id == IDC_CA_INSTALL ? IProxyTlsControl::TrustCA :
                 id == IDC_CA_REMOVE ? IProxyTlsControl::RemoveCATrust : IProxyTlsControl::QueryCA);
             return TRUE;
@@ -272,8 +311,15 @@ public:
         return CModernDialog::OnCommand(wParam, lParam);
     }
     // Do not allow a trust operation to finish invisibly after dismissing it.
-    void OnOK() override { if (!m_job) CModernDialog::OnOK(); }
+    void OnOK() override { OnCancel(); } // The resource button is the Cancel action.
     void OnCancel() override { if (!m_job) CModernDialog::OnCancel(); }
+    afx_msg HBRUSH OnCtlColor(CDC* dc, CWnd* wnd, UINT color) {
+        HBRUSH brush=CModernDialog::OnCtlColor(dc,wnd,color);
+        if(color==CTLCOLOR_STATIC && wnd && wnd->GetDlgCtrlID()==IDC_MITM_STATUS &&
+            !m_job && m_flags>=0 && !IsTrusted())
+            dc->SetTextColor(RGB(184,135,0)); // Dark yellow remains readable on white.
+        return brush;
+    }
     afx_msg void OnTimer(UINT_PTR id) {
         if (m_job && m_job->done.load()) {
             // Consume before entering MessageBox's nested message loop: timer
@@ -286,9 +332,18 @@ public:
                 flags & 2 ? _T("mitm.trusted") : flags & 1 ? _T("mitm.untrusted") : _T("mitm.uninitialized")));
             for (auto& button : m_buttons) button.EnableWindow(TRUE);
             GetDlgItem(IDC_CA_INSTALL)->EnableWindow(!IsTrusted());
-            GetDlgItem(IDC_CA_REMOVE)->EnableWindow((flags & 2) && flags >= 0);
+            SetDlgItemText(IDC_CA_REMOVE,Localization::Get(IsTrusted() && m_monitoring ?
+                L"mitm.remove_stop_first" : L"mitm.remove"));
+            GetDlgItem(IDC_CA_REMOVE)->EnableWindow((flags & 2) && flags >= 0 && !m_monitoring);
+            GetDlgItem(IDC_MITM_ENABLE)->EnableWindow(TRUE);m_save.EnableWindow(TRUE);m_defaults.EnableWindow(TRUE);
             LayoutOptions();
+            if(m_enablePending && m_action==IProxyTlsControl::QueryCA && flags>=0 && !IsTrusted()) {Start(IProxyTlsControl::TrustCA);return;}
+            const bool save=m_saveAfterTrust && IsTrusted();
+            if(m_enablePending && !IsTrusted()) CheckDlgButton(IDC_MITM_ENABLE,BST_UNCHECKED);
+            UpdateEnableHint();
+            m_enablePending=m_saveAfterTrust=false;
             if (flags < 0) MessageBox(m_details, Localization::Get(L"mitm.ca"), MB_ICONERROR);
+            else if(save) SaveOptions();
         }
         CModernDialog::OnTimer(id);
     }
@@ -296,6 +351,7 @@ public:
 };
 BEGIN_MESSAGE_MAP(CMitmCaDialog, CModernDialog)
     ON_WM_TIMER()
+    ON_WM_CTLCOLOR()
 END_MESSAGE_MAP()
 
 IMPLEMENT_DYNAMIC(CPage4, CModernDialog)
@@ -306,7 +362,7 @@ void CPage4::DoDataExchange(CDataExchange* dx)
     CModernDialog::DoDataExchange(dx);
     DDX_Control(dx, IDC_CHECK1, m_monitor);
     DDX_Control(dx, IDC_BTN_CLEAR, m_clear);
-    DDX_Control(dx, IDC_MITM_ENABLE, m_decrypt); DDX_Control(dx, IDC_MITM_CA, m_ca);
+    DDX_Control(dx, IDC_MITM_CA, m_ca);
 }
 BOOL CPage4::OnInitDialog()
 {
@@ -326,8 +382,8 @@ BOOL CPage4::OnInitDialog()
     SetDlgItemText(IDC_MITM_CA, Localization::Get(_T("mitm.ca")));
     UiTheme::CreateUiFont(m_font, m_hWnd, 9, FW_NORMAL, _T("Consolas"));
     InitProtocolView(); ApplyMonitorSettings();
-    m_decrypt.EnableWindow(m_mitmSupported); m_ca.EnableWindow(m_mitmSupported); m_monitor.EnableWindow(m_mitmSupported);
-    SetDecryptStatus(); SetTimer(1, 100, NULL);
+    m_tls->SetEnabled(FALSE,nullptr,0); // A saved preference never enables interception before monitoring.
+    SetMonitorControls(false); SetTimer(1, 100, NULL);
     CRect rect; GetClientRect(rect); LayoutControls(rect.Width(), rect.Height()); return TRUE;
 }
 BEGIN_MESSAGE_MAP(CPage4, CModernDialog)
@@ -349,9 +405,9 @@ BEGIN_MESSAGE_MAP(CPage4, CModernDialog)
     ON_WM_SETCURSOR()
     ON_WM_CAPTURECHANGED()
     ON_BN_CLICKED(IDC_BTN_CLEAR, &CPage4::OnClear)
-    ON_BN_CLICKED(IDC_MITM_ENABLE, &CPage4::OnDecrypt)
     ON_BN_CLICKED(IDC_MITM_CA, &CPage4::OnCA)
     ON_NOTIFY(LVN_ITEMCHANGED, IDC_PROTOCOL_REQUESTS, &CPage4::OnRequestSelected)
+    ON_NOTIFY(LVN_GETINFOTIP, IDC_PROTOCOL_REQUESTS, &CPage4::OnRequestInfoTip)
     ON_NOTIFY(TCN_SELCHANGE, IDC_PROTOCOL_DETAIL_TABS, &CPage4::OnDetailTab)
 END_MESSAGE_MAP()
 void CPage4::OnSize(UINT type, int cx, int cy)
@@ -363,7 +419,7 @@ void CPage4::OnSize(UINT type, int cx, int cy)
 void CPage4::OnShowWindow(BOOL show, UINT status)
 {
     CModernDialog::OnShowWindow(show, status);
-    if (show) InitProtocolColumns();
+    if (show) { InitProtocolColumns(); SetMonitorControls(m_job || m_stopJob); }
 }
 void CPage4::LayoutControls(int cx, int cy)
 {
@@ -380,63 +436,54 @@ void CPage4::LayoutControls(int cx, int cy)
         dc.SelectObject(old);
         return result;
     };
-    int decryptWidth = labelWidth(m_decrypt, 20), monitorWidth = labelWidth(m_monitor, 20);
+    int monitorWidth = labelWidth(m_monitor, 20);
     int caWidth = labelWidth(m_ca, 16);
     int clearWidth = max(s(48), labelWidth(m_clear, 16));
-    if (decryptWidth + monitorWidth + caWidth + clearWidth + s(8) > width) {
-        decryptWidth = labelWidth(m_decrypt, 16);
+    if (monitorWidth + caWidth + clearWidth + s(8) > width) {
         monitorWidth = labelWidth(m_monitor, 16);
         caWidth = labelWidth(m_ca, 8);
         clearWidth = max(s(40), labelWidth(m_clear, 8));
     }
-    int gap = max(1, min(s(12), (width - decryptWidth - monitorWidth - caWidth - clearWidth) / 3));
-    m_decrypt.MoveWindow(s(8), top, decryptWidth, h);
-    m_monitor.MoveWindow(s(8) + decryptWidth + gap, top, monitorWidth, h);
+    int gap = max(1, min(s(12), (width - monitorWidth - caWidth - clearWidth) / 2));
+    m_monitor.MoveWindow(s(8), top, monitorWidth, h);
     m_clear.MoveWindow(cx - s(8) - clearWidth, top, clearWidth, h);
     m_ca.MoveWindow(cx - s(8) - clearWidth - gap - caWidth, top, caWidth, h);
     GetDlgItem(IDC_STATIC_TASKCOUNT)->MoveWindow(max(s(160), cx - s(220)), s(10), min(s(212), max(0, cx - s(168))), s(20));
     top += s(36);
     LayoutProtocolView(s(8), top, width, max(0, cy - top - s(8)));
 }
-void CPage4::SetDecryptStatus()
+void CPage4::SetMonitorControls(bool busy)
 {
-    m_decrypt.SetCheck(m_mitmSupported && m_tls->IsEnabled() ? BST_CHECKED : BST_UNCHECKED);
-    m_decrypt.SetWindowText(Localization::Get(_T("mitm.enable")));
+    m_ca.EnableWindow(m_mitmSupported && !busy);m_monitor.EnableWindow(m_mitmSupported && !busy);
+    // While running, describe this run; edited preferences apply to the next start.
+    const bool decrypt=m_recording ? m_tls->IsEnabled()!=FALSE : MitmSettings::DecryptHTTPS();
+    m_monitor.SetWindowText(Localization::Get(busy && m_job ? L"monitor.preparing" :
+        decrypt ? L"page4.monitor_decrypt" : L"page4.monitor"));
+    CRect client;GetClientRect(client);LayoutControls(client.Width(),client.Height());
 }
-void CPage4::OnCA()
+void CPage4::OnCA() { OpenCA(false); }
+void CPage4::OpenCA(bool resumeStart)
 {
-    OpenCA(false);
-}
-void CPage4::OpenCA(bool enableAfterClose)
-{
-    if (!m_mitmSupported) return;
-    CMitmCaDialog dialog(this, m_tls);
-    dialog.DoModal();
+    if (!m_mitmSupported || m_stopJob) return;
+    CMitmCaDialog dialog(this, m_tls, m_recording);
+    const INT_PTR result=dialog.DoModal();
     ApplyMonitorSettings();
-    SetDecryptStatus();
-    // Closing without installing cancels this attempt. A successful install
-    // resumes the original checkbox action, including when closed with X/Esc.
-    if (enableAfterClose && dialog.IsTrusted()) StartDecryption();
-    else if (enableAfterClose) CompleteReconnect(false);
-}
-void CPage4::OnDecrypt()
-{
-    if (!m_mitmSupported) { SetDecryptStatus(); return; }
-    if (m_decrypt.GetCheck() != BST_CHECKED) {
-        m_tls->SetEnabled(FALSE, NULL, 0); SetDecryptStatus(); return;
-    }
-    if (!PrepareReconnect(true)) { SetDecryptStatus(); return; }
-    StartDecryption();
+    SetMonitorControls(false);
+    // This attempt requested decryption: changing the preference to off must
+    // cancel it, never silently turn it into a plaintext-only monitoring start.
+    if (resumeStart && result==IDOK && dialog.IsTrusted() && MitmSettings::DecryptHTTPS()) StartMonitoring();
+    else if (resumeStart) {m_monitor.SetCheck(BST_UNCHECKED);CompleteReconnect(false);}
 }
 bool CPage4::PrepareReconnect(bool decrypt)
 {
     CompleteReconnect(false);
+    if (!decrypt) return true;
     auto manager = g_GlobalProxy ? g_GlobalProxy->GetPRCInstance()->GetPTMInstance(0) : nullptr;
     if (!manager) return true;
     DWORD count = manager->PrepareReconnect(decrypt ? TRUE : FALSE);
     m_reconnectPrepared = true;
     if (!count) return true;
-    CString title = Localization::Get(L"mitm.ca");
+    CString title = Localization::Get(L"page4.monitor");
     CString message = Localization::Format(L"mitm.reconnect", count);
     const int result = MessageBox(message, title, MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2);
     m_reconnectAccepted = result == IDYES;
@@ -451,51 +498,62 @@ void CPage4::CompleteReconnect(bool commit)
     }
     m_reconnectPrepared = m_reconnectAccepted = false;
 }
-void CPage4::StartDecryption()
+void CPage4::StartMonitoring()
 {
-    if (!m_mitmSupported) return;
-    m_decrypt.EnableWindow(FALSE); m_ca.EnableWindow(FALSE); m_monitor.EnableWindow(FALSE);
-    m_decrypt.SetWindowText(Localization::Get(_T("monitor.preparing")));
-    m_job = StartMitmJob(m_tls, IProxyTlsControl::PrepareCA, true);
+    if (!m_mitmSupported || m_job || m_stopJob) return;
+    m_job = StartMonitorJob(m_tls,MitmSettings::DecryptHTTPS());
+    SetMonitorControls(true);
 }
 void CPage4::UpdateMonitorStatus()
 {
     if (!m_monitor.GetSafeHwnd()) return;
-    if (!m_mitmSupported) { m_monitor.SetCheck(BST_UNCHECKED); return; }
-    bool recording = m_monitor.GetCheck() == BST_CHECKED;
-    char reply[512] = {};
-    if (m_tls->QueryProtocol(recording ? "{\"type\":\"monitor_start\"}" : "{\"type\":\"monitor_stop\"}", reply, sizeof(reply)) < 0) {
-        m_monitor.SetCheck(m_recording ? BST_CHECKED : BST_UNCHECKED);
-        CompleteReconnect(false);
-        MessageBox(Utf8(reply), Localization::Get(L"mitm.ca"), MB_ICONERROR);
-        return;
+    if (!m_mitmSupported) {m_monitor.SetCheck(BST_UNCHECKED);return;}
+    if (m_stopJob || m_job) return;
+    if(m_monitor.GetCheck()==BST_CHECKED) { if(!m_recording) StartMonitoring();return; }
+    auto job = std::make_shared<MitmJob>();
+    try {
+        auto tls = m_tls;
+        std::thread([job, tls]() {
+            job->result=tls->QueryProtocol("{\"type\":\"monitor_stop\"}",job->text,sizeof(job->text));
+            job->done.store(true);
+        }).detach();
+    } catch (...) {
+        m_monitor.SetCheck(m_recording ? BST_CHECKED:BST_UNCHECKED);
+        MessageBox(L"Unable to start monitor stop worker.",Localization::Get(L"mitm.ca"),MB_ICONERROR);return;
     }
-    const bool changed = m_recording != recording;
-    m_recording = recording;
-    if (changed && GetParent()) GetParent()->Invalidate(FALSE);
+    m_stopJob=job;m_recording=false;SetMonitorControls(true);
+    if(GetParent()) GetParent()->Invalidate(FALSE);
 }
-void CPage4::OnMonitor() {
-    if (!m_mitmSupported) { m_monitor.SetCheck(BST_UNCHECKED); return; }
-    if (!m_recording && m_monitor.GetCheck() == BST_CHECKED && !PrepareReconnect(m_tls->IsEnabled() != FALSE)) {
-        m_monitor.SetCheck(BST_UNCHECKED); return;
+void CPage4::OnMonitor()
+{
+    if (!m_mitmSupported) {m_monitor.SetCheck(BST_UNCHECKED);return;}
+    if(m_job || m_stopJob) return;
+    if(!m_recording && m_monitor.GetCheck()==BST_CHECKED && !PrepareReconnect(MitmSettings::DecryptHTTPS())) {
+        m_monitor.SetCheck(BST_UNCHECKED);return;
     }
-    UpdateMonitorStatus(); CompleteReconnect(m_recording);
+    UpdateMonitorStatus();
 }
 
 void CPage4::OnClear() { ClearProtocolView(); }
 void CPage4::OnTimer(UINT_PTR id)
 {
     TickProtocolView();
+    if (m_stopJob && m_stopJob->done.load()) {
+        auto job = m_stopJob; m_stopJob.reset();
+        SetMonitorControls(false);
+        if (job->result < 0) MessageBox(Utf8(job->text), Localization::Get(L"mitm.ca"), MB_ICONERROR);
+    }
     if (m_job && m_job->done.load()) {
-        int result = m_job->result; bool needsCA = m_job->needsCA;
-        CString error = Utf8(m_job->text); m_job.reset();
-        m_decrypt.EnableWindow(TRUE); m_ca.EnableWindow(TRUE); m_monitor.EnableWindow(TRUE); SetDecryptStatus();
-        if (needsCA) OpenCA(true);
-        else if (result < 0) {
-            CompleteReconnect(false);
-            MessageBox(Localization::Get(_T("mitm.enable_failed")) + _T("\r\n\r\n") + error,
-                Localization::Get(_T("mitm.ca")), MB_ICONERROR);
-        } else { m_monitor.SetCheck(BST_CHECKED); UpdateMonitorStatus(); CompleteReconnect(m_recording); }
+        auto job=std::move(m_job);SetMonitorControls(false);
+        if(job->needsCA) {m_monitor.SetCheck(BST_UNCHECKED);OpenCA(true);}
+        else if(job->result<0) {
+            m_monitor.SetCheck(BST_UNCHECKED);m_recording=false;CompleteReconnect(false);
+            MessageBox(Localization::Get(L"monitor.start_failed")+L"\r\n\r\n"+Utf8(job->text),Localization::Get(L"mitm.ca"),MB_ICONERROR);
+        } else {
+            m_recording=true;m_monitor.SetCheck(BST_CHECKED);CompleteReconnect(true);
+            SetMonitorControls(false);
+            if(GetParent()) GetParent()->Invalidate(FALSE);
+        }
     }
     DWORD tcp = 0, udp = 0;
     if (g_GlobalProxy) {

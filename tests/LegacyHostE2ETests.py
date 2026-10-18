@@ -71,15 +71,15 @@ Transport=PLAIN
         panels=[]
         @CALLBACK
         def collect(hwnd,_):
-            if u.GetDlgItem(hwnd,1068) or u.GetDlgItem(hwnd,1085):panels.append(hwnd)
+            if u.GetDlgItem(hwnd,1068) or u.GetDlgItem(hwnd,1086):panels.append(hwnd)
             return True
         u.EnumChildWindows(nav,collect,0)
         profile=next(h for h in panels if u.GetDlgItem(h,1068))
-        monitor=next(h for h in panels if u.GetDlgItem(h,1085))
+        monitor=next(h for h in panels if u.GetDlgItem(h,1086))
         transport=u.GetDlgItem(profile,1068)
         assert send(transport,0x147)==1, 'Existing encrypted mode was silently downgraded'
         assert not u.IsWindowEnabled(transport) and not u.IsWindowEnabled(u.GetDlgItem(profile,1070))
-        for ident in (1085,1086,1011):assert not u.IsWindowEnabled(u.GetDlgItem(monitor,ident))
+        for ident in (1086,1011):assert not u.IsWindowEnabled(u.GetDlgItem(monitor,ident))
         time.sleep(.3)
         assert windows()==[main_window], 'Persisted MITM settings caused an error dialog'
         screenshot(main_window,work/'encrypted-profile-disabled.png')

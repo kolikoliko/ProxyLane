@@ -92,10 +92,15 @@ def ca_guidance(process, page, main_window, work, verify_read_error=False):
             return True
         u.EnumWindows(collect, 0)
         return found[0] if found else None
-    decrypt = u.GetDlgItem(page, 1085)
+    # The saved preference controls the next monitoring start.
+    ini=work/'ProxyLane.ini'
+    text=ini.read_text();text=text.replace('DecryptHTTPS=0','DecryptHTTPS=1')
+    if 'DecryptHTTPS=1' not in text:text=text.replace('[options]','[options]\nDecryptHTTPS=1')
+    ini.write_text(text)
+    decrypt = u.GetDlgItem(page, 1011)
     def toggle(enabled):
         send(decrypt, 0xF1, int(enabled))
-        send(page, 0x111, 1085, decrypt)  # Finish reading the checkbox before toggling it again.
+        send(page, 0x111, 1011, decrypt)  # Finish reading the checkbox before toggling it again.
     def ready(dialog):
         return u.IsWindowEnabled(u.GetDlgItem(dialog, 1))
     def open_guide():
@@ -105,7 +110,7 @@ def ca_guidance(process, page, main_window, work, verify_read_error=False):
             return dialogs(True)
         dialog = wait(detect, 'CA guidance did not open')
         wait(lambda: ready(dialog), 'CA query did not finish')
-        assert not u.GetDlgItem(dialog, 1096), 'Old introductory text remains'
+        assert read(u.GetDlgItem(dialog,1096)) == 'ProxyLane CA / TLS', 'CA section heading'
         assert not u.GetDlgItem(dialog, 1092), 'Removed initialization button remains'
         instruction = read(u.GetDlgItem(dialog, 1087))
         assert 'HTTPS' in instruction and ('当前系统用户' in instruction or 'current Windows user' in instruction), instruction
@@ -128,7 +133,7 @@ def ca_guidance(process, page, main_window, work, verify_read_error=False):
         screenshot(dialog, work/'ca-install-failure.png')
         print('CA details:', read(u.GetDlgItem(dialog, 1087)), 'status:', read(u.GetDlgItem(dialog, 1087)), flush=True)
         raise
-    close(dialog)  # X must resume the original checkbox action too.
+    close(dialog,0x111,1301)  # Only Save and close resumes the requested start.
     wait(lambda: send(decrypt, 0xF0) == 1 and u.IsWindowEnabled(decrypt), 'Decryption did not resume after installation')
     assert send(u.GetDlgItem(page, 1011), 0xF0) == 1, 'Monitoring did not start'
     assert not dialogs(False)
@@ -173,6 +178,14 @@ def main():
         reservation.bind(('127.0.0.1',0)); port = reservation.getsockname()[1]
     env = dict(os.environ,PROXYLANE_MITM='0',PROXYLANE_MITM_HOME=str(work/'pki'),PROXYLANE_MITM_CRL_PORT=str(port))
     process = subprocess.Popen([str(work/'ProxyLane64.exe')], cwd=work, env=env)
+    def wait(predicate, message):
+        deadline=time.monotonic()+15
+        while time.monotonic()<deadline:
+            assert process.poll() is None, ('GUI exited',process.returncode,str(work))
+            value=predicate()
+            if value:return value
+            time.sleep(.1)
+        raise AssertionError((message,str(work)))
     try:
         main_window = None
         for _ in range(100):
@@ -193,7 +206,7 @@ def main():
         pages=[]
         @CALLBACK
         def find_page(hwnd,_):
-            if u.GetDlgItem(hwnd,1085): pages.append(hwnd)
+            if u.GetDlgItem(hwnd,1086): pages.append(hwnd)
             return True
         u.EnumChildWindows(nav,find_page,0); assert len(pages)==1
         page=pages[0]; scale=u.GetDpiForWindow(nav)/96
@@ -246,9 +259,9 @@ def main():
             assert u.IsWindowVisible(page), 'Monitor page not activated'
             client=w.RECT();u.GetClientRect(page,c.byref(client))
             controls={}
-            for ident in (1042,1087,1088,1089,1090,1097,1000,1012):
+            for ident in (1085,1042,1087,1088,1089,1090,1097,1000,1012):
                 assert not u.GetDlgItem(page,ident), ('Removed control still exists',ident)
-            for name, ident in [('decrypt',1085),('ca',1086),('monitor',1011),('hex',1102),('clear',1021),
+            for name, ident in [('ca',1086),('monitor',1011),('hex',1102),('clear',1021),
                                 ('filter',1104),('follow',1109),('kind',1105),('requests',1098),('detail_tabs',1099),('detail',1100)]:
                 h=u.GetDlgItem(page,ident); assert h and u.IsWindowVisible(h), name
                 r=rect(h,page); controls[name]=r
@@ -256,8 +269,8 @@ def main():
                 assert r[2]-r[0]>=40 and r[3]-r[1]>=14, (label,name,'collapsed',r)
             assert controls['detail'][3]-controls['detail'][1]>=100
             assert controls['requests'][3] < controls['detail_tabs'][1] < controls['detail'][1]
-            assert rect(u.GetDlgItem(page,1041),page)[3] <= controls['decrypt'][1], 'Title overlaps controls'
-            toolbar = [controls[name] for name in ('decrypt','monitor','ca','clear')]
+            assert rect(u.GetDlgItem(page,1041),page)[3] <= controls['monitor'][1], 'Title overlaps controls'
+            toolbar = [controls[name] for name in ('monitor','ca','clear')]
             assert len({r[1] for r in toolbar}) == 1, 'Toolbar must occupy one row'
             assert all(left[2] <= right[0] for left,right in zip(toolbar,toolbar[1:])), ('Toolbar overlaps',controls)
             assert controls['hex'][1] == controls['detail_tabs'][1], 'HEX belongs beside request/response tabs'
@@ -277,6 +290,7 @@ def main():
         assert monitor_dot('monitor-stopped.png')==0, 'Unexpected active monitor indicator'
         monitor=u.GetDlgItem(page,1011)
         send(monitor,0xF1,1); send(page,0x111,1011,monitor)
+        wait(lambda:u.IsWindowEnabled(monitor),'monitor start did not finish')
         assert send(monitor,0xF0)==1
         activate(0)
         assert monitor_dot('monitor-active-other-page.png')>5, 'Monitor indicator missing on another page'
@@ -286,6 +300,7 @@ def main():
         activate(0)
         assert monitor_dot('monitor-stopped-other-page.png')==0, 'Monitor indicator remains after stop'
         activate(3)
+        wait(lambda:u.IsWindowEnabled(monitor),'monitor stop did not finish')
         send(page,5,0,0); validate('parameterless WM_SIZE')
         for width,height in [(800,610),(1200,900)]:
             assert u.SetWindowPos(main_window,None,0,0,width,height,0x16)
@@ -309,10 +324,11 @@ def main():
                 if 'HTTPS' in details.value and u.IsWindowEnabled(u.GetDlgItem(dialogs[0],1)): ca_dialog=dialogs[0];break
             time.sleep(.1)
         assert ca_dialog, ('CA status dialog did not initialize', dialogs, details.value if dialogs else '')
-        assert not u.GetDlgItem(ca_dialog,1096), 'Removed CA description still exists'
+        heading=c.create_unicode_buffer(128);send(u.GetDlgItem(ca_dialog,1096),0xD,128,c.addressof(heading))
+        assert heading.value=='ProxyLane CA / TLS', 'CA section heading'
         assert not u.GetDlgItem(ca_dialog,1092), 'Removed CA initialization button still exists'
         bounds=w.RECT();u.GetClientRect(ca_dialog,c.byref(bounds))
-        for ident in (1087,1093,1094,1095,1107,1108,1):
+        for ident in (1085,1087,1093,1094,1095,1107,1108,1):
             control=u.GetDlgItem(ca_dialog,ident); r=rect(control,ca_dialog)
             assert u.IsWindowVisible(control) and 0<=r[0]<r[2]<=bounds.right and 0<=r[1]<r[3]<=bounds.bottom, (ident,r)
         assert not u.GetDlgItem(ca_dialog,1091), 'Large diagnostic edit must be removed'
@@ -328,14 +344,26 @@ def main():
         for i,value in enumerate(new_options):
             control=u.GetDlgItem(ca_dialog,1310+i)
             text=c.create_unicode_buffer(str(value));send(control,0xC,0,c.addressof(text))
-        send(ca_dialog,0x111,1301,u.GetDlgItem(ca_dialog,1301))
-        assert 'EntryMiB=48' in (work/'ProxyLane.ini').read_text(), 'INI was not saved'
         bounds=w.RECT();u.GetClientRect(ca_dialog,c.byref(bounds))
         for ident in [*range(1310,1319),1300,1301,1302,1]:
             r=rect(u.GetDlgItem(ca_dialog,ident),ca_dialog)
             assert 0<=r[0]<r[2]<=bounds.right and 0<=r[1]<r[3]<=bounds.bottom,(ident,r,bounds.bottom)
         time.sleep(.3)
         screenshot(ca_dialog,work/'mitm-options-advanced.png')
+        send(ca_dialog,0x111,1301,u.GetDlgItem(ca_dialog,1301))
+        wait(lambda:not u.IsWindow(ca_dialog),'Save must close the options')
+        assert 'EntryMiB=48' in (work/'ProxyLane.ini').read_text(), 'INI was not saved'
+        assert u.PostMessageW(page,0x111,1086,u.GetDlgItem(page,1086))
+        def options_ready(d):
+            status=c.create_unicode_buffer(2048)
+            send(u.GetDlgItem(d,1087),0xD,len(status),c.addressof(status))
+            return 'HTTPS' in status.value and u.IsWindowEnabled(u.GetDlgItem(d,1301))
+        def ready_options():
+            nonlocal dialogs
+            dialogs=[];u.EnumWindows(find_ca,0)
+            return next((d for d in dialogs if options_ready(d)),None)
+        ca_dialog=wait(ready_options,'reopen saved options')
+        skip=u.GetDlgItem(ca_dialog,1107)
         saved_ini=(work/'ProxyLane.ini').read_bytes()
         defaults=[32,512,512,64,4,32,8,256,15]
         send(ca_dialog,0x111,1302,u.GetDlgItem(ca_dialog,1302))
@@ -355,7 +383,7 @@ def main():
         reopened=None
         for _ in range(50):
             dialogs=[];u.EnumWindows(find_ca,0)
-            if dialogs and u.IsWindowEnabled(u.GetDlgItem(dialogs[0],1)):
+            if dialogs and options_ready(dialogs[0]):
                 reopened=dialogs[0];break
             time.sleep(.1)
         assert reopened, 'MITM options did not reopen'
@@ -367,17 +395,17 @@ def main():
         skip=u.GetDlgItem(reopened,1107)
         assert send(skip,0xF0)==1, 'Native/Rust option was not retained in this instance'
         send(reopened,0x111,1302,u.GetDlgItem(reopened,1302))
+        assert send(skip,0xF0)==0, 'Restore defaults must uncheck verification bypass'
         assert (work/'ProxyLane.ini').read_bytes()==saved_ini
         send(reopened,0x111,1301,u.GetDlgItem(reopened,1301))
+        wait(lambda:not u.IsWindow(reopened),'Save defaults must close the dialog')
         new_options=defaults
         ini=(work/'ProxyLane.ini').read_text()
         assert 'EntryMiB=32' in ini and 'MitmSkipUpstreamVerify=0' in ini
-        close_button=u.GetDlgItem(reopened,1);send(reopened,0x28,close_button,1)
-        assert u.PostMessageW(close_button,0x100,0x0D,1)  # Enter still activates a real dialog's Close button.
         for _ in range(50):
             if not u.IsWindow(reopened): break
             time.sleep(.1)
-        assert not u.IsWindow(reopened), 'Enter no longer closes the MITM options dialog'
+        assert not u.IsWindow(reopened), 'Save no longer closes the options dialog'
         ca_dialog=reopened
         records.append({'case':'Compact MITM options, CA status, strict default and retained verification option'})
         if not args.ca_guidance:
@@ -396,7 +424,7 @@ def main():
             restored=None
             for _ in range(50):
                 dialogs=[];u.EnumWindows(find_ca,0)
-                if dialogs and u.IsWindowEnabled(u.GetDlgItem(dialogs[0],1)):restored=dialogs[0];break
+                if dialogs and options_ready(dialogs[0]):restored=dialogs[0];break
                 time.sleep(.1)
             assert restored,'options failed to open after restart'
             for i,value in enumerate(new_options):

@@ -113,7 +113,7 @@ def main():
         pages = {}; scale = u.GetDpiForWindow(nav)/96
         @CALLBACK
         def find(hwnd, _):
-            if u.GetDlgItem(hwnd, 1085): pages['monitor'] = hwnd
+            if u.GetDlgItem(hwnd, 1086): pages['monitor'] = hwnd
             if u.GetDlgItem(hwnd, 1005) and u.GetDlgItem(hwnd, 1): pages['proxy'] = hwnd
             return True
         u.EnumChildWindows(nav, find, 0)

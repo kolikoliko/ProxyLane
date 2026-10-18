@@ -38,6 +38,7 @@ enum Event {
     Eof(u64, usize, bool, Arc<Ticket>),
     State(u64, usize, Arc<Ticket>),
     Barrier(mpsc::Sender<()>),
+    StopCapture(mpsc::Sender<()>),
     Shutdown,
 }
 #[derive(Default)]
@@ -74,6 +75,8 @@ pub struct Runtime {
     sender: SyncSender<Event>,
     worker: Mutex<Option<JoinHandle<()>>>,
     stopping: AtomicBool,
+    // Odd epochs accept capture. Even epochs are paused; old taps never resume.
+    capture_epoch: Mutex<u64>,
     next: AtomicU64,
     active: Arc<AtomicUsize>,
     rejected: AtomicU64,
@@ -83,9 +86,30 @@ pub struct Runtime {
     pub run_id: String,
 }
 impl Runtime {
-    pub fn lifecycle(&self, identity: &Connection, state: &str, protocol: &str, problem: &str, skipped: bool) {
+    pub fn lifecycle(&self, epoch: u64, identity: &Connection, state: &str, protocol: &str, problem: &str, skipped: bool) {
+        let gate = lock(&self.capture_epoch);
+        if *gate != epoch || epoch % 2 == 0 || self.stopping.load(Ordering::Acquire) { return; }
         lock(&self.results).add(json!({"type":"connection", "connection":identity, "protocol":protocol,
             "status":state,"detail":problem,"upstream_verification_skipped":skipped}));
+    }
+    pub fn capture_epoch(&self) -> u64 { *lock(&self.capture_epoch) }
+    pub fn start_capture(&self) {
+        let mut epoch = lock(&self.capture_epoch);
+        if *epoch % 2 == 0 { *epoch += 1; }
+    }
+    pub fn stop_capture(&self) -> Result<(), String> {
+        // Only close the gate under the producer lock. Never hold it while
+        // waiting for analysis or disk I/O: forwarding must keep running.
+        {
+            let mut epoch = lock(&self.capture_epoch);
+            if *epoch % 2 != 0 { *epoch += 1; }
+        }
+        let (tx, rx) = mpsc::channel();
+        self.sender.send(Event::StopCapture(tx)).map_err(|_| "analysis worker unavailable")?;
+        rx.recv().map_err(|_| "analysis worker unavailable")?;
+        // stats is a FIFO disk-worker barrier, retaining all existing payloads.
+        if let Some(cache) = &self.cache { cache.stats()?; }
+        Ok(())
     }
     pub fn configured() -> Result<Arc<Self>, String> {
         let mut config = CacheConfig::default();
@@ -144,6 +168,7 @@ impl Runtime {
             sender,
             worker: Mutex::new(Some(worker)),
             stopping: AtomicBool::new(false),
+            capture_epoch: Mutex::new(1),
             next: AtomicU64::new(1),
             active,
             rejected: AtomicU64::new(0),
@@ -156,8 +181,12 @@ impl Runtime {
     pub fn tap(self: &Arc<Self>, connection: Connection, alpn: Option<Vec<u8>>) -> Option<Tap> {
         self.tap_transport(connection, alpn, true)
     }
-    pub fn tap_transport(self: &Arc<Self>, mut connection: Connection, alpn: Option<Vec<u8>>, decrypted: bool) -> Option<Tap> {
-        if self.stopping.load(Ordering::Acquire) {
+    pub fn tap_transport(self: &Arc<Self>, connection: Connection, alpn: Option<Vec<u8>>, decrypted: bool) -> Option<Tap> {
+        self.tap_at(self.capture_epoch(), connection, alpn, decrypted)
+    }
+    pub fn tap_at(self: &Arc<Self>, epoch: u64, mut connection: Connection, alpn: Option<Vec<u8>>, decrypted: bool) -> Option<Tap> {
+        let gate = lock(&self.capture_epoch);
+        if *gate != epoch || epoch % 2 == 0 || self.stopping.load(Ordering::Acquire) {
             return None;
         }
         if self
@@ -188,6 +217,7 @@ impl Runtime {
         }
         Some(Tap {
             owner: self.clone(),
+            epoch,
             id,
             ticket,
             offsets: [0; 2],
@@ -303,6 +333,7 @@ impl Drop for Runtime {
 
 pub struct Tap {
     owner: Arc<Runtime>,
+    epoch: u64,
     id: u64,
     ticket: Arc<Ticket>,
     offsets: [u64; 2],
@@ -310,7 +341,16 @@ pub struct Tap {
 }
 impl Tap {
     pub fn transport_result(&mut self, error: usize) { self.send(Event::State(self.id,error,self.ticket.clone())); }
+    fn accepting(&self) -> bool {
+        !self.ticket.lost.load(Ordering::Acquire) && !self.ticket.closed.load(Ordering::Acquire)
+            && !self.owner.stopping.load(Ordering::Acquire)
+    }
     fn send(&self, event: Event) {
+        let gate = lock(&self.owner.capture_epoch);
+        if *gate != self.epoch || self.epoch % 2 == 0 || !self.accepting() { return; }
+        self.enqueue(event);
+    }
+    fn enqueue(&self, event: Event) {
         self.ticket.pending.fetch_add(1, Ordering::AcqRel);
         if self.owner.sender.try_send(event).is_err() {
             // Out-of-band terminal flag cannot itself be lost in the full queue.
@@ -319,30 +359,18 @@ impl Tap {
         }
     }
     pub fn data(&mut self, side: usize, bytes: &[u8]) {
-        if self.ticket.lost.load(Ordering::Acquire)
-            || self.ticket.closed.load(Ordering::Acquire)
-            || self.owner.stopping.load(Ordering::Acquire)
-        {
-            return;
-        }
+        let gate = lock(&self.owner.capture_epoch);
+        if *gate != self.epoch || self.epoch % 2 == 0 || !self.accepting() { return; }
         for chunk in bytes.chunks(16384) {
-            self.send(Event::Data(
-                self.id,
-                side,
-                self.offsets[side],
-                chunk.to_vec(),
-                self.ticket.clone(),
-            ));
+            self.enqueue(Event::Data(self.id, side, self.offsets[side], chunk.to_vec(), self.ticket.clone()));
             self.offsets[side] += chunk.len() as u64;
-            if self.ticket.lost.load(Ordering::Acquire) {
-                break;
-            }
+            if self.ticket.lost.load(Ordering::Acquire) { break; }
         }
     }
     pub fn datagram(&mut self, side: usize, bytes: &[u8]) {
-        if bytes.len() > 65535 || self.ticket.lost.load(Ordering::Acquire)
-            || self.ticket.closed.load(Ordering::Acquire) || self.owner.stopping.load(Ordering::Acquire) { return; }
-        self.send(Event::Datagram(self.id, side, bytes.to_vec(), self.ticket.clone()));
+        let gate = lock(&self.owner.capture_epoch);
+        if bytes.len() > 65535 || *gate != self.epoch || self.epoch % 2 == 0 || !self.accepting() { return; }
+        self.enqueue(Event::Datagram(self.id, side, bytes.to_vec(), self.ticket.clone()));
     }
     pub fn eof(&mut self, side: usize, clean: bool) {
         if !self.ended[side] && !self.ticket.lost.load(Ordering::Acquire) {
@@ -457,7 +485,7 @@ impl Worker {
             self.connections.insert(id, stream);
         }
     }
-    fn reap(&mut self, all: bool) {
+    fn reap(&mut self, all: bool, stopped: bool) {
         let ids: Vec<_> = self.connections.iter().filter_map(|(id, stream)| {
             (all || (stream.ticket.pending.load(Ordering::Acquire) == 0 &&
                 (stream.ticket.closed.load(Ordering::Acquire) || stream.ticket.lost.load(Ordering::Acquire))))
@@ -479,7 +507,7 @@ impl Worker {
                 self.publish(&mut stream, true);
             }
             if stream.identity.transport != "udp" && !stream.decrypted {
-                lock(&self.results).add(json!({"type":"connection","connection":stream.identity,"protocol":"tcp","status":"Closed"}));
+                lock(&self.results).add(json!({"type":"connection","connection":stream.identity,"protocol":"tcp","status":if stopped {"Stopped"}else{"Closed"}}));
             }
             self.active.fetch_sub(1, Ordering::AcqRel);
         }
@@ -591,16 +619,22 @@ impl Worker {
                     }
                     ticket.pending.fetch_sub(1, Ordering::AcqRel);
                 }
+                Ok(Event::StopCapture(reply)) => {
+                    // End reconstruction without fabricating transport EOFs.
+                    for stream in self.connections.values() { stream.ticket.closed.store(true, Ordering::Release); }
+                    self.reap(true, true);
+                    let _ = reply.send(());
+                }
                 Ok(Event::Barrier(reply)) => {
-                    self.reap(false); self.progress(); let _ = reply.send(());
+                    self.reap(false, false); self.progress(); let _ = reply.send(());
                 }
                 Ok(Event::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => (),
             }
-            self.reap(false);
+            self.reap(false, false);
             if progress.elapsed() >= Duration::from_millis(500) { self.progress(); progress = Instant::now(); }
         }
-        self.reap(true);
+        self.reap(true, false);
     }
 }
 fn direction(side: usize) -> Direction {
@@ -865,6 +899,7 @@ mod tests {
             sender,
             worker: Mutex::new(None),
             stopping: AtomicBool::new(false),
+            capture_epoch: Mutex::new(1),
             next: AtomicU64::new(1),
             active: Arc::new(AtomicUsize::new(0)),
             rejected: AtomicU64::new(0),
@@ -1050,4 +1085,36 @@ mod tests {
         r.shutdown().unwrap();
     }
 
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+    #[test]
+    fn concurrent_stop_drains_writes_retains_history_and_invalidates_old_taps() {
+        let r=Runtime::new(CacheConfig {root:std::env::temp_dir().join("proxylane-stop-race"),..Default::default()}).unwrap();
+        let mut tap=r.tap_transport(Connection {id:"race".into(),transport:"udp".into(),..Default::default()},None,false).unwrap();
+        tap.datagram(0,b"before-stop");
+        r.query(&json!({"type":"stats"})).unwrap();
+        let running=Arc::new(AtomicBool::new(true));let run=running.clone();
+        let producer=thread::spawn(move || {
+            while run.load(Ordering::Acquire) { tap.datagram(0,b"during-stop"); thread::yield_now(); }
+            tap
+        });
+        r.stop_capture().unwrap();
+        let snapshot=r.query(&json!({"type":"stats"})).unwrap();
+        assert_eq!(snapshot["active_connections"],0);
+        assert!(snapshot["cache"]["used_bytes"].as_u64().unwrap()>0);
+        for _ in 0..4 {assert_eq!(r.query(&json!({"type":"stats"})).unwrap(),snapshot);}
+        running.store(false,Ordering::Release);let mut old=producer.join().unwrap();
+        assert!(r.tap(Default::default(),None).is_none());
+        r.start_capture();
+        old.datagram(0,b"must-not-resume");old.eof(0,true);old.transport_result(0);drop(old);
+        assert_eq!(r.query(&json!({"type":"stats"})).unwrap(),snapshot);
+        let mut fresh=r.tap_transport(Connection {id:"new".into(),transport:"udp".into(),..Default::default()},None,false).unwrap();
+        fresh.datagram(0,b"new-capture");
+        r.stop_capture().unwrap();
+        assert!(r.query(&json!({"type":"stats"})).unwrap()["cache"]["used_bytes"].as_u64().unwrap()>snapshot["cache"]["used_bytes"].as_u64().unwrap());
+        drop(fresh);r.shutdown().unwrap();
+    }
 }

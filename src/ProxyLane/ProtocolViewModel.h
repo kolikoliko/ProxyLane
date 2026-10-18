@@ -15,6 +15,7 @@ constexpr size_t BodyPreviewLimit = 64 * 1024;
 struct Row {
     std::string run, key, process, protocol, destination, method, target, status;
     uint64_t number = 0;
+    int64_t firstSeenSeconds = 0; // First appearance; stable across row updates.
     size_t datagram[2] = {0, 0};
     uint64_t sequence = 0, processStart = 0, cacheId = 0, requestBytes = 0, responseBytes = 0;
     unsigned pid = 0;
@@ -40,6 +41,7 @@ struct Side {
 struct Detail {
     Side request, response;
     std::string context, note, cacheStamp;
+    bool targetCertificateRejected = false;
     // Human-facing banner is localized by the window; diagnostics stay English.
     enum State { Ready, Truncated, Evicted, Unavailable, Pending } state = Ready;
 };

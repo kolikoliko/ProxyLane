@@ -159,8 +159,10 @@ int wmain(int argc, wchar_t** argv) {
     char protocolMode[8] = {}, monitorOff[8] = {};
     bool protocolTest = GetEnvironmentVariableA("PROXYLANE_TEST_PROTOCOL", protocolMode, sizeof(protocolMode)) != 0;
     bool noMonitor = GetEnvironmentVariableA("PROXYLANE_TEST_NO_MONITOR", monitorOff, sizeof(monitorOff)) != 0;
-    if (protocolTest && !noMonitor && tls->QueryProtocol("{\"type\":\"monitor_start\"}", error, sizeof(error)) < 0) return 38;
-    monitor->SetEnabled(!noMonitor);
+    if (!noMonitor && tls->QueryProtocol("{\"type\":\"monitor_start\"}", error, sizeof(error)) < 0) return 38;
+    char previewOff[8] = {};
+    bool noPreview = GetEnvironmentVariableA("PROXYLANE_TEST_NO_PREVIEW", previewOff, sizeof(previewOff)) != 0;
+    monitor->SetEnabled(!noMonitor && !noPreview);
     char disabled[8] = {};
     bool disableBeforeConnect = GetEnvironmentVariableA("PROXYLANE_MITM_TEST_DISABLED", disabled, sizeof(disabled)) != 0;
     if (disableBeforeConnect) tls->SetEnabled(FALSE, NULL, 0);
@@ -175,6 +177,27 @@ int wmain(int argc, wchar_t** argv) {
     wchar_t repeatGate[MAX_PATH] = {}, holdGate[MAX_PATH] = {};
     GetEnvironmentVariableW(L"PROXYLANE_TEST_REPEAT_GATE", repeatGate, _countof(repeatGate));
     GetEnvironmentVariableW(L"PROXYLANE_TEST_HOLD_GATE", holdGate, _countof(holdGate));
+    wchar_t stopGate[MAX_PATH] = {};
+    GetEnvironmentVariableW(L"PROXYLANE_TEST_MONITOR_STOP", stopGate, _countof(stopGate));
+    if(stopGate[0]) monitor->SetEnabled(FALSE);
+    int stopStage=0;std::string stoppedStats;
+    auto exists=[&](const wchar_t* suffix) { return GetFileAttributesW((std::wstring(stopGate)+suffix).c_str())!=INVALID_FILE_ATTRIBUTES; };
+    auto signal=[&](const wchar_t* suffix) { FILE* f=nullptr;_wfopen_s(&f,(std::wstring(stopGate)+suffix).c_str(),L"wb");if(!f) ExitProcess(60);fclose(f); };
+    auto stopStep=[&]() {
+        if(!stopGate[0]) return;
+        if(stopStage==0 && exists(L".stop")) {
+            if(tls->QueryProtocol("{\"type\":\"monitor_stop\"}",error,sizeof(error))<0) ExitProcess(61);
+            stoppedStats=ProtocolQuery(tls,"{\"type\":\"stats\"}");
+            signal(L".stopped");stopStage=1;
+        } else if(stopStage==1 && exists(L".resume")) {
+            if(stoppedStats!=ProtocolQuery(tls,"{\"type\":\"stats\"}")) ExitProcess(62);
+            if(tls->QueryProtocol("{\"type\":\"monitor_start\",\"decrypt\":true}",error,sizeof(error))<0) ExitProcess(63);
+            signal(L".resumed");stopStage=2;
+        } else if(stopStage==2 && exists(L".check")) {
+            if(stoppedStats!=ProtocolQuery(tls,"{\"type\":\"stats\"}")) ExitProcess(64);
+            signal(L".new");stopStage=3;
+        }
+    };
     DWORD code = 8;
     for (int attempt = 0; attempt < (repeatGate[0] ? 2 : 1); ++attempt) {
     STARTUPINFOW startup = {sizeof(startup)};
@@ -214,7 +237,7 @@ int wmain(int argc, wchar_t** argv) {
         }
     };
     while (WaitForSingleObject(child.hProcess, 10) != WAIT_OBJECT_0) {
-        drain();
+        drain();stopStep();
         if (GetTickCount() - started > 45000) { TerminateProcess(child.hProcess, 8); break; }
     }
     // Allow the PRC to finish both TLS shutdown directions before tearing it down.
@@ -236,6 +259,7 @@ int wmain(int argc, wchar_t** argv) {
         tls->SetEnabled(FALSE, NULL, 0);
         if (!WaitTestGate(holdGate)) code = 36;
     }
+    if(stopGate[0] && stopStage!=3) return 65;
     if (protocolTest) DumpProtocol(tls);
     proxy->DisableProxy();
     if (protocolTest && ProtocolQuery(tls, "{\"type\":\"stats\"}") != "{\"type\":\"inactive\"}") return 33;

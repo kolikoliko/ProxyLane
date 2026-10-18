@@ -761,3 +761,55 @@ fn realtime_tls_h2_doh_get_post_and_gzip() {
     }
     drop(m);runtime.shutdown().unwrap();
 }
+
+#[test]
+fn stopping_monitor_preserves_tls_transport_and_freezes_capture() {
+    for tls12 in [false, true] {
+        for alpn in [b"http/1.1".as_slice(), b"h2".as_slice()] {
+            let f = Fixture::new();
+            let runtime = protocol::Runtime::new(proxylane_protocol::cache::CacheConfig {
+                root: f.path.join("stop-cache"), ..Default::default()
+            }).unwrap();
+            let mut m = f.session();
+            m.enable_protocol(runtime.clone(), proxylane_protocol::Connection { id:"stop-test".into(), ..Default::default() });
+            // Also cover a connection whose ClientHello has not arrived at stop.
+            let mut delayed = f.session();
+            delayed.enable_protocol(runtime.clone(), proxylane_protocol::Connection { id:"delayed".into(), ..Default::default() });
+            let (mut app, mut origin) = f.endpoints_alpn(tls12, true, alpn);
+            for _ in 0..30 { exchange(&mut m, &mut app, &mut origin, 17).unwrap(); }
+            assert!(m.ready());
+            let request = if alpn==b"h2" { b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_slice() }
+                else { b"POST /before HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\nbefore".as_slice() };
+            app.writer().write_all(request).unwrap();
+            for _ in 0..4 { exchange(&mut m, &mut app, &mut origin, 17).unwrap(); }
+            let mut received=Vec::new(); let _=origin.reader().read_to_end(&mut received);
+            assert_eq!(received,request);
+            runtime.stop_capture().unwrap();
+            let snapshot=runtime.query(&json!({"type":"stats"})).unwrap();
+            assert_eq!(snapshot["active_connections"],0);
+            let records=runtime.query(&json!({"type":"poll","limit":64})).unwrap();
+            for resume in [false,true] {
+                if resume { runtime.start_capture(); }
+                // More than the TLS high-water limit in total, on the SAME TLS connection.
+                for _ in 0..40 {
+                    let bytes=vec![0x65;16384];
+                    app.writer().write_all(&bytes).unwrap(); origin.writer().write_all(&bytes).unwrap();
+                    for _ in 0..3 { exchange(&mut m,&mut app,&mut origin,4096).unwrap(); }
+                    let mut upstream=Vec::new();let _=origin.reader().read_to_end(&mut upstream);
+                    let mut downstream=Vec::new();let _=app.reader().read_to_end(&mut downstream);
+                    assert_eq!(upstream,bytes);assert_eq!(downstream,bytes);
+                }
+                assert_eq!(runtime.query(&json!({"type":"stats"})).unwrap(),snapshot);
+                assert_eq!(runtime.query(&json!({"type":"poll","limit":64})).unwrap(),records);
+            }
+            let (mut later_app,mut later_origin)=f.endpoints_alpn(tls12,true,alpn);
+            for _ in 0..30 {exchange(&mut delayed,&mut later_app,&mut later_origin,17).unwrap();}
+            assert!(delayed.ready());
+            assert_eq!(runtime.query(&json!({"type":"stats"})).unwrap(),snapshot);
+            drop(delayed);drop(m);
+            assert_eq!(runtime.query(&json!({"type":"stats"})).unwrap(),snapshot);
+            assert!(runtime.tap(Default::default(),None).is_some(),"new captures can start after resuming");
+            runtime.shutdown().unwrap();
+        }
+    }
+}

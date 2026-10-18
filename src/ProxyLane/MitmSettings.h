@@ -19,6 +19,8 @@ inline const std::array<Field,9>& Fields() {
     }};
     return fields;
 }
+inline bool DecryptHTTPS() { return GetPrivateProfileInt(L"options",L"DecryptHTTPS",0,Localization::SettingsPath())==1; }
+inline bool SaveDecryptHTTPS(bool enabled) { return WritePrivateProfileString(L"options",L"DecryptHTTPS",enabled ? L"1":L"0",Localization::SettingsPath())!=FALSE; }
 using Values=std::array<unsigned,9>;
 inline Values Defaults() {
     Values values;for(size_t i=0;i<values.size();++i) values[i]=Fields()[i].initial;return values;
