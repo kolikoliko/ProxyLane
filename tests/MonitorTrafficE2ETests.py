@@ -90,7 +90,10 @@ def main():
     profile = 'MonitorLoad'+unique
     config = (root/'examples/ProxyLane.ini').read_text().replace('Test', profile)
     config = config.replace('Port=1080', 'Port='+str(relay.server_address[1]))
-    config = config.replace('[options]', '[options]\nlanguage=zh-CN')
+    # This is a plaintext throughput test, independent of the example profile's
+    # saved decryption preference (which may require CA onboarding).
+    config = '\n'.join(line for line in config.splitlines() if not line.startswith('DecryptHTTPS='))
+    config = config.replace('[options]', '[options]\nlanguage=zh-CN\nDecryptHTTPS=0')
     (work/'ProxyLane.ini').write_text(config)
     env = dict(os.environ, PROXYLANE_MITM='0', PROXYLANE_MITM_HOME=str(work/'pki'), PROXYLANE_PROTOCOL_CACHE_ROOT=str(work/'cache'),
         PROXYLANE_PROTOCOL_ENTRY_BYTES=str(1024*1024), PROXYLANE_PROTOCOL_TOTAL_BYTES=str(2*1024*1024))
@@ -128,6 +131,12 @@ def main():
         send(pages['proxy'], 0x111, 1, u.GetDlgItem(pages['proxy'], 1))
         time.sleep(.5)
         activate(3); check(1011, True)
+        deadline = time.monotonic()+15
+        monitor = u.GetDlgItem(page,1011)
+        while not u.IsWindowEnabled(monitor):
+            assert process.poll() is None and time.monotonic()<deadline, 'Monitoring did not start'
+            time.sleep(.05)
+        assert send(monitor,0xF0)==1, 'Plain monitoring failed to start'
         baseline = memory(process)
         output = work/'client-result.json'
         launch = subprocess.Popen([str(work/'ProxyLane64.exe'), '--auto', '--profile', profile,

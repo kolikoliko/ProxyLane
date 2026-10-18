@@ -99,6 +99,8 @@ BOOL CPage2::OnInitDialog()
 
 BEGIN_MESSAGE_MAP(CPage2, CModernDialog)
 	ON_WM_SIZE()
+	ON_WM_TIMER()
+	ON_WM_DESTROY()
 	//ON_WM_ERASEBKGND()
 
 	ON_MESSAGE(WM_PRINTLOGTEXT, OnPrintLogText)
@@ -165,6 +167,46 @@ void CPage2::LogText(LPCWSTR lpText)
 
 LRESULT CPage2::OnPrintLogText(WPARAM wParam, LPARAM lParam)
 {
+	ScheduleLogFlush();
+	return 0;
+}
+
+void CPage2::ScheduleLogFlush()
+{
+	// One notification starts a bounded, low-priority timer. Continuations must
+	// not repost WM_PRINTLOGTEXT: a busy producer would starve input/painting.
+	if (!m_logTimer)
+	{
+		m_logTimer = SetTimer(1, LOG_REFRESH_MS, NULL);
+		if (!m_logTimer)
+		{
+			CSingleLock lock(&m_logLock, TRUE);
+			m_logQueue.OnNotificationPostFailed();
+		}
+	}
+}
+
+void CPage2::OnTimer(UINT_PTR timer)
+{
+	if (m_logTimer && timer == m_logTimer)
+	{
+		KillTimer(m_logTimer);
+		m_logTimer = 0;
+		FlushLogText();
+		return;
+	}
+	CModernDialog::OnTimer(timer);
+}
+
+void CPage2::OnDestroy()
+{
+	if (m_logTimer) KillTimer(m_logTimer);
+	m_logTimer = 0;
+	CModernDialog::OnDestroy();
+}
+
+void CPage2::FlushLogText()
+{
 	CBoundedLogQueue<LogEntry>::Batch batch;
 	{
 		CSingleLock lock(&m_logLock, TRUE);
@@ -172,7 +214,7 @@ LRESULT CPage2::OnPrintLogText(WPARAM wParam, LPARAM lParam)
 	}
 
 	if (batch.entries.empty() && batch.dropped == 0)
-		return 0;
+		return;
 
 	CString text;
 	const int baseOffset = m_Edit.GetWindowTextLength();
@@ -194,24 +236,42 @@ LRESULT CPage2::OnPrintLogText(WPARAM wParam, LPARAM lParam)
 		AppendLogEntry(*it, text, baseOffset);
 	}
 
-	m_Edit.SetRedraw(FALSE);
+	int selectionStart = 0, selectionEnd = 0;
+	m_Edit.GetSel(selectionStart, selectionEnd);
+	const int firstVisibleChar = m_Edit.LineIndex(m_Edit.GetFirstVisibleLine());
+	SCROLLINFO scroll = { sizeof(scroll), SIF_RANGE | SIF_PAGE | SIF_POS };
+	m_Edit.GetScrollInfo(SB_VERT, &scroll);
+	const bool follow = selectionStart == selectionEnd &&
+		scroll.nPos + static_cast<int>(scroll.nPage) >= scroll.nMax;
+	// WM_SETREDRAW(TRUE) adds WS_VISIBLE; don't accidentally reveal a hidden page.
+	const bool visible = m_Edit.IsWindowVisible() != FALSE;
+	if (visible) m_Edit.SetRedraw(FALSE);
 	int nLen = m_Edit.GetWindowTextLength();
 	m_Edit.SetSel(nLen, nLen);
 	m_Edit.ReplaceSel(text, FALSE);
-	TrimLogLines();
-	nLen = m_Edit.GetWindowTextLength();
-	m_Edit.SetSel(nLen, nLen);
-	m_Edit.LineScroll(m_Edit.GetLineCount());
-	m_Edit.SetRedraw(TRUE);
-	m_Edit.Invalidate(FALSE);
+	const int removed = TrimLogLines();
+	if (follow)
+	{
+		nLen = m_Edit.GetWindowTextLength();
+		m_Edit.SetSel(nLen, nLen);
+		m_Edit.LineScroll(m_Edit.GetLineCount());
+	}
+	else
+	{
+		m_Edit.SetSel(max(0, selectionStart - removed), max(0, selectionEnd - removed), TRUE);
+		const int firstLine = m_Edit.LineFromChar(max(0, firstVisibleChar - removed));
+		m_Edit.LineScroll(firstLine - m_Edit.GetFirstVisibleLine());
+	}
+	if (visible)
+	{
+		m_Edit.SetRedraw(TRUE);
+		m_Edit.Invalidate(FALSE);
+	}
 
 	if (batch.hasMore)
 	{
-		CSingleLock lock(&m_logLock, TRUE);
-		PostPrintLogMessageLocked();
+		ScheduleLogFlush();
 	}
-
-	return 0;
 }
 
 void CPage2::AddLogText(const CString &lpText)
@@ -233,6 +293,12 @@ void CPage2::CopyAll()
 
 void CPage2::ClearAll()
 {
+	{
+		CSingleLock lock(&m_logLock, TRUE);
+		m_logQueue.Clear();
+	}
+	if (m_logTimer) KillTimer(m_logTimer);
+	m_logTimer = 0;
 	m_Edit.SetWindowText(_T(""));
 	m_lastLogDate.Empty();
 	m_logDates.clear();
@@ -305,17 +371,26 @@ void CPage2::PostPrintLogMessageLocked()
 	m_logQueue.OnNotificationPostFailed();
 }
 
-void CPage2::TrimLogLines()
+int CPage2::TrimLogLines()
 {
 	int lineCount = m_Edit.GetLineCount();
-	if (lineCount <= MAX_LOG_LINES)
-		return;
+	const int chars = m_Edit.GetWindowTextLength();
+	if (lineCount <= MAX_LOG_LINES && chars <= MAX_LOG_CHARS)
+		return 0;
 
-	// Reserve one line for a date heading restored below.
-	int firstLineToKeep = lineCount - MAX_LOG_LINES + 1;
-	int firstCharToKeep = m_Edit.LineIndex(firstLineToKeep);
+	// Trim with headroom so small batches don't repeatedly relayout the entire
+	// edit control. A character bound also covers very long/wrapped log lines.
+	int firstCharToKeep = 0;
+	if (lineCount > MAX_LOG_LINES)
+		firstCharToKeep = m_Edit.LineIndex(lineCount - LOG_LINES_TO_KEEP + 1);
+	if (chars > MAX_LOG_CHARS)
+	{
+		const int cut = chars - LOG_CHARS_TO_KEEP;
+		const int nextLine = m_Edit.LineIndex(m_Edit.LineFromChar(cut) + 1);
+		firstCharToKeep = max(firstCharToKeep, nextLine >= 0 ? nextLine : cut);
+	}
 	if (firstCharToKeep <= 0)
-		return;
+		return 0;
 
 	// Keep the date of the first remaining entry even when its original
 	// heading was trimmed. Character offsets also work with wrapped lines.
@@ -339,6 +414,7 @@ void CPage2::TrimLogLines()
 	}
 	m_Edit.SetSel(0, firstCharToKeep);
 	m_Edit.ReplaceSel(header, FALSE);
+	return firstCharToKeep - header.GetLength();
 }
 
 void CPage2::OnHookWsock(LPHookWSockResult res)

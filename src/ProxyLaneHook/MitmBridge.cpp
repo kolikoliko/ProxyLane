@@ -259,7 +259,14 @@ bool CMitmBridge::Pump()
             peers[side]->ShutDown(SD_SEND);
             peers[side]->m_bWriteShutdown = TRUE;
         }
-        peers[side]->AsyncSelect(FD_WRITE | FD_CLOSE | ((!paused && !peers[side]->m_bReadClosed) ? FD_READ : 0));
+        const long events = FD_WRITE | FD_CLOSE | ((!paused && !peers[side]->m_bReadClosed) ? FD_READ : 0);
+        // WSAAsyncSelect posts FD_WRITE again for an already writable socket.
+        // Re-registering on every Pump would feed OnWritable back into itself,
+        // even with no queued output. Keep Winsock's normal would-block rearm;
+        // only change the subscription when read/EOF state actually changes.
+        if (peers[side]->m_lEvent != events && !peers[side]->AsyncSelect(events)) {
+            Fail(WSAGetLastError()); return false;
+        }
         if (m_paused && !paused && !peers[side]->m_bReadClosed) peers[side]->TriggerEvent(FD_READ);
     }
     m_paused = paused;
