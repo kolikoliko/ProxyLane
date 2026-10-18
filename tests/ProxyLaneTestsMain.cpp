@@ -16,6 +16,8 @@ int DnsQueryPolicyTestsMain();
 int DeferredMitigationPolicyTestsMain();
 int AppContainerPipeAccessTestsMain();
 int ProcessActionsTestsMain();
+int HookedProcessRegistryTestsMain();
+int ExitProcessCleanupTestsMain();
 int ScopedProcessSuspensionTestsMain();
 int TrafficStatisticsTestsMain();
 
@@ -58,6 +60,10 @@ int main(int argc, char** argv)
 	if (AppContainerPipeAccessTestsMain() != 0)
 		return 1;
 	if (ProcessActionsTestsMain() != 0)
+		return 1;
+	if (HookedProcessRegistryTestsMain() != 0)
+		return 1;
+	if (ExitProcessCleanupTestsMain() != 0)
 		return 1;
 	if (ScopedProcessSuspensionTestsMain() != 0)
 		return 1;

@@ -42,6 +42,8 @@
     <ClCompile Include="..\src\ProxyLaneHook\DetourHooks.cpp" />
     <ClCompile Include="TrafficStatisticsTests.cpp" />
     <ClCompile Include="ProcessActionsTests.cpp" />
+    <ClCompile Include="HookedProcessRegistryTests.cpp" />
+    <ClCompile Include="ExitProcessCleanupTests.cpp" />
     <ClCompile Include="ScopedProcessSuspensionTests.cpp" />
     <ClCompile Include="AppContainerPipeAccessTests.cpp"><PreprocessorDefinitions>main=AppContainerPipeAccessTestsMain;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
     <ClCompile Include="..\src\ProxyLaneHook\AppContainerPipeAccess.cpp"><PreprocessorDefinitions>PROXYLANE_PIPE_ACCESS_STANDALONE;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>

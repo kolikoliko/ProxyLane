@@ -5,6 +5,7 @@
 #include "ListCtrlEx.h"
 #include "ModernUI.h"
 #include "RecentApplications.h"
+#include "HookedProcessRegistry.h"
 #include <map>
 #include <set>
 #include <vector>
@@ -148,6 +149,7 @@ private:
 	DWORD m_launchedProcessId;
 	ULONGLONG m_launchedProcessTime;
 	DWORD m_launchSelectionTick;
+	CHookedProcessRegistry m_hookedProcesses;
 
 	static int CALLBACK CompareProcessItems(LPARAM leftParam, LPARAM rightParam, LPARAM sortParam);
 	void BuildProcessTree();
@@ -180,6 +182,7 @@ public:
 	void OnPageActivated();
 	int UpdatePslist(BOOL bRefresh);
 	BOOL ProxyProcess(DWORD dwPid);
+	void GetRunningHookedProcesses(std::vector<_myPROCESSINFO>& processes);
 
 	void OnDropAppFile(TCHAR *pFileName);
 	AppLaunchResult LaunchAndProxyApp(
@@ -210,7 +213,7 @@ public:
 	void LogNewProxyTask(const LPPRCClient lpC);
 	BOOL ShouldInjectNewProcess(LPHookNewProcessInfo lphnpi);
 	void OnChildInjectionResult(LPHookNewProcessInfo lphnpi, BOOL succeeded) {};
-	void OnHookWsock(LPHookWSockResult res){};
+	void OnHookWsock(LPHookWSockResult res);
 	void OnHookLogtext(LPHookLogtext log) {};
 
 

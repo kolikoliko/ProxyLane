@@ -539,6 +539,29 @@ int GetProcessList(list<_myPROCESSINFO> &ls)
 	return nCount;
 }
 
+void CPage3::OnHookWsock(LPHookWSockResult res)
+{
+	// Called from pipe worker threads, including automatic descendant injection.
+	if (res)
+		m_hookedProcesses.Record(res->dwProcessId, res->processCreateTime, res->err);
+}
+
+void CPage3::GetRunningHookedProcesses(std::vector<_myPROCESSINFO>& processes)
+{
+	processes.clear();
+	const CHookedProcessRegistry::Identities identities = m_hookedProcesses.Snapshot();
+	if (identities.empty()) return;
+	std::list<_myPROCESSINFO> current;
+	GetProcessList(current);
+	for (std::list<_myPROCESSINFO>::const_iterator it = current.begin();
+		it != current.end(); ++it)
+	{
+		if (it->hasStartTime && identities.count(
+			CHookedProcessRegistry::Identity(it->pid, it->startTimeValue)))
+			processes.push_back(*it);
+	}
+}
+
 BOOL InjectDll2(HANDLE hProc, DWORD dwPid, DWORD dwTid, LPCSTR lpszPipeName)
 {
 	STARTUPINFO si = { 0 };

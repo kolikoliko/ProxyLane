@@ -191,6 +191,18 @@
     <ClInclude Include="TrafficRateSampler.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="HookedProcessRegistry.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="ExitProcessesDialog.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="ExitProcessCleanup.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="ExitCleanupDialog.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="..\ProxyLaneHook\token.h">
       <Filter>头文件</Filter>
     </ClInclude>

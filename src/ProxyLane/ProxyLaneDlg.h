@@ -38,6 +38,7 @@ protected:
 	CAdminDropOverlay* m_adminDropOverlay;
 	CNormalDropBanner* m_normalDropBanner;
 	UINT m_fileDragGeneration;
+	BOOL m_confirmingExit = FALSE;
 
 
 	BOOL AddTaskbarIcons();

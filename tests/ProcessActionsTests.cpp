@@ -16,14 +16,34 @@ int ProcessActionsTestsMain()
 	if (!CreateProcessW(executable.c_str(), NULL, NULL, NULL, FALSE,
 		CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, NULL, &startup, &child)) return 1;
 	const ULONGLONG created = ProcessActions::CreationTime(child.hProcess);
+	std::vector<ProcessActions::TerminationTarget> invalidTargets;
+	ProcessActions::TerminationTarget wrongIdentity = { child.dwProcessId, created + 1 };
+	ProcessActions::TerminationTarget self = { GetCurrentProcessId(),
+		ProcessActions::CreationTime(GetCurrentProcess()) };
+	invalidTargets.push_back(wrongIdentity);
+	invalidTargets.push_back(self);
+	const std::vector<DWORD> rejected = ProcessActions::TerminateExactProcesses(invalidTargets);
+	if (!rejected[0] || !rejected[1] ||
+		WaitForSingleObject(child.hProcess, 0) != WAIT_TIMEOUT) ++failures;
 	HANDLE wrong = ProcessActions::OpenForTermination(child.dwProcessId, created + 1);
 	if (wrong) { ++failures; CloseHandle(wrong); }
 	HANDLE unknown = ProcessActions::OpenForTermination(child.dwProcessId, 0);
 	if (unknown) { ++failures; CloseHandle(unknown); }
 	if (WaitForSingleObject(child.hProcess, 0) != WAIT_TIMEOUT) ++failures;
 	HANDLE held = ProcessActions::OpenForTermination(child.dwProcessId, created);
-	if (!held || !TerminateProcess(held, 1) || WaitForSingleObject(held, 5000) != WAIT_OBJECT_0)
+	std::vector<ProcessActions::TerminationTarget> targets;
+	ProcessActions::TerminationTarget exact = { child.dwProcessId, created };
+	targets.push_back(exact);
+	targets.push_back(exact); // A duplicate/naturally exited target is harmless.
+	const std::vector<DWORD> ended = ProcessActions::TerminateExactProcesses(targets);
+	if (ended[0] || ended[1])
+		std::cerr << "Batch termination errors: " << ended[0] << ", " << ended[1] << std::endl;
+	if (!held || ended[0] || ended[1] || WaitForSingleObject(held, 0) != WAIT_OBJECT_0)
 		++failures;
+	const std::vector<DWORD> alreadyExited = ProcessActions::TerminateExactProcesses(targets);
+	if (alreadyExited[0] || alreadyExited[1])
+		std::cerr << "Already exited errors: " << alreadyExited[0] << ", " << alreadyExited[1] << std::endl;
+	if (alreadyExited[0] || alreadyExited[1]) ++failures;
 	if (held) CloseHandle(held);
 	HANDLE exited = ProcessActions::OpenForTermination(child.dwProcessId, created);
 	if (exited) { ++failures; CloseHandle(exited); }

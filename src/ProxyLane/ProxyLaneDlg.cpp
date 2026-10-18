@@ -7,6 +7,8 @@
 #include "AppVersion.h"
 #include "Localization.h"
 #include "PackagedAppSupport.h"
+#include "ExitCleanupDialog.h"
+#include "ProcessActions.h"
 #include <afxole.h>
 
 #ifdef _DEBUG
@@ -658,11 +660,58 @@ BOOL CProxyLaneDlg::OnInitDialog()
 
 void CProxyLaneDlg::OnCancel()
 {
+	// Modal dialogs pump messages; ignore another close request while confirming.
+	if (m_confirmingExit) return;
+	m_confirmingExit = TRUE;
 	CPage1* page1 = m_MainTab.GetPage1();
 	if (page1 && !theApp.GetAutomationOptions().enabled
 		&& !page1->ConfirmDiscardUnsavedChanges())
 	{
+		m_confirmingExit = FALSE;
 		return;
+	}
+	// A user can close a GUI originally launched with --auto too. Explicit
+	// automation failures use EndDialog directly and remain non-interactive.
+	{
+		std::vector<_myPROCESSINFO> processes;
+		m_MainTab.GetPage3()->GetRunningHookedProcesses(processes);
+		if (!processes.empty())
+		{
+			CString details;
+			for (size_t i = 0; i < processes.size(); ++i)
+			{
+				CString line;
+				line.Format(_T("%s  (PID %lu)\r\n"), processes[i].proname, processes[i].pid);
+				details += line;
+			}
+			ShowAndActivate();
+			CExitCleanupDialog dialog(m_MainTab.GetPage3(), static_cast<UINT>(processes.size()), details, this);
+			const INT_PTR choice = dialog.DoModal();
+			if (choice != IDOK)
+			{
+				if (choice != IDCANCEL)
+				{
+					CString failures;
+					UINT failed = 0;
+					for (size_t i = 0; i < dialog.result.errors.size(); ++i)
+					{
+						if (!dialog.result.errors[i]) continue;
+						if (++failed <= 10)
+							failures += Localization::Format(_T("page3.end_error"),
+								dialog.result.processes[i].proname,
+								dialog.result.processes[i].pid, dialog.result.errors[i]);
+					}
+					if (failed > 10) failures += _T("...\r\n");
+					const CString message = failed ?
+						Localization::Format(_T("exit.terminate_failed"), failed) + _T("\r\n\r\n") + failures :
+						Localization::Format(_T("exit.cleanup_error"),
+							dialog.workerError ? dialog.workerError : ERROR_GEN_FAILURE);
+					MessageBox(message, Localization::Get(_T("exit.processes_title")), MB_OK | MB_ICONWARNING);
+				}
+				m_confirmingExit = FALSE;
+				return;
+			}
+		}
 	}
 	CModernDialog::OnCancel();
 }
