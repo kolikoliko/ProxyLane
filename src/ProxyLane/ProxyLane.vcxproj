@@ -302,7 +302,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)..\scripts\bu
     <ClInclude Include="MonitorLogFormat.h" />
     <ClInclude Include="Page5.h" />
 	<ClInclude Include="ProfileCommandBroker.h" />
-	<ClInclude Include="HookedProcessRegistry.h" />
 	<ClInclude Include="ExitProcessesDialog.h" />
 	<ClInclude Include="ExitProcessCleanup.h" />
 	<ClInclude Include="ExitCleanupDialog.h" />

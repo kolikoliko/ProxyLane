@@ -2,6 +2,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "InetCompat.h"
+#include "ProcessIdentity.h"
 
 #pragma pack(push, 1)
 
@@ -384,18 +385,7 @@ typedef struct _HookNewProcessInfo
 	ULONGLONG processCreateTime;
 }HookNewProcessInfo, *LPHookNewProcessInfo;
 
-typedef struct _HookProcessIdentityInfo
-{
-	DWORD dwProcessId;
-	ULONGLONG processCreateTime;
-	WCHAR szAppPath[MAX_PATH];
-	DWORD hookState;
-	DWORD hookError;
-}HookProcessIdentityInfo, *LPHookProcessIdentityInfo;
 
-#define PROCESS_HOOK_STATE_PENDING 0
-#define PROCESS_HOOK_STATE_SUCCEEDED 1
-#define PROCESS_HOOK_STATE_FAILED 2
 
 //PRC Pipe Protocol Data Head
 typedef struct _tagPRCPDHead

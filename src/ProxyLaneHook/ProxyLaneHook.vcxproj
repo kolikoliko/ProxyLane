@@ -355,6 +355,8 @@
 	<ClInclude Include="ElevatedLaunchProtocol.h" />
     <ClInclude Include="asynsocket\types.h" />
     <ClInclude Include="GlobalProxy.h" />
+    <ClInclude Include="ProcessIdentity.h" />
+    <ClInclude Include="ProcessRegistry.h" />
     <ClInclude Include="AppContainerPipeAccess.h" />
     <ClInclude Include="HookWinsock.h" />
     <ClInclude Include="InjectDll.h" />

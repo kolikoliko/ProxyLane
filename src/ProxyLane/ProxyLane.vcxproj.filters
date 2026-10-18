@@ -191,9 +191,6 @@
     <ClInclude Include="TrafficRateSampler.h">
       <Filter>头文件</Filter>
     </ClInclude>
-    <ClInclude Include="HookedProcessRegistry.h">
-      <Filter>头文件</Filter>
-    </ClInclude>
     <ClInclude Include="ExitProcessesDialog.h">
       <Filter>头文件</Filter>
     </ClInclude>

@@ -5,7 +5,6 @@
 #include "ListCtrlEx.h"
 #include "ModernUI.h"
 #include "RecentApplications.h"
-#include "HookedProcessRegistry.h"
 #include <map>
 #include <set>
 #include <vector>
@@ -102,6 +101,7 @@ class CPage3 : public CModernDialog
 
 #define TIMER_PSLIST 0x100
 #define TIMER_LAUNCHED_PROCESS 0x101
+#define TIMER_PROCESS_REGISTRY 0x102
 
 public:
 	CPage3(CWnd* pParent = NULL);   // 标准构造函数
@@ -149,7 +149,7 @@ private:
 	DWORD m_launchedProcessId;
 	ULONGLONG m_launchedProcessTime;
 	DWORD m_launchSelectionTick;
-	CHookedProcessRegistry m_hookedProcesses;
+	IProxyProcessRegistry* m_processRegistry;
 
 	static int CALLBACK CompareProcessItems(LPARAM leftParam, LPARAM rightParam, LPARAM sortParam);
 	void BuildProcessTree();

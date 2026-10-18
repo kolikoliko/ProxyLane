@@ -47,6 +47,7 @@ public:
 	// Do not delete/release them. New callers need the matching Hook DLL.
 	virtual IProxyTlsControl* GetTlsControl() = 0;
 	virtual IProxyMonitor* GetMonitorInstance() = 0;
+	virtual IProxyProcessRegistry* GetProcessRegistry() = 0;
 };
 
 class IProxyTlsControl

@@ -394,7 +394,8 @@ static BOOL QueryProcessCreateTime(DWORD processId, ULONGLONG *value)
 
 CProxyReceptionCentre::CProxyReceptionCentre(CGlobalProxy *pGlobalProxy)
 {
-	InitializeCriticalSection(&m_ProcessIdentityLock);
+	InitializeCriticalSection(&m_ReleasedChildrenLock);
+	m_processRegistry = pGlobalProxy->GetProcessRegistry();
 	m_hPRCThread = NULL;
 	m_dwPRCThreadId = 0;
 	m_PRCWnd = NULL;
@@ -411,7 +412,7 @@ CProxyReceptionCentre::CProxyReceptionCentre(CGlobalProxy *pGlobalProxy)
 CProxyReceptionCentre::~CProxyReceptionCentre(void)
 {
 	delete m_pProxyDataHandle;
-	DeleteCriticalSection(&m_ProcessIdentityLock);
+	DeleteCriticalSection(&m_ReleasedChildrenLock);
 }
 //
 //BOOL CProxyReceptionCentre::InitPRCWnd()
@@ -779,48 +780,17 @@ BOOL CProxyReceptionCentre::RegisterProcessIdentity(
 		return FALSE;
 	}
 
-	HookProcessIdentityInfo safeIdentity = *identity;
-	safeIdentity.szAppPath[_countof(safeIdentity.szAppPath) - 1] = L'\0';
-	safeIdentity.hookState = PROCESS_HOOK_STATE_PENDING;
-	safeIdentity.hookError = 0;
-
-	EnterCriticalSection(&m_ProcessIdentityLock);
-	std::map<DWORD, HookProcessIdentityInfo>::iterator existing =
-		m_ProcessIdentities.find(safeIdentity.dwProcessId);
-	if (existing != m_ProcessIdentities.end() &&
-		existing->second.processCreateTime == safeIdentity.processCreateTime &&
-		existing->second.hookState != PROCESS_HOOK_STATE_PENDING)
-	{
-		// A late identity registration must not erase a final result that has
-		// already arrived for this exact process lifetime.
-		safeIdentity.hookState = existing->second.hookState;
-		safeIdentity.hookError = existing->second.hookError;
-	}
-	m_ProcessIdentities[safeIdentity.dwProcessId] = safeIdentity;
-	LeaveCriticalSection(&m_ProcessIdentityLock);
-	return TRUE;
+	return m_processRegistry->Register(identity);
 }
 
 BOOL CProxyReceptionCentre::UpdateProcessHookResult(LPHookWSockResult result)
 {
 	if (!result || !result->dwProcessId || !result->processCreateTime)
 		return FALSE;
-
-	BOOL updated = FALSE;
-	EnterCriticalSection(&m_ProcessIdentityLock);
-	std::map<DWORD, HookProcessIdentityInfo>::iterator identity =
-		m_ProcessIdentities.find(result->dwProcessId);
-	if (identity != m_ProcessIdentities.end() &&
-		identity->second.processCreateTime == result->processCreateTime)
-	{
-		identity->second.hookState = result->err == 0
-			? PROCESS_HOOK_STATE_SUCCEEDED
-			: PROCESS_HOOK_STATE_FAILED;
-		identity->second.hookError = result->err;
-		updated = TRUE;
-	}
-	LeaveCriticalSection(&m_ProcessIdentityLock);
-	return updated;
+	ULONGLONG actual = 0;
+	if (QueryProcessCreateTime(result->dwProcessId, &actual) &&
+		actual != result->processCreateTime) return FALSE;
+	return m_processRegistry->Update(result->dwProcessId, result->processCreateTime, result->err);
 }
 
 BOOL CProxyReceptionCentre::RegisterReleasedChild(LPHookNewProcessInfo child)
@@ -835,9 +805,9 @@ BOOL CProxyReceptionCentre::RegisterReleasedChild(LPHookNewProcessInfo child)
 		return FALSE;
 	}
 
-	EnterCriticalSection(&m_ProcessIdentityLock);
+	EnterCriticalSection(&m_ReleasedChildrenLock);
 	m_ReleasedChildren[child->dwProcessId] = child->processCreateTime;
-	LeaveCriticalSection(&m_ProcessIdentityLock);
+	LeaveCriticalSection(&m_ReleasedChildrenLock);
 	return TRUE;
 }
 
@@ -850,23 +820,14 @@ BOOL CProxyReceptionCentre::GetProcessIdentity(
 		return FALSE;
 	appPath[0] = L'\0';
 
-	BOOL found = FALSE;
-	EnterCriticalSection(&m_ProcessIdentityLock);
-	std::map<DWORD, HookProcessIdentityInfo>::const_iterator it =
-		m_ProcessIdentities.find(processId);
-	if (it != m_ProcessIdentities.end())
-	{
-		ULONGLONG actual = 0;
-		if (!QueryProcessCreateTime(processId, &actual) ||
-			actual == it->second.processCreateTime)
-		{
-			wcsncpy(appPath, it->second.szAppPath, appPathCount - 1);
-			appPath[appPathCount - 1] = L'\0';
-			found = appPath[0] != L'\0';
-		}
-	}
-	LeaveCriticalSection(&m_ProcessIdentityLock);
-	return found;
+	HookProcessIdentityInfo identity = { 0 };
+	if (!m_processRegistry->Get(processId, 0, &identity)) return FALSE;
+	ULONGLONG actual = 0;
+	if (QueryProcessCreateTime(processId, &actual) && actual != identity.processCreateTime)
+		return FALSE;
+	wcsncpy(appPath, identity.szAppPath, appPathCount - 1);
+	appPath[appPathCount - 1] = L'\0';
+	return appPath[0] != L'\0';
 }
 
 BOOL CProxyReceptionCentre::GetProcessHookState(
@@ -875,22 +836,12 @@ BOOL CProxyReceptionCentre::GetProcessHookState(
 	DWORD *hookState,
 	DWORD *hookError)
 {
-	if (!processId || !processCreateTime || !hookState || !hookError)
-		return FALSE;
-
-	BOOL found = FALSE;
-	EnterCriticalSection(&m_ProcessIdentityLock);
-	std::map<DWORD, HookProcessIdentityInfo>::const_iterator identity =
-		m_ProcessIdentities.find(processId);
-	if (identity != m_ProcessIdentities.end() &&
-		identity->second.processCreateTime == processCreateTime)
-	{
-		*hookState = identity->second.hookState;
-		*hookError = identity->second.hookError;
-		found = TRUE;
-	}
-	LeaveCriticalSection(&m_ProcessIdentityLock);
-	return found;
+	if (!processCreateTime || !hookState || !hookError) return FALSE;
+	HookProcessIdentityInfo identity = { 0 };
+	if (!m_processRegistry->Get(processId, processCreateTime, &identity)) return FALSE;
+	*hookState = identity.hookState;
+	*hookError = identity.hookError;
+	return TRUE;
 }
 
 
@@ -1117,21 +1068,9 @@ void CProxyReceptionCentre::CheckSuspendedChildren()
 	if (!QueryChildGuardProcessSnapshot(processes))
 		return;
 
-	// Keep normal-release and successful-Hook exclusions only for the exact
-	// lifetime of the corresponding PID.  This prevents historical records
-	// from accumulating and also handles PID reuse safely.
-	EnterCriticalSection(&m_ProcessIdentityLock);
-	for (std::map<DWORD, HookProcessIdentityInfo>::iterator it =
-		m_ProcessIdentities.begin(); it != m_ProcessIdentities.end();)
-	{
-		std::map<DWORD, ChildGuardProcessSnapshot>::const_iterator current =
-			processes.find(it->first);
-		if (current == processes.end() ||
-			current->second.createTime != it->second.processCreateTime)
-			m_ProcessIdentities.erase(it++);
-		else
-			++it;
-	}
+	// Prune service-local child-release exclusions. Process identities are
+	// pruned by the GUI timer even while the proxy service is stopped.
+	EnterCriticalSection(&m_ReleasedChildrenLock);
 	for (std::map<DWORD, ULONGLONG>::iterator it =
 		m_ReleasedChildren.begin(); it != m_ReleasedChildren.end();)
 	{
@@ -1142,7 +1081,7 @@ void CProxyReceptionCentre::CheckSuspendedChildren()
 		else
 			++it;
 	}
-	LeaveCriticalSection(&m_ProcessIdentityLock);
+	LeaveCriticalSection(&m_ReleasedChildrenLock);
 
 	for (std::map<DWORD, SuspendedChildObservation>::iterator it =
 		m_SuspendedChildObservations.begin();
@@ -1199,14 +1138,10 @@ void CProxyReceptionCentre::CheckSuspendedChildren()
 		}
 
 		BOOL excluded = FALSE;
-		EnterCriticalSection(&m_ProcessIdentityLock);
-		std::map<DWORD, HookProcessIdentityInfo>::const_iterator identity =
-			m_ProcessIdentities.find(child.processId);
-		if (identity != m_ProcessIdentities.end() &&
-			identity->second.processCreateTime == child.createTime)
-		{
+		EnterCriticalSection(&m_ReleasedChildrenLock);
+		HookProcessIdentityInfo identity = { 0 };
+		if (m_processRegistry->Get(child.processId, child.createTime, &identity))
 			excluded = TRUE;
-		}
 		std::map<DWORD, ULONGLONG>::const_iterator released =
 			m_ReleasedChildren.find(child.processId);
 		if (released != m_ReleasedChildren.end() &&
@@ -1214,7 +1149,7 @@ void CProxyReceptionCentre::CheckSuspendedChildren()
 		{
 			excluded = TRUE;
 		}
-		LeaveCriticalSection(&m_ProcessIdentityLock);
+		LeaveCriticalSection(&m_ReleasedChildrenLock);
 		std::map<DWORD, ULONGLONG>::const_iterator processed =
 			m_ProcessedSuspendedChildren.find(child.processId);
 		if (excluded || (processed != m_ProcessedSuspendedChildren.end() &&
@@ -1273,17 +1208,13 @@ void CProxyReceptionCentre::CheckSuspendedChildren()
 			continue;
 		}
 		BOOL releaseWasRegistered = FALSE;
-		EnterCriticalSection(&m_ProcessIdentityLock);
-		std::map<DWORD, HookProcessIdentityInfo>::const_iterator finalIdentity =
-			m_ProcessIdentities.find(child.processId);
+		EnterCriticalSection(&m_ReleasedChildrenLock);
+		HookProcessIdentityInfo finalIdentity = { 0 };
 		std::map<DWORD, ULONGLONG>::const_iterator finalRelease =
 			m_ReleasedChildren.find(child.processId);
-		releaseWasRegistered =
-			(finalIdentity != m_ProcessIdentities.end() &&
-				finalIdentity->second.processCreateTime == child.createTime) ||
-			(finalRelease != m_ReleasedChildren.end() &&
-				finalRelease->second == child.createTime);
-		LeaveCriticalSection(&m_ProcessIdentityLock);
+		releaseWasRegistered = m_processRegistry->Get(child.processId, child.createTime, &finalIdentity) ||
+			(finalRelease != m_ReleasedChildren.end() && finalRelease->second == child.createTime);
+		LeaveCriticalSection(&m_ReleasedChildrenLock);
 		if (releaseWasRegistered)
 		{
 			CloseHandle(process);

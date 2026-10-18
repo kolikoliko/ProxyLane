@@ -12,6 +12,15 @@
 #include "ProxyTesterMgr.h"
 #include "MitmControl.h"
 #include "ProxyMonitor.h"
+#include "ProcessRegistry.h"
+
+// The GUI keeps this DLL loaded until process exit. Service stop/start only
+// recreates CGlobalProxy/PRC; all readers and writers retain this one registry.
+IProxyProcessRegistry* CGlobalProxy::GetProcessRegistry()
+{
+	static CProcessRegistry registry;
+	return &registry;
+}
 
 IProxyTlsControl* CGlobalProxy::GetTlsControl() { return &CMitmControl::Instance(); }
 IProxyMonitor* CGlobalProxy::GetMonitorInstance() { return &CProxyMonitor::Instance(); }

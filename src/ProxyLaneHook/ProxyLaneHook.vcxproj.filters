@@ -126,6 +126,12 @@
     <ClInclude Include="GlobalProxy.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="ProcessIdentity.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ProcessRegistry.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="AppContainerPipeAccess.h">
       <Filter>Header Files</Filter>
     </ClInclude>

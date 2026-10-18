@@ -539,25 +539,23 @@ int GetProcessList(list<_myPROCESSINFO> &ls)
 	return nCount;
 }
 
-void CPage3::OnHookWsock(LPHookWSockResult res)
+void CPage3::OnHookWsock(LPHookWSockResult)
 {
-	// Called from pipe worker threads, including automatic descendant injection.
-	if (res)
-		m_hookedProcesses.Record(res->dwProcessId, res->processCreateTime, res->err);
+	// The pipe server updates the shared registry before notifying observers.
 }
 
 void CPage3::GetRunningHookedProcesses(std::vector<_myPROCESSINFO>& processes)
 {
 	processes.clear();
-	const CHookedProcessRegistry::Identities identities = m_hookedProcesses.Snapshot();
-	if (identities.empty()) return;
+	if (!m_processRegistry) return;
 	std::list<_myPROCESSINFO> current;
 	GetProcessList(current);
 	for (std::list<_myPROCESSINFO>::const_iterator it = current.begin();
 		it != current.end(); ++it)
 	{
-		if (it->hasStartTime && identities.count(
-			CHookedProcessRegistry::Identity(it->pid, it->startTimeValue)))
+		HookProcessIdentityInfo identity = { 0 };
+		if (it->hasStartTime && m_processRegistry->Get(it->pid, it->startTimeValue, &identity) &&
+			identity.hookState == PROCESS_HOOK_STATE_SUCCEEDED)
 			processes.push_back(*it);
 	}
 }
@@ -827,6 +825,7 @@ CPage3::CPage3(CWnd* pParent /*=NULL*/)
 	, m_launchedProcessId(0)
 	, m_launchedProcessTime(0)
 	, m_launchSelectionTick(0)
+	, m_processRegistry(NULL)
 {
 	//m_pEdit = NULL;
 	//m_pEdit = new CMyEdit;
@@ -855,6 +854,15 @@ void CPage3::DoDataExchange(CDataExchange* pDX)
 BOOL CPage3::OnInitDialog()
 {
 	CModernDialog::OnInitDialog();
+	// Acquire the module-lifetime registry once; never consult the transient
+	// g_GlobalProxy pointer from cleanup workers or drawing after service stop.
+	IGlobalProxy* proxy = GetGlobalProxyInstance();
+	if (proxy)
+	{
+		m_processRegistry = proxy->GetProcessRegistry();
+		ReleaseGlobalProxyInstance();
+	}
+	SetTimer(TIMER_PROCESS_REGISTRY, 30000, NULL);
 	DragAcceptFiles(FALSE);
 	m_ListCtrl.DragAcceptFiles(FALSE);
 	m_btnWindowFinder.SetVisualStyle(CModernButton::STYLE_SECONDARY);
@@ -2315,18 +2323,10 @@ void CPage3::OnNMCustomdrawProcessList(NMHDR* notifyHeader, LRESULT* result)
 		return;
 	}
 
-	IProxyReceptionCentre *receptionCentre = g_GlobalProxy
-		? g_GlobalProxy->GetPRCInstance()
-		: NULL;
-	DWORD hookState = PROCESS_HOOK_STATE_PENDING;
-	DWORD hookError = 0;
-	if (receptionCentre && receptionCentre->GetProcessHookState(
-		pid,
-		process->second.startTimeValue,
-		&hookState,
-		&hookError))
+	HookProcessIdentityInfo identity = { 0 };
+	if (m_processRegistry && m_processRegistry->Get(pid, process->second.startTimeValue, &identity))
 	{
-		switch (hookState)
+		switch (identity.hookState)
 		{
 		case PROCESS_HOOK_STATE_SUCCEEDED:
 			customDraw->clrText = RGB(112, 48, 160);
@@ -2519,6 +2519,9 @@ void CPage3::OnTimer(UINT_PTR nIDEvent)
 	// TODO: 在此添加消息处理程序代码和/或调用默认值
 	switch(nIDEvent)
 	{
+	case TIMER_PROCESS_REGISTRY:
+		if (m_processRegistry) m_processRegistry->PruneExited();
+		break;
 	case TIMER_PSLIST:
 		{
 			// Hidden pages and a hidden top-level window still receive WM_TIMER.

@@ -380,6 +380,21 @@ Transport=PLAIN
             wait_for(lambda: not owned_pipe(owner.pid), 'service stopped')
             stopped = warning(owner, main)
             assert 'PID %d)' % child.pid in text(USER.GetDlgItem(stopped, 1111))
+            dismiss(stopped, 2)
+            # An idle orphan sends no new Hook/traffic reports. Its one shared
+            # identity must survive service destruction AND recreation.
+            USER.PostMessageW(page, 0x111, 1, 0)
+            restarted_pipe = wait_for(lambda: owned_pipe(owner.pid), 'service restarted')
+            assert restarted_pipe == pipe
+            restarted = warning(owner, main)
+            assert 'PID %d)' % child.pid in text(USER.GetDlgItem(restarted, 1111))
+            assert 'PID %d)' % shell.pid not in text(USER.GetDlgItem(restarted, 1111))
+            dismiss(restarted, 2)
+            USER.PostMessageW(page, 0x111, 2, 0)
+            wait_for(lambda: not owned_pipe(owner.pid), 'service stopped again')
+            stopped = warning(owner, main)
+            assert 'PID %d)' % child.pid in text(USER.GetDlgItem(stopped, 1111))
+            record['idle_orphan_survived_service_restart'] = True
             if child_exits_first:
                 child.terminate()
                 child.wait(timeout=10)
