@@ -21,6 +21,9 @@
     <ClCompile Include="ApplicationCatalogCache.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="RecentApplicationCache.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="RecentApplications.cpp">
       <Filter>源文件</Filter>
     </ClCompile>

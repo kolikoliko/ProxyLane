@@ -259,7 +259,9 @@ BOOL RecentApplications::DeleteProfile(const CString& profile, const CString& pa
 		for (std::list<CString>::const_iterator i = sections.begin(); i != sections.end(); ++i)
 			if (i->Left(prefix.GetLength()).CompareNoCase(prefix) == 0 && !ini.DeleteSection(*i)) return FALSE;
 	}
-	return ini.DeleteSection(L"proxy_" + profile);
+	if (!ini.DeleteSection(L"proxy_" + profile)) return FALSE;
+	InvalidateCache(path, id, TRUE);
+	return TRUE;
 }
 
 BOOL RecentApplications::Store::ReadBound(std::vector<Entry>& entries, CString& identity, BOOL create) const
@@ -324,6 +326,7 @@ BOOL RecentApplications::Store::Write(const std::vector<Entry>& entries, const C
 		for (size_t j = 0; j < entries.size() && !retain; ++j) retain = i->CompareNoCase(prefix + entries[j].id) == 0;
 		if (!retain && !ini.DeleteSection(*i)) return FALSE;
 	}
+	InvalidateCache(m_path, identity, FALSE, &entries);
 	return TRUE;
 }
 
@@ -402,6 +405,16 @@ void RecentApplications::ReleaseIcons(std::vector<Entry>& entries)
 {
 	for (size_t i = 0; i < entries.size(); ++i)
 		if (entries[i].app.icon) { DestroyIcon(entries[i].app.icon); entries[i].app.icon = NULL; }
+}
+
+void RecentApplications::Clone(const std::vector<Entry>& source, std::vector<Entry>& destination, size_t limit)
+{
+	std::vector<Entry> copy(source.begin(), source.begin() + min(source.size(), limit));
+	for (size_t i = 0; i < copy.size(); ++i) copy[i].app.icon = NULL;
+	for (size_t i = 0; i < copy.size(); ++i)
+		if (source[i].app.icon) copy[i].app.icon = CopyIcon(source[i].app.icon);
+	ReleaseIcons(destination);
+	destination.swap(copy);
 }
 
 RecentApplications::Load::Load(const CString& profileName, const CString& filePath, const CString& identity)

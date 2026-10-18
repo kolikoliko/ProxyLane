@@ -27,6 +27,15 @@ namespace RecentApplications
 	CString Description(const Entry& entry, const CString& runningProfile);
 	BOOL MatchesCatalog(const Entry& entry, const InstalledApplications::Application& app);
 	void ReleaseIcons(std::vector<Entry>& entries);
+	void Clone(const std::vector<Entry>& source, std::vector<Entry>& destination, size_t limit = static_cast<size_t>(-1));
+	// Shared GUI-lifetime cache. Consumers release references, never cancel or
+	// move entries out of a shared Load. Only supersession/eviction cancels work.
+	struct Load;
+	Load* AcquireLoad(const CString& profile, const CString& path, const CString& profileId, BOOL refresh = FALSE);
+	Load* AcquireReadyLoad(const CString& profile, const CString& path, const CString& profileId);
+	BOOL IsCurrentLoad(Load* load);
+	void Preload(const CString& profile, const CString& path = DefaultPath(), const CString& profileId = CString());
+	void InvalidateCache(const CString& path, const CString& profileId, BOOL forget = FALSE, const std::vector<Entry>* saved = NULL);
 	// Background validation/shortcut resolution. A picker can close without
 	// waiting for Shell extensions or an unavailable network path.
 	struct Load

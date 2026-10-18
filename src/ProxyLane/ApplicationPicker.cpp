@@ -16,7 +16,7 @@ static CString ApplicationSourceName(InstalledApplications::SourceKind kind)
 
 CApplicationPicker::CApplicationPicker(CWnd* parent)
 	: CModernDialog(IDD_APPLICATION_PICKER, parent), m_hoverRow(-1), m_load(NULL), m_loading(TRUE),
-	  m_loadFailed(FALSE), m_recentReadFailed(FALSE), m_rebuilding(FALSE), m_recentLoad(NULL) {}
+	  m_loadFailed(FALSE), m_recentReadFailed(FALSE), m_rebuilding(FALSE), m_recentLoad(NULL), m_recentConsumed(FALSE) {}
 
 CApplicationPicker::~CApplicationPicker()
 {
@@ -178,7 +178,14 @@ void CApplicationPicker::SetEmptyState(const CString& text)
 void CApplicationPicker::OnTimer(UINT_PTR timer)
 {
 	if ((timer == 1 || timer == 2) && RefreshProfileContext()) return;
-	if (timer == 1) FinishLoad();
+	if (timer == 2 && RefreshRecentLoad(FALSE))
+	{
+		m_loading = TRUE;
+		m_refresh.EnableWindow(FALSE);
+		RebuildApplications();
+		SetTimer(1, 100, NULL);
+	}
+	if (timer == 1 || timer == 2) FinishLoad();
 	CModernDialog::OnTimer(timer);
 }
 
@@ -191,24 +198,25 @@ void CApplicationPicker::BeginLoad(BOOL refresh)
 	KillTimer(1);
 	if (m_load) m_load->Release();
 	m_load = NULL;
-	if (m_recentLoad)
-	{
-		if (m_recentLoad->cancel) SetEvent(m_recentLoad->cancel);
-		m_recentLoad->Release();
-	}
-	m_recentLoad = RecentApplications::BeginLoad(m_profile, RecentApplications::DefaultPath(), m_profileId);
 	if (changedProfile)
 	{
+		if (m_recentLoad) { m_recentLoad->Release(); m_recentLoad = NULL; }
 		RecentApplications::ReleaseIcons(m_recentEntries);
 		m_recentEntries.clear();
-		RebuildApplications();
 	}
+	RefreshRecentLoad(refresh);
 	m_load = AcquireApplicationCatalog(refresh);
+	ApplicationCatalogLoad* ready = AcquireReadyApplicationCatalog();
+	if (ready)
+	{
+		InstalledApplications::Clone(ready->applications, m_catalog);
+		ready->Release();
+	}
 	m_loading = TRUE;
 	m_loadFailed = FALSE;
 	m_recentReadFailed = FALSE;
 	m_refresh.EnableWindow(FALSE);
-	FilterApplications();
+	RebuildApplications();
 	if (!FinishLoad()) SetTimer(1, 100, NULL);
 }
 
@@ -217,8 +225,9 @@ BOOL CApplicationPicker::FinishLoad()
 	BOOL changed = FALSE;
 	// Recent entries are independently validated and become usable before the
 	// potentially much slower installed-application enumeration finishes.
-	if (m_recentLoad)
+	if (m_recentLoad && !m_recentConsumed)
 	{
+		if (!RecentApplications::IsCurrentLoad(m_recentLoad)) changed = RefreshRecentLoad(FALSE);
 		EnterCriticalSection(&m_recentLoad->lock);
 		const BOOL done = m_recentLoad->done;
 		LeaveCriticalSection(&m_recentLoad->lock);
@@ -226,8 +235,8 @@ BOOL CApplicationPicker::FinishLoad()
 		{
 			m_recentReadFailed = !m_recentLoad->succeeded;
 			if (!m_recentReadFailed && m_recentLoad->profileId == m_profileId && m_recentLoad->profile == m_profile)
-				m_recentEntries.swap(m_recentLoad->entries);
-			m_recentLoad->Release(); m_recentLoad = NULL;
+				RecentApplications::Clone(m_recentLoad->entries, m_recentEntries);
+			m_recentConsumed = TRUE;
 			changed = TRUE;
 		}
 	}
@@ -249,10 +258,27 @@ BOOL CApplicationPicker::FinishLoad()
 			changed = TRUE;
 		}
 	}
-	m_loading = m_load || m_recentLoad;
+	m_loading = m_load || (m_recentLoad && !m_recentConsumed);
 	if (changed) RebuildApplications();
 	if (!m_loading) { KillTimer(1); m_refresh.EnableWindow(TRUE); }
 	return !m_loading;
+}
+
+BOOL CApplicationPicker::RefreshRecentLoad(BOOL refresh)
+{
+	RecentApplications::Load* latest = RecentApplications::AcquireLoad(
+		m_profile, RecentApplications::DefaultPath(), m_profileId, refresh);
+	if (latest == m_recentLoad) { latest->Release(); return FALSE; }
+	// Local history edits are published into Ready() before validation starts.
+	{
+		RecentApplications::Load* ready = RecentApplications::AcquireReadyLoad(
+			m_profile, RecentApplications::DefaultPath(), m_profileId);
+		if (ready) { RecentApplications::Clone(ready->entries, m_recentEntries); ready->Release(); }
+	}
+	if (m_recentLoad) m_recentLoad->Release();
+	m_recentLoad = latest;
+	m_recentConsumed = FALSE;
+	return TRUE;
 }
 
 void CApplicationPicker::OnRefresh() { if (!m_loading) BeginLoad(TRUE); }
@@ -353,11 +379,11 @@ void CApplicationPicker::FilterApplications(const CString& selection)
 	m_list.Invalidate(FALSE);
 	m_rebuilding = FALSE;
 	UpdateSelectionActions();
-	SetWindowText(Localization::Get(L"apps.title") + (m_loading ? L" - " + Localization::Get(L"apps.loading_list") : CString()));
+	SetWindowText(Localization::Get(L"apps.title") + (m_loading && m_applications.empty() ? L" - " + Localization::Get(L"apps.loading_list") : CString()));
 	const CString emptyText = Localization::Get(m_loading ? L"apps.loading_list" :
 		(m_loadFailed ? L"apps.load_failed" : L"apps.no_matches"));
 	SetEmptyState(m_list.GetItemCount() == 0 ? emptyText : CString());
-	SetDlgItemText(IDC_APP_STATUS, m_loading ? Localization::Get(L"apps.loading_list") :
+	SetDlgItemText(IDC_APP_STATUS, m_loading ? Localization::Get(m_applications.empty() ? L"apps.loading_list" : L"apps.updating_list") :
 		(m_recentReadFailed ? Localization::Get(L"recent.read_failed") :
 		(m_loadFailed ? Localization::Get(L"apps.refresh_failed") : Localization::Format(L"apps.count", m_list.GetItemCount()))));
 }
@@ -476,7 +502,7 @@ void CApplicationPicker::UpdateSelectionActions()
 	if (currentCaption != caption) m_launch.SetWindowText(caption);
 	m_launch.EnableWindow(available && running);
 	m_removeRecent.ShowWindow(recent ? SW_SHOW : SW_HIDE);
-	m_removeRecent.EnableWindow(recent && !m_recentLoad);
+	m_removeRecent.EnableWindow(recent && (!m_recentLoad || m_recentConsumed));
 	GetDlgItem(IDC_APP_STATUS)->ShowWindow(SW_SHOW);
 }
 
@@ -521,7 +547,7 @@ void CApplicationPicker::OnOK()
 
 void CApplicationPicker::OnContextMenu(CWnd* window, CPoint point)
 {
-	if (m_recentLoad || window != &m_list) return;
+	if ((m_recentLoad && !m_recentConsumed) || window != &m_list) return;
 	int row = -1;
 	if (point.x == -1 && point.y == -1)
 	{
@@ -553,7 +579,7 @@ void CApplicationPicker::OnRemoveRecent()
 void CApplicationPicker::ChangeRecent(size_t index, BOOL remove)
 {
 	if (RefreshProfileContext()) return;
-	if (m_recentLoad || index >= m_recentEntries.size()) return;
+	if ((m_recentLoad && !m_recentConsumed) || index >= m_recentEntries.size()) return;
 	const RecentApplications::Entry entry = m_recentEntries[index];
 	RecentApplications::Store store(m_profile, RecentApplications::DefaultPath(), m_profileId);
 	const BOOL updated = remove ? store.Remove(entry.id) : store.SetPinned(entry.id, !entry.pinned);
@@ -599,7 +625,6 @@ void CApplicationPicker::OnDestroy()
 	}
 	if (m_recentLoad)
 	{
-		if (m_recentLoad->cancel) SetEvent(m_recentLoad->cancel);
 		m_recentLoad->Release(); m_recentLoad = NULL;
 	}
 	CModernDialog::OnDestroy();

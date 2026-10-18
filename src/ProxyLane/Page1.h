@@ -20,6 +20,7 @@ class CPage1 : public CModernDialog
 	DECLARE_DYNAMIC(CPage1)
 
 public:
+	void PreloadRecentApplications();
 	CPage1(CWnd* pParent = NULL);   // 标准构造函数
 	virtual ~CPage1();
 
@@ -94,7 +95,9 @@ private:
 	CToolTipCtrl m_recentTooltip;
 	CString m_recentHoverText;
 	std::vector<RecentApplications::Entry> m_recentEntries;
-	ULONGLONG m_recentFileStamp;
+	RecentApplications::Load* m_recentLoad;
+	BOOL m_recentConsumed;
+	BOOL m_recentReadFailed;
 	CString m_recentProfileId;
 	BOOL m_recentLaunching;
 	DWORD m_recentLaunchTick;

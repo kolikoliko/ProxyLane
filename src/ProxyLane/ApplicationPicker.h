@@ -35,6 +35,7 @@ private:
 	void LayoutPicker();
 	void BeginLoad(BOOL refresh);
 	BOOL FinishLoad();
+	BOOL RefreshRecentLoad(BOOL refresh);
 	void SetEmptyState(const CString& text);
 	void FilterApplications(const CString& selection = CString());
 	void RebuildApplications();
@@ -66,6 +67,7 @@ private:
 	BOOL m_recentReadFailed;
 	BOOL m_rebuilding;
 	RecentApplications::Load* m_recentLoad;
+	BOOL m_recentConsumed;
 	CString m_profile;
 	CString m_profileId;
 	std::vector<RecentApplications::Entry> m_recentEntries;

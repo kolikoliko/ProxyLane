@@ -273,6 +273,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)..\scripts\bu
     <ClCompile Include="ApplicationPicker.cpp" />
     <ClCompile Include="ApplicationCatalogCache.cpp" />
     <ClCompile Include="RecentApplications.cpp" />
+    <ClCompile Include="RecentApplicationCache.cpp" />
     <ClCompile Include="stdafx.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">Create</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>

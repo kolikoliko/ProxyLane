@@ -71,6 +71,7 @@ protected:
 	DECLARE_MESSAGE_MAP()
 public:
 	afx_msg void OnDestroy();
+	afx_msg LRESULT OnPreloadApplications(WPARAM, LPARAM);
 	afx_msg LRESULT OnShellIconNotify( WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnTaskbarRestartNotify( WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnAutomationStart(WPARAM wParam, LPARAM lParam);

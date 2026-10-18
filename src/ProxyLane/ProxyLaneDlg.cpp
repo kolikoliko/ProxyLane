@@ -9,6 +9,7 @@
 #include "PackagedAppSupport.h"
 #include "ExitCleanupDialog.h"
 #include "ProcessActions.h"
+#include "ApplicationCatalogCache.h"
 #include <afxole.h>
 
 #ifdef _DEBUG
@@ -537,6 +538,7 @@ BEGIN_MESSAGE_MAP(CProxyLaneDlg, CModernDialog)
 	ON_MESSAGE(WM_SHELLICON_NOTIFY, OnShellIconNotify)
 	ON_REGISTERED_MESSAGE(s_uTaskbarRestart, OnTaskbarRestartNotify)
 	ON_MESSAGE(WM_AUTOMATION_START, OnAutomationStart)
+	ON_MESSAGE(WM_PRELOAD_APPLICATIONS, OnPreloadApplications)
 	ON_MESSAGE(WM_PROXY_STATUS_CHANGED, OnProxyStatusChanged)
 	ON_MESSAGE(WM_PROFILE_COMMAND_REQUEST, OnProfileCommandRequest)
 	ON_MESSAGE(WM_DEFERRED_FILE_DRAG_LEAVE, OnDeferredFileDragLeave)
@@ -549,6 +551,13 @@ END_MESSAGE_MAP()
 
 
 // CProxyLaneDlg 消息处理程序
+
+LRESULT CProxyLaneDlg::OnPreloadApplications(WPARAM, LPARAM)
+{
+	PreloadApplicationCatalog();
+	m_MainTab.GetPage1()->PreloadRecentApplications();
+	return 0;
+}
 
 BOOL CProxyLaneDlg::OnInitDialog()
 {
@@ -653,6 +662,7 @@ BOOL CProxyLaneDlg::OnInitDialog()
 		ShowWindow(SW_SHOW);
 		RedrawWindow(NULL, NULL,
 			RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+		PostMessage(WM_PRELOAD_APPLICATIONS);
 	}
 
 	return TRUE;  // 除非将焦点设置到控件，否则返回 TRUE

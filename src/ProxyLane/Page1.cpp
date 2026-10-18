@@ -78,7 +78,9 @@ CPage1::CPage1(CWnd* pParent /*=NULL*/)
 	, m_profileStore(g_ini)
 	, m_filterEditBaseHeight(0)
 {
-	m_recentFileStamp = 0;
+	m_recentLoad = NULL;
+	m_recentConsumed = TRUE;
+	m_recentReadFailed = FALSE;
 	m_recentLaunching = FALSE;
 	m_recentLaunchTick = 0;
 	m_pTestProxy = 0;
@@ -93,6 +95,8 @@ CPage1::CPage1(CWnd* pParent /*=NULL*/)
 
 CPage1::~CPage1()
 {
+	if (m_recentLoad) m_recentLoad->Release();
+	RecentApplications::ReleaseIcons(m_recentEntries);
 	if (m_pProxyTester)
 	{
 		m_pProxyTester->Release();
@@ -309,7 +313,7 @@ void CPage1::CreateWorkflowCard()
 		m_recentTooltip.SetDelayTime(TTDT_AUTOPOP, 30000);
 	}
 	ReloadRecentApplications(TRUE);
-	SetTimer(0x310, 2000, NULL);
+	SetTimer(0x310, 500, NULL);
 	LayoutWorkflowCard();
 }
 
@@ -318,17 +322,38 @@ void CPage1::ReloadRecentApplications(BOOL force)
 	if (!m_recentList.GetSafeHwnd()) return;
 	const CString profile = g_MainTab && g_MainTab->IsProxyRunning() ? g_MainTab->GetRunningProfileName() : CString();
 	const CString identity = g_MainTab ? g_MainTab->GetRunningRecentProfileId() : CString();
-	WIN32_FILE_ATTRIBUTE_DATA data = {0};
-	ULONGLONG stamp = 0;
-	if (GetFileAttributesEx(RecentApplications::DefaultPath(), GetFileExInfoStandard, &data))
-		stamp = (static_cast<ULONGLONG>(data.ftLastWriteTime.dwHighDateTime) << 32) | data.ftLastWriteTime.dwLowDateTime;
-	if (!force && stamp == m_recentFileStamp && identity == m_recentProfileId) return;
-	std::vector<RecentApplications::Entry> entries;
-	const BOOL loaded = identity.IsEmpty() || RecentApplications::Store(profile, RecentApplications::DefaultPath(), identity).Read(entries);
-	if (loaded) m_recentFileStamp = stamp;
-	m_recentProfileId = identity;
-	m_recentEntries.swap(entries);
-	if (m_recentEntries.size() > 7) m_recentEntries.resize(7);
+	BOOL changed = force || identity != m_recentProfileId;
+	if (identity != m_recentProfileId)
+	{
+		RecentApplications::ReleaseIcons(m_recentEntries); m_recentEntries.clear();
+		if (m_recentLoad) { m_recentLoad->Release(); m_recentLoad = NULL; }
+		m_recentProfileId = identity;
+		m_recentConsumed = TRUE; m_recentReadFailed = FALSE;
+	}
+	if (!identity.IsEmpty())
+	{
+		RecentApplications::Load* latest = RecentApplications::AcquireLoad(profile, RecentApplications::DefaultPath(), identity);
+		if (latest != m_recentLoad)
+		{
+			{
+				RecentApplications::Load* ready = RecentApplications::AcquireReadyLoad(profile, RecentApplications::DefaultPath(), identity);
+				if (ready) { RecentApplications::Clone(ready->entries, m_recentEntries, 7); ready->Release(); }
+			}
+			if (m_recentLoad) m_recentLoad->Release();
+			m_recentLoad = latest; m_recentConsumed = FALSE; changed = TRUE;
+		}
+		else latest->Release();
+		EnterCriticalSection(&m_recentLoad->lock);
+		const BOOL done = m_recentLoad->done;
+		LeaveCriticalSection(&m_recentLoad->lock);
+		if (done && !m_recentConsumed)
+		{
+			m_recentReadFailed = !m_recentLoad->succeeded;
+			if (!m_recentReadFailed) RecentApplications::Clone(m_recentLoad->entries, m_recentEntries, 7);
+			m_recentConsumed = TRUE; changed = TRUE;
+		}
+	}
+	if (!changed) return;
 	m_recentHoverText.Empty();
 	if (m_recentTooltip.GetSafeHwnd()) m_recentTooltip.Pop();
 	m_recentList.SetRedraw(FALSE);
@@ -336,12 +361,11 @@ void CPage1::ReloadRecentApplications(BOOL force)
 	m_recentIcons.SetImageCount(0);
 	for (size_t i = 0; i < m_recentEntries.size(); ++i)
 	{
-		HICON icon = RecentApplications::LoadIcon(m_recentEntries[i]);
+		HICON icon = m_recentEntries[i].app.icon;
 		const int image = icon ? m_recentIcons.Add(icon) : -1;
-		if (icon) DestroyIcon(icon);
 		m_recentList.InsertItem(static_cast<int>(i), m_recentEntries[i].app.name, image);
 	}
-	m_recentEmpty.SetWindowText(Localization::Get(loaded ? L"recent.empty" : L"recent.read_failed"));
+	m_recentEmpty.SetWindowText(Localization::Get(!m_recentConsumed ? L"apps.loading_list" : (m_recentReadFailed ? L"recent.read_failed" : L"recent.empty")));
 	m_recentList.SetRedraw(TRUE);
 	m_recentList.Invalidate(FALSE);
 	LayoutWorkflowCard();
@@ -350,11 +374,20 @@ void CPage1::ReloadRecentApplications(BOOL force)
 LRESULT CPage1::OnRecentApplicationsChanged(WPARAM, LPARAM)
 {
 	ReloadRecentApplications(TRUE);
+	PreloadRecentApplications();
 	return 0;
+}
+
+void CPage1::PreloadRecentApplications()
+{
+	const BOOL running = g_MainTab && g_MainTab->IsProxyRunning();
+	RecentApplications::Preload(running ? g_MainTab->GetRunningProfileName() : GetCurrentProfileName(),
+		RecentApplications::DefaultPath(), running ? g_MainTab->GetRunningRecentProfileId() : CString());
 }
 
 void CPage1::OnTimer(UINT_PTR timer)
 {
+	if (timer == 0x311) { KillTimer(0x311); PreloadRecentApplications(); }
 	if (timer == 0x310 && IsWindowVisible() && !m_recentLaunching) ReloadRecentApplications(FALSE);
 	CModernDialog::OnTimer(timer);
 }
@@ -1696,6 +1729,7 @@ void CPage1::UILoadCfg( CfgProxyItem *item )
 	}
 	UpdateDnsRedirectEnable();
 	UpdateTransportEnable();
+	SetTimer(0x311, 300, NULL); // Debounce profile selection; no Shell work on the UI thread.
 	m_loadedProfileName = item ? item->strName : _T("");
 	m_draftProfileName = m_loadedProfileName;
 	m_loadingProfile = FALSE;
