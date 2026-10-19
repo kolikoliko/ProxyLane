@@ -13,6 +13,11 @@ public:
 		: CExitProcessesDialog(count, processes, parent), m_page(page) {}
 	~CExitCleanupDialog()
 	{
+		if (m_refreshWorker)
+		{
+			WaitForSingleObject(m_refreshWorker->m_hThread, INFINITE);
+			delete m_refreshWorker;
+		}
 		if (m_worker)
 		{
 			SetEvent(m_cancel);
@@ -43,6 +48,7 @@ protected:
 		area.bottom = area.top + barHeight;
 		area.right = area.left + UiTheme::ScaleForWindow(m_hWnd, 96);
 		m_progress.Create(WS_CHILD | PBS_MARQUEE, area, this, IDC_EXIT_PROGRESS);
+		SetTimer(2, 250, NULL);
 		return FALSE;
 	}
 	void OnOK() override
@@ -68,6 +74,11 @@ protected:
 	}
 	LRESULT WindowProc(UINT message, WPARAM wParam, LPARAM lParam) override
 	{
+		if (message == WM_TIMER && wParam == 2)
+		{
+			RefreshProcesses();
+			return 0;
+		}
 		if (message == WM_TIMER && wParam == 1 && m_worker)
 		{
 			if (WaitForSingleObject(m_worker->m_hThread, 0) == WAIT_OBJECT_0)
@@ -93,8 +104,74 @@ protected:
 	}
 
 private:
+	void RefreshProcesses()
+	{
+		// Enumerating system processes stays off the UI thread. At most one
+		// refresh runs at a time; read its snapshot only after the thread exits.
+		if (m_refreshWorker)
+		{
+			if (WaitForSingleObject(m_refreshWorker->m_hThread, 0) != WAIT_OBJECT_0) return;
+			delete m_refreshWorker;
+			m_refreshWorker = NULL;
+			if (!m_worker && !m_discardRefresh && m_refreshSucceeded)
+			{
+				ShowProcesses(m_refreshProcesses);
+				if (m_refreshProcesses.empty())
+				{
+					if (m_emptySnapshot)
+					{
+						KillTimer(2);
+						EndDialog(IDOK);
+						return;
+					}
+					m_emptySnapshot = true;
+				}
+				else m_emptySnapshot = false;
+			}
+			else m_emptySnapshot = false;
+			m_discardRefresh = false;
+		}
+		if (m_worker || GetTickCount() - m_lastRefresh < 500) return;
+		m_lastRefresh = GetTickCount();
+		m_refreshSucceeded = FALSE;
+		m_refreshWorker = AfxBeginThread(RefreshWork, this, THREAD_PRIORITY_NORMAL, 0, CREATE_SUSPENDED);
+		if (!m_refreshWorker) { m_emptySnapshot = false; return; }
+		m_refreshWorker->m_bAutoDelete = FALSE;
+		m_refreshWorker->ResumeThread();
+	}
+	void ShowProcesses(const std::vector<_myPROCESSINFO>& processes)
+	{
+		CString details;
+		for (size_t i = 0; i < processes.size(); ++i)
+		{
+			CString line;
+			line.Format(_T("%s  (PID %lu)\r\n"), processes[i].proname, processes[i].pid);
+			details += line;
+		}
+		const UINT count = static_cast<UINT>(processes.size());
+		UpdateProcesses(count, details);
+		const CString warning = Localization::Format(
+			m_timedOut ? _T("exit.timeout") : _T("exit.processes_warning"), count);
+		CString previous;
+		GetDlgItemText(IDC_EXIT_WARNING, previous);
+		if (previous != warning) SetDlgItemText(IDC_EXIT_WARNING, warning);
+	}
+	static UINT RefreshWork(LPVOID context)
+	{
+		CExitCleanupDialog* self = static_cast<CExitCleanupDialog*>(context);
+		try
+		{
+			self->m_refreshSucceeded = self->m_page->GetRunningHookedProcesses(self->m_refreshProcesses);
+		}
+		catch (...) { self->m_refreshSucceeded = FALSE; }
+		return 0;
+	}
 	void StartCleanup()
 	{
+		// A snapshot started before this round must never replace its result
+		// or trigger an automatic exit after the round times out.
+		m_discardRefresh = m_refreshWorker != NULL;
+		m_emptySnapshot = false;
 		GetDlgItem(IDOK)->EnableWindow(FALSE);
 		GetDlgItem(IDC_EXIT_TERMINATE)->EnableWindow(FALSE);
 		SetDefID(IDCANCEL);
@@ -128,16 +205,8 @@ private:
 		}
 		if (result.status == ExitProcessCleanup::TimedOut)
 		{
-			CString remaining;
-			for (size_t i = 0; i < result.processes.size(); ++i)
-			{
-				CString line;
-				line.Format(_T("%s  (PID %lu)\r\n"), result.processes[i].proname, result.processes[i].pid);
-				remaining += line;
-			}
-			UpdateProcesses(static_cast<UINT>(result.processes.size()), remaining);
-			SetDlgItemText(IDC_EXIT_WARNING, Localization::Format(_T("exit.timeout"),
-				static_cast<UINT>(result.processes.size())));
+			m_timedOut = true;
+			ShowProcesses(result.processes);
 			SetDlgItemText(IDC_EXIT_TERMINATE, Localization::Get(_T("exit.continue")));
 			SetDlgItemText(IDCANCEL, Localization::Get(_T("exit.return")));
 			GetDlgItem(IDOK)->EnableWindow(TRUE);
@@ -166,6 +235,13 @@ private:
 		return 0;
 	}
 	CPage3* m_page;
+	CWinThread* m_refreshWorker = NULL;
+	std::vector<_myPROCESSINFO> m_refreshProcesses;
+	BOOL m_refreshSucceeded = FALSE;
+	DWORD m_lastRefresh = 0;
+	bool m_discardRefresh = false;
+	bool m_emptySnapshot = false;
+	bool m_timedOut = false;
 	CWinThread* m_worker = NULL;
 	HANDLE m_cancel = NULL;
 	DWORD m_started = 0;

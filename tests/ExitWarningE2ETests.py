@@ -146,7 +146,7 @@ def capture_dialog(window, destination):
 
 
 def run(binary_directory, bits, language, capture=False, exit_action='keep', child_exits_first=False,
-        new_process=False, during_termination=False, cleanup_scenario=None):
+        new_process=False, during_termination=False, cleanup_scenario=None, live_refresh=False):
     directory = Path('build/qa/exit-warning-' + uuid.uuid4().hex[:8]).resolve()
     directory.mkdir(parents=True)
     # The Win32 launcher forwards to the x64 GUI on a 64-bit OS.
@@ -184,7 +184,8 @@ Transport=PLAIN
                                  creationflags=subprocess.CREATE_NO_WINDOW)
     record = {'parent_bits': bits, 'language': language, 'exit_action': exit_action,
               'child_exits_first': child_exits_first, 'new_process': new_process,
-              'during_termination': during_termination, 'cleanup_scenario': cleanup_scenario}
+              'during_termination': during_termination, 'cleanup_scenario': cleanup_scenario,
+              'live_refresh': live_refresh}
     try:
         main = wait_for(lambda: next((w for w in windows(owner.pid)
                                      if not USER.GetParent(w)), None), 'main window')
@@ -344,14 +345,48 @@ Transport=PLAIN
                     assert '10' not in text(USER.GetDlgItem(timeout, 1110))
                     assert kernel.DebugActiveProcessStop(debugged_pid)
                     debugged_pid = None
+                elif cleanup_scenario == 'manual':
+                    assert kernel.DebugActiveProcessStop(debugged_pid)
+                    debugged_pid = None
+                    child.wait(timeout=10)
+                    wait_for(lambda: 'PID %d)' % child.pid not in text(USER.GetDlgItem(timeout, 1111)),
+                             'timeout list removes exited child')
+                    assert owner.poll() is None
+                    for arrival in arrivals:
+                        assert 'PID %d)' % arrival.pid in text(USER.GetDlgItem(timeout, 1111))
+                    assert ('%d' % len(arrivals)) in text(USER.GetDlgItem(timeout, 1110))
+                    for arrival in arrivals:
+                        arrival.terminate()
+                        arrival.wait(timeout=10)
                 else:
                     dismiss(timeout, 1)
                 owner.wait(timeout=10)
                 for arrival in arrivals:
-                    if cleanup_scenario == 'continue':
+                    if cleanup_scenario in ('continue', 'manual'):
                         arrival.wait(timeout=10)
                     else:
                         assert arrival.poll() is None, 'Exit only must leave the remaining processes alive'
+        elif live_refresh:
+            original_rect = window_rect(orphan)
+            late = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(180)'],
+                                    creationflags=subprocess.CREATE_NO_WINDOW)
+            attach(directory, 64, late.pid, pipe)
+            wait_for(lambda: 'PID %d)' % late.pid in text(USER.GetDlgItem(orphan, 1111)),
+                     'newly proxied process appears without reopening')
+            assert window_rect(orphan) == original_rect
+            # The user closes the first application while the dialog stays open.
+            child.terminate()
+            child.wait(timeout=10)
+            wait_for(lambda: 'PID %d)' % child.pid not in text(USER.GetDlgItem(orphan, 1111)),
+                     'closed application removed from list')
+            assert owner.poll() is None and late.poll() is None
+            assert 'PID %d)' % late.pid in text(USER.GetDlgItem(orphan, 1111))
+            assert '1' in text(USER.GetDlgItem(orphan, 1110))
+            assert window_rect(orphan) == original_rect
+            late.terminate()
+            late.wait(timeout=10)
+            owner.wait(timeout=10)  # No button click after the last application exits.
+            record['automatic_exit_after_manual_close'] = True
         elif new_process or during_termination:
             # The button rescans: a process attached after the preview must end too.
             late = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(180)'],
@@ -367,7 +402,8 @@ Transport=PLAIN
                 wait_for(lambda: any('proxylanehook64.dll' in m.path.lower()
                                     for m in psutil.Process(late.pid).memory_maps()), 'late DLL')
                 time.sleep(1)
-                assert 'PID %d)' % late.pid not in text(USER.GetDlgItem(orphan, 1111))
+                wait_for(lambda: 'PID %d)' % late.pid in text(USER.GetDlgItem(orphan, 1111)),
+                         'late process appears in refreshed list')
                 start_cleanup(orphan)
             child.wait(timeout=10)
             late.wait(timeout=10)
@@ -398,7 +434,9 @@ Transport=PLAIN
             if child_exits_first:
                 child.terminate()
                 child.wait(timeout=10)
-            if exit_action == 'terminate':
+            if child_exits_first:
+                owner.wait(timeout=10)  # The refreshed empty list closes automatically.
+            elif exit_action == 'terminate':
                 # A fast exit must not show a transient cleaning message or a
                 # separate progress window, including the final quiet period.
                 original_warning = text(USER.GetDlgItem(stopped, 1110))
@@ -475,9 +513,11 @@ if __name__ == '__main__':
     parser.add_argument('--new-process', action='store_true', help='Attach a new process during confirmation')
     parser.add_argument('--during-termination', action='store_true',
                         help='Attach a new process after the first termination batch')
-    parser.add_argument('--cleanup-scenario', choices=('continue', 'exit', 'cancel'),
+    parser.add_argument('--live-refresh', action='store_true',
+                        help='Check live additions/removals and automatic exit after manual closes')
+    parser.add_argument('--cleanup-scenario', choices=('continue', 'exit', 'cancel', 'manual'),
                         help='Hold an owned process exit to check timeout choices and UI responsiveness')
     arguments = parser.parse_args()
     run(arguments.bin.resolve(), arguments.bits, arguments.language, arguments.capture,
         arguments.exit_action, arguments.child_exits_first, arguments.new_process,
-        arguments.during_termination, arguments.cleanup_scenario)
+        arguments.during_termination, arguments.cleanup_scenario, arguments.live_refresh)

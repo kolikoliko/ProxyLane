@@ -182,7 +182,7 @@ public:
 	void OnPageActivated();
 	int UpdatePslist(BOOL bRefresh);
 	BOOL ProxyProcess(DWORD dwPid);
-	void GetRunningHookedProcesses(std::vector<_myPROCESSINFO>& processes);
+	BOOL GetRunningHookedProcesses(std::vector<_myPROCESSINFO>& processes);
 
 	void OnDropAppFile(TCHAR *pFileName);
 	AppLaunchResult LaunchAndProxyApp(

@@ -477,8 +477,9 @@ static BOOL GetSnapshotProcessStartTimes(std::map<DWORD, ULONGLONG>& startTimes)
 	return !startTimes.empty();
 }
 
-int GetProcessList(list<_myPROCESSINFO> &ls)
+int GetProcessList(list<_myPROCESSINFO> &ls, BOOL* complete = NULL)
 {
+	if (complete) *complete = FALSE;
 	int nCount = 0;
 	PROCESSENTRY32 pe;
 	DWORD dwRet;
@@ -533,6 +534,7 @@ int GetProcessList(list<_myPROCESSINFO> &ls)
 			nCount++;
 		}
 
+		if (complete) *complete = GetLastError() == ERROR_NO_MORE_FILES;
 		::CloseHandle(hSP);
 	}
 
@@ -544,12 +546,13 @@ void CPage3::OnHookWsock(LPHookWSockResult)
 	// The pipe server updates the shared registry before notifying observers.
 }
 
-void CPage3::GetRunningHookedProcesses(std::vector<_myPROCESSINFO>& processes)
+BOOL CPage3::GetRunningHookedProcesses(std::vector<_myPROCESSINFO>& processes)
 {
 	processes.clear();
-	if (!m_processRegistry) return;
+	if (!m_processRegistry) return FALSE;
 	std::list<_myPROCESSINFO> current;
-	GetProcessList(current);
+	BOOL complete = FALSE;
+	GetProcessList(current, &complete);
 	for (std::list<_myPROCESSINFO>::const_iterator it = current.begin();
 		it != current.end(); ++it)
 	{
@@ -558,6 +561,7 @@ void CPage3::GetRunningHookedProcesses(std::vector<_myPROCESSINFO>& processes)
 			identity.hookState == PROCESS_HOOK_STATE_SUCCEEDED)
 			processes.push_back(*it);
 	}
+	return complete;
 }
 
 BOOL InjectDll2(HANDLE hProc, DWORD dwPid, DWORD dwTid, LPCSTR lpszPipeName)

@@ -42,6 +42,7 @@ protected:
 	}
 	void UpdateProcesses(UINT count, const CString& processes)
 	{
+		if (m_count == count && m_processes == processes) return;
 		m_count = count;
 		m_processes = processes;
 		// Keep the existing rectangle even if the number of survivors changes.
