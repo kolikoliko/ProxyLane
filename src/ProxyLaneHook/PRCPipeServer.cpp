@@ -5,6 +5,7 @@
 
 #include "stdafx.h"
 #include "PRCPipeServer.h"
+#include "BrowserQuicPolicy.h"
 #include "GlobalProxy.h"
 #include "ProxyReceptionCentre.h"
 #include "token.h"
@@ -94,6 +95,7 @@ CPRCPipeServer::CPRCPipeServer(CProxyReceptionCentre *pPRC)
 CPRCPipeServer::~CPRCPipeServer(void)
 {
 	ShutdownServer();
+    BrowserQuicPolicy::Forget(m_pPRC);
 }
 
 
@@ -391,8 +393,18 @@ DWORD WINAPI CPRCPipeServer::_InstanceThread(HANDLE hPipe, HANDLE hThread)
 
 		switch(hdr.action)
 		{
+        case PRCPD_QUIC_STATUS:
+        {
+            BrowserQuicPolicy::Report r={};
+            if(!pipeClientPid||hdr.flag!=1||hdr.dataSize!=sizeof(r)||!ReadPipe(hPipe,&r,sizeof(r)))goto SEC_ERROR;
+            BrowserQuicPolicy::Observe(m_pPRC,pipeClientPid,r);
+            hdr.action=PRCPD_REPLY;hdr.flag=1;hdr.dataSize=0;
+            if(!WritePipe(hPipe,&hdr,sizeof(hdr)))goto SEC_ERROR;
+            break;
+        }
 		case PRCPD_GETSTARTUPINFO:
 			{
+				const bool extended=hdr.flag==2;
 				PRCINFO info;
 				if (!m_pPRC->GetStartupInfo(&info))
 					goto SEC_ERROR;
@@ -400,12 +412,17 @@ DWORD WINAPI CPRCPipeServer::_InstanceThread(HANDLE hPipe, HANDLE hThread)
 				//先写协议头
 				hdr.action = PRCPD_REPLY;
 				hdr.flag = 1;// means true
-				hdr.dataSize = sizeof(info); //协议头后面的数据长度
+				hdr.dataSize = sizeof(info)+(extended?sizeof(DWORD):0); // versioned startup extension
 				if (! WritePipe(hPipe, &hdr, sizeof(hdr)))
 					goto SEC_ERROR;
 				//写数据
 				if (! WritePipe(hPipe, &info, sizeof(info)))
 					goto SEC_ERROR;
+                if(extended) {
+                    ProxySettingsInfo settings={};m_pPRC->GetProxySettingsInfo(&settings);
+                    DWORD policy=BrowserQuicPolicy::Preference()&&settings.bHookUDP&&!settings.bBlockUDP?1:0;
+                    if(!WritePipe(hPipe,&policy,sizeof(policy)))goto SEC_ERROR;
+                }
 
 			}
 			break;
@@ -423,7 +440,11 @@ DWORD WINAPI CPRCPipeServer::_InstanceThread(HANDLE hPipe, HANDLE hThread)
 				if (pipeClientPid && client.dwPid != pipeClientPid)
 					goto SEC_ERROR;
 
-				//将数据注册到PRC
+				if(client.sType==SOCK_DGRAM && pipeClientPid) {
+                    BrowserQuicPolicy::Report r={client.processCreateTime,client.reserved,0};
+                    BrowserQuicPolicy::Observe(m_pPRC,pipeClientPid,r);
+                }
+                //将数据注册到PRC
 				if (! m_pPRC->RegisterClient(&client))
 				{
 					DWORD registrationError = WSAGetLastError();
@@ -753,6 +774,12 @@ DWORD WINAPI CPRCPipeServer::_InstanceThread(HANDLE hPipe, HANDLE hThread)
 
 			m_pPRC->m_pGlobalProxy->GetLogInstance()->OnHookLogtext(textinfo);
 			free(textinfo);
+            // Optional acknowledgment for short-lived diagnostic clients.
+            // Existing flag=0 clients keep the original one-way log protocol.
+            if(hdr.flag==1) {
+                hdr.action=PRCPD_REPLY;hdr.dataSize=0;
+                if(!WritePipe(hPipe,&hdr,sizeof(hdr)))goto SEC_ERROR;
+            }
 
 		}
 		break;

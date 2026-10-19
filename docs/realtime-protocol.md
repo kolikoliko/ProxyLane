@@ -1,6 +1,6 @@
 # 实时协议还原接入（开发验证版）
 
-开启 ProxyLane 的“解密 HTTPS”后，新建 MITM 连接的完整 TLS 明文自动送入 Rust 协议分析后台；不依赖“开始监视”，不依赖 GUI 截断的日志。数据监视页提供简单的会话列表和详情视图，没有 Web 服务。勾选“开始监视”后，新连接的普通 TCP 通过独立被动 tap 接入同一后台，不初始化 CA；MITM 的非 TLS 透传也接入。
+“开始监视”是采集的统一入口；HTTPS 和 QUIC 解密均是默认关闭的选项，保存后在开始监视时校验 CA 和模块依赖。停止监视同时停止新连接解密、明文采集、协议分析和缓存写入，但已经接管的 TLS/QUIC 连接继续转发，旧连接不会在重新开始监视时恢复采集。流量监视页提供简单的会话列表和详情视图，没有 Web 服务。
 
 ## 数据链路
 
@@ -150,8 +150,8 @@ python tests/MonitorTrafficE2ETests.py
 - 界面中的 MITM 选项集中提供当前用户 CA 信任管理和目标服务器证书校验开关。默认严格校验；跳过选项保存在程序旁 `ProxyLane.ini` 的 `[options] MitmSkipUpstreamVerify=0/1`，启动时恢复，由新 TLS 会话快照，仍验证 TLS 握手签名和记录完整性。它不改变客户端对 ProxyLane CA 的信任要求。
 - 开启解密或监视时，对本实例尚未接入相应采集的 TCP 连接提供断开、仅新连接、取消。任务管理器先标记快照，CA/监视准备成功后才提交；网络线程的任务定时器负责断开。新任务不继承标记，失败或取消清除快照。
 - 无载荷的 TCP/TLS 连接也发布连接状态。列表以首个实际请求/流替换连接占位记录并保留序号，不为后续关闭事件增加重复行。握手失败保留错误信息，载荷区留空。
-- DNS 列表显示查询域名，详情上方保留 DNS 服务器地址和端口。DoH GET 的 dns 参数与 POST/响应的 application/dns-message 正文使用现有 DNS 解析器；正文先通过原有缓存解压，再解析 DNS。DoH 保留 HTTP 状态、头与请求归属，HexView 仍显示头和实际载荷字节。HTTP/3 应用数据解密不在此实现范围内。
-- 内部 MITM DLL ABI 升为 7，补充 TCP 建立结果通知；Hook 对外导出不变。选项通过已有 QueryProtocol 接口传递。
+- DNS 列表显示查询域名，详情上方保留 DNS 服务器地址和端口。DoH GET 的 dns 参数与 POST/响应的 application/dns-message 正文使用现有 DNS 解析器；正文先通过原有缓存解压，再解析 DNS。DoH 保留 HTTP 状态、头与请求归属，HexView 仍显示头和实际载荷字节。HTTP/3 通过下述 QUIC 入口接入相同的缓存和 DoH 还原。
+- 内部 MITM DLL ABI 升为 8，补充 TCP 建立结果通知；Hook 对外导出不变。选项通过已有 QueryProtocol 接口传递。
 
 同目录程序共用 ini；32 位程序保留但不应用这一配置项。修改立即保存，其他已运行实例不自动同步；写入失败会恢复当前实例原值并提示错误。
 
@@ -175,10 +175,35 @@ GUI 的 MITM 选项新增九项参数，保存到程序旁 `ProxyLane.ini` 的 `
 
 显示设置保存后立即生效。缓存和还原配置在下一次开始监视时应用：只有配置确实变化才关闭旧分析运行、清理旧载荷并在新连接到来时创建新运行；旧连接的转发不受影响，完整采集仍需新连接。
 GUI 的配置保存先校验整个配置，再一次写入专用 ini 段，最后提交后台；关闭窗口不提交尚未保存的数值。
-已有证书校验复选框继续即时保存到 `[options] MitmSkipUpstreamVerify`。
+证书校验复选框在“保存并关闭”时保存到 `[options] MitmSkipUpstreamVerify`，取消不保存本次选项修改。
 
 按需解压的输入另受 `min(EntryMiB, 64 MiB)` 保护；解压完整性和输出上限检查成功后只向 GUI 返回显示前缀及实际解码字节数，避免把最多 64 MiB 的正文转换成巨大的 JSON 回包。
 原始缓存读取单次最多 1 MiB；后台常驻的编码/解码预览仍各限 64 KiB。
 缓存大小不是整个进程的内存预算。缓存索引容量随列表配置扩展，内部事件队列与解析器防护限制仍由程序管理。
 
 32 位主程序不加载 MITM 或 SecureTransport 模块，保留普通代理功能；已有 MITM 设置保留但不应用，加密代理配置拒绝启动而不降级为明文。64 位主程序使用两种位数的 Hook 处理 32/64 位目标进程。
+
+
+## QUIC / HTTP/3 实验接入
+
+QUIC 数据入口位于 `CUdpProxyTask` / `CQuicBridge`，不按进程名或端口筛选。检查经过认证的 QUIC Initial，本实例最多保留 256 个候选/活动桥，每个候选最多保留 64 KiB / 64 个报文并等待 5 秒，重组 ClientHello 后仅接管当前支持的 QUIC v1、ALPN h3。其他协议及无法确认的握手保留原始数据按原路转发，不将 UDP 443 当作充分依据。无 SNI 时仅允许以明确的 IP 目标签发 IP SAN 证书。
+
+Rust `quic_live` 使用 quinn / rustls 和 h3 / h3-quinn 终止两端连接。抽象 UDP socket 的所有报文回到原有 NOPROXY / SOCKS5 路由，不另外发起系统 DNS 或直连绕过代理。每方向收、发队列各限 512 KiB，单连接收/发窗口各限 1 MiB；当前 QUIC 桥数量受 Connections 限制，单连接并行请求受 PendingRequests 限制。HTTP/3 头和 DATA 送入既有带代次的观察队列，经 `ProxyLaneProtocol::http3::Capture` 使用原缓存、解压和 DoH 逻辑。列表显示 QUIC/HTTP/3，保留 PID、进程创建时间、socket 代次、连接及 stream ID。
+
+`[options] DecryptQUIC=0/1` 默认关闭。首次注入时通过既有 PRC 启动消息的可选扩展读取，禁止 UDP 或未接管 UDP 时兼容逻辑不启用。重复注入、重新绑定 PRC、停止监视与修改选项不改变首次决定；必须重新运行目标应用。普通系统证书校验仍保留，不限定只信任 ProxyLane CA。
+
+兼容层不按 EXE 名称或 NetworkService 角色筛选。KernelBase 的 LoadLibraryExW 入口仅记录 chrome.dll / msedge.dll 模块提示；数据文件加载不触发，加载回调不定位、不通信、不装 Hook。首次及后续允许接管的 UDP 发送会补查模块，覆盖已加载模块和绕过 LoadLibraryExW 的加载方式。TCP、单纯 UDP connect、被禁止或绕过代理的 UDP 不启动安装。普通应用没有候选模块便直接继续。
+
+目标进程自己的后台任务加载同目录 ProxyLaneMitm64.dll，读取自身已加载映像的有界快照并调用 Rust 内存定位器。使用字符串交叉引用、指令结构和异常展开边界唯一定位 ShouldAllowUnknownRootForHost；无固定版本、偏移、厂商签名或整文件 SHA。安装前仍核对两段小函数的快照摘要及调用位置，避免代码变化后错误写入。仅从识别的证书完成分支放行；找不到或存在歧义时保守放弃。该过程不初始化 CA、采集缓存或网络运行时。安装后保留模块和 Hook 至目标退出。
+
+第一次 UDP 注册携带 None/Pending/Ready/Unavailable 状态，已注册的 connected UDP 在发送前通过原管道报告状态，后台任务再报告完成结果。PRC 只维护有界、按实例及 PID/创建时间隔离的状态表，无浏览器轮询、远程定位或额外远程初始化线程。仅明确 Pending 的新 QUIC 在发出 MITM 握手前异步等待，截止时间从首包计时，最多 2 秒；没有报告不是 Pending，普通应用不等待。超时、失败或队列超限恢复普通代理转发，该路由不再切换 MITM。非 QUIC UDP 不等待。最多 128 个待接管队列，每队列常规上限 64 KiB / 64 包，所有暂存 Initial 数据合计硬上限 8 MiB；超出预算的新报文直接普通转发，不继续等待。总桥数上限仍为 256。
+
+停止监视停止新增解密和采集，已接管连接继续转发，兼容 Hook 不撤回。新的目标进程经过普通注入后按当时配置重新初始化。不能保证所有机器、所有新版本在等待期限内完成定位；超时优先保持通信。
+
+### 当前边界
+
+- 通用入口不等于所有 QUIC 应用协议均已实现：目前还原 HTTP/3，其他 ALPN 保持原路转发；不提供通用自定义 QUIC stream、WebTransport、QUIC DATAGRAM 或连接迁移的语义代理。
+- 当前一个 UDP 路由只接管一条 QUIC 连接，不支持同一 socket 同时承载多条独立连接。
+- 不接受 0-RTT，不复用目标服务器票据；真实 ECH、客户端证书认证、证书固定和独立信任库仍可能无法解密。未知版本浏览器的兼容 Hook 也可能不可用。
+- 既有 UDP 透明路由对部分未连接 socket 的异步 recvfrom 会暴露本地回包源端口。严格检查对端地址的 aioquic 默认客户端已复现丢弃回包；正常 connected UDP 客户端已验证。此问题属于原 UDP Hook 的收包地址兼容性缺口，不能用通过浏览器测试来掩盖。
+- 自动化测试在 `tests/e2e/quic_live_*`，测试宿主和结果位于 `build/quic-live`，不进入 bin。测试不修改证书信任、浏览器策略或用户配置文件。

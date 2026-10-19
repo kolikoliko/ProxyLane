@@ -2,6 +2,7 @@
 //! Optional bounded temporary payload storage; no TLS or socket interception.
 pub mod cache;
 pub mod dns;
+pub mod http3;
 mod cache_directory;
 mod decode;
 mod hpack_guard;

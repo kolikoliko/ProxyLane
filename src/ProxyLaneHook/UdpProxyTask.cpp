@@ -11,6 +11,7 @@
 #include "UdpAssociationPolicy.h"
 #include "ProxyReceptionCentre.h"
 #include "MitmBridge.h"
+#include "QuicBridge.h"
 
 static const DWORD UDP_ASSOCIATION_IDLE_TIMEOUT = 5 * 60 * 1000;
 
@@ -420,6 +421,9 @@ VOID CUdpProxyTask::OnServerWritable()
 	// packet queued during synchronous activation. The peer's receive buffer
 	// is still populated on that call stack; resending it duplicates traffic.
 	FlushPendingReplies();
+    // Wake asynchronously: direct activation can call us from inside PumpQuic,
+    // before its current datagram is consumed. Never reenter that drain.
+    for(auto& route:m_routes) if(route.quic && route.peer)route.peer->TriggerEvent(FD_WRITE);
 }
 
 VOID CUdpProxyTask::OnMaintenanceTimer()
@@ -532,6 +536,22 @@ VOID CUdpProxyTask::WakeServerAssociation()
 VOID CUdpProxyTask::OnRouteWritable(CPRCUdpPeer *routePeer)
 {
 	FlushPendingReplies(routePeer);
+    for(auto& route:m_routes) if(route.peer==routePeer && route.quic) PumpQuic(route);
+}
+void CUdpProxyTask::PumpQuic(UdpRoute& route) {
+    char data[65536];
+    for(unsigned side=0;side<2;++side) for(unsigned n=0;n<64;++n) {
+        int length=route.quic->Peek(side,data,sizeof(data));if(length<=0)break;
+        BOOL ok=side ? ForwardUpstreamDatagram(route.quicTarget,data,length) : DeliverServerDatagram(route,data,length);
+        if(!ok)break;
+        if(route.quic->Passthrough() && CProtocolTap::Enabled()) {
+            if(!route.capture)route.capture=std::make_shared<CProtocolTap>(route.client,true);
+            route.capture->Data(0,data,length);
+        }
+        route.quic->Consume(side);m_lastActivity=GetTickCount();
+        if(n==63)route.peer->TriggerEvent(FD_WRITE);
+    }
+    if(route.quic->Drained())route.quic.reset();
 }
 
 BOOL CUdpProxyTask::ForwardClientDatagram(CPRCUdpPeer *routePeer,
@@ -546,21 +566,28 @@ BOOL CUdpProxyTask::ForwardClientDatagram(CPRCUdpPeer *routePeer,
 	{
 		if (it->peer == routePeer)
 		{
-			if (!CProtocolTap::Enabled()) it->capture.reset();
-			else if (!it->capture) it->capture = std::make_shared<CProtocolTap>(it->client, true);
-			if (it->capture) it->capture->Data(0, data, length);
 			it->applicationEndpoint = application;
 			it->hasApplicationEndpoint = TRUE;
+            if(it->quic) {bool retained=it->quic->Feed(0,data,length);PumpQuic(*it);return retained?TRUE:ForwardUpstreamDatagram(target,data,length);}
 			if (!it->firstDatagramLogged)
 			{
 				it->firstDatagramLogged = TRUE;
 				LogUdpFirstDatagram(m_pTaskmgr->m_pPRC, &it->client,
 					&m_ProxyInfo);
+                it->quicTarget=target;
+                it->quic=CQuicBridge::Open(this,routePeer,it->client,data,length);
+                if(it->quic) {PumpQuic(*it);return TRUE;}
 			}
+            if (!CProtocolTap::Enabled()) it->capture.reset();
+            else if (!it->capture) it->capture = std::make_shared<CProtocolTap>(it->client, true);
+            if (it->capture) it->capture->Data(0, data, length);
 			break;
 		}
 	}
 
+    return ForwardUpstreamDatagram(target,data,length);
+}
+BOOL CUdpProxyTask::ForwardUpstreamDatagram(CPRCUdpPeer::_CSAddrInfo target,const char* data,int length) {
 	if (UdpAssociationPolicy::ShouldActivateUpstream(m_upstreamState))
 	{
 		BOOL queued = QueueDatagram(target, data, length);
@@ -633,9 +660,14 @@ BOOL CUdpProxyTask::ForwardServerDatagram(_SockAddr source,
 	if (!selected)
 		return FALSE;
 	m_lastActivity = GetTickCount();
+	if(selected->quic) {selected->quic->Feed(1,data,length);PumpQuic(*selected);return TRUE;}
 
 	if (!CProtocolTap::Enabled()) selected->capture.reset();
 	if (selected->capture) selected->capture->Data(1, data, length);
+    return DeliverServerDatagram(*selected,data,length);
+}
+BOOL CUdpProxyTask::DeliverServerDatagram(UdpRoute& route,const char* data,int length) {
+    UdpRoute* selected=&route;
 	_SockAddr application = selected->hasApplicationEndpoint ?
 		selected->applicationEndpoint : selected->client.srcAddr;
 	if (application.IsAny())

@@ -9,6 +9,8 @@
 #include "MitmControl.h"
 #include "ProxyMonitor.h"
 #include "PlatformSupport.h"
+#include "QuicBridge.h"
+#include "BrowserQuicPolicy.h"
 #include <atomic>
 #include <mutex>
 #include <algorithm>
@@ -18,6 +20,7 @@ namespace {
     std::mutex moduleLock, monitorControlLock;
     std::atomic<int> enabledMode(-1);
     std::atomic<bool> streamMonitoring(false);
+    std::atomic<bool> quicEnabled(false);
     std::atomic<ULONGLONG> connectionSequence(0);
     std::atomic<PLM_PROTOCOL_FN> protocolQuery(NULL);
     // Kept loaded for process lifetime: the Rust context owns the CRL listener.
@@ -37,7 +40,7 @@ namespace {
         if (module) {
             PLM_VERSION_FN version = (PLM_VERSION_FN)GetProcAddress(module, "plm_abi_version");
             bool complete = version && version() == PLM_ABI_VERSION;
-            for (auto name : {"plm_create","plm_io","plm_error","plm_free","plm_observe","plm_stream_open","plm_stream_io"})
+            for (auto name : {"plm_create","plm_io","plm_error","plm_free","plm_observe","plm_stream_open","plm_stream_io","plm_quic_open","plm_quic_io","plm_quic_inspect"})
                 complete = complete && GetProcAddress(module,name)!=NULL;
             if (complete)
                 protocolQuery.store((PLM_PROTOCOL_FN)GetProcAddress(module, "plm_protocol"));
@@ -56,6 +59,8 @@ namespace {
         return CStringA(buffer);
     }
 }
+HMODULE ProxyMitmModule() {return LoadMitm();}
+bool ProxyQuicEnabled() {return quicEnabled.load() && streamMonitoring.load();}
 
 CMitmControl& CMitmControl::Instance()
 {
@@ -101,6 +106,18 @@ int CMitmControl::QueryProtocol(const char* request, char* output, size_t capaci
         return -1;
     }
     auto command = nlohmann::json::parse(request ? request : "", nullptr, false);
+    if(command.is_object() && command.value("type",nlohmann::json())=="monitor_status") {
+        auto reply=nlohmann::json{{"monitoring",streamMonitoring.load()},{"quic",quicEnabled.load()}}.dump();
+        if(output&&capacity>reply.size())memcpy(output,reply.c_str(),reply.size()+1);return (int)reply.size()+1;
+    }
+    if(command.is_object() && command.value("type",nlohmann::json())=="quic_injection_policy") {
+        if(command.contains("enabled")) {
+            if(!command["enabled"].is_boolean())return -1;
+            BrowserQuicPolicy::SetPreference(command["enabled"].get<bool>());
+        }
+        auto reply=nlohmann::json{{"enabled",BrowserQuicPolicy::Preference()}}.dump();
+        if(output&&capacity>reply.size())memcpy(output,reply.c_str(),reply.size()+1);return (int)reply.size()+1;
+    }
     const bool start = command.is_object() && command.value("type", nlohmann::json()) == "monitor_start";
     const bool stop = command.is_object() && command.value("type", nlohmann::json()) == "monitor_stop";
     if (start || stop) {
@@ -109,9 +126,13 @@ int CMitmControl::QueryProtocol(const char* request, char* output, size_t capaci
             // Existing bridges keep their TLS state; only new connections stop MITM.
             enabledMode.store(0);
             streamMonitoring.store(false);
+            quicEnabled.store(false);
         }
         bool decrypt = IsEnabled() != FALSE; // Compatibility for internal callers without a mode.
         if (start) {
+            if(command.contains("quic") && !command["quic"].is_boolean()) {
+                if(output&&capacity)_snprintf_s(output,capacity,_TRUNCATE,"Invalid QUIC decryption option.");return -1;
+            }
             if (command.contains("decrypt")) {
                 if (!command["decrypt"].is_boolean()) {
                     if (output && capacity) _snprintf_s(output,capacity,_TRUNCATE,"Invalid HTTPS decryption option.");
@@ -125,6 +146,9 @@ int CMitmControl::QueryProtocol(const char* request, char* output, size_t capaci
                 if (output && capacity) _snprintf_s(output, capacity, _TRUNCATE, "Cannot load compatible protocol module.");
                 return -1;
             }
+            if(command.value("quic",false)) {
+                if(ManageCA(PrepareCA,output,capacity)<0 || protocolQuery.load()("{\"type\":\"quic_prepare\"}",output,capacity)<0)return -1;
+            }
         }
         PLM_PROTOCOL_FN query = protocolQuery.load();
         if (query && (stop || !streamMonitoring.load())) {
@@ -134,7 +158,7 @@ int CMitmControl::QueryProtocol(const char* request, char* output, size_t capaci
                 return -1;
             }
         }
-        if (start) { enabledMode.store(decrypt ? 1 : 0); streamMonitoring.store(true); }
+        if (start) { enabledMode.store(decrypt ? 1 : 0); quicEnabled.store(command.value("quic",false));streamMonitoring.store(true); }
         const char reply[] = "{\"type\":\"monitor\"}";
         if (output && capacity >= sizeof(reply)) memcpy(output, reply, sizeof(reply));
         return sizeof(reply);
@@ -148,6 +172,7 @@ int CMitmControl::QueryProtocol(const char* request, char* output, size_t capaci
 }
 void CMitmControl::ShutdownProtocol()
 {
+    quicEnabled.store(false);
     PLM_PROTOCOL_FN query = protocolQuery.load();
     if (!query) return; // Do not load Rust merely to shut down an unused service.
     char error[1024] = {};

@@ -2,6 +2,8 @@
 
 #include "structinfo.h"
 
+namespace BrowserQuicPolicy { struct Report; }
+
 class CPRCPipeClient
 {
 public:
@@ -16,7 +18,8 @@ public:
 	BOOL WritePipe(LPCVOID lpBuf, int size);
 	BOOL ReadPipe(LPVOID lpBuf, int size);
 
-	BOOL GetPRCStartupInfo(LPPRCINFO lpStartupInfo);
+	BOOL GetPRCStartupInfo(LPPRCINFO lpStartupInfo, bool* quicPolicy = NULL);
+	BOOL PRCReportQuicStatus(const BrowserQuicPolicy::Report& report);
 
 	BOOL PRCRegisterClient(LPPRCClient lpClientInfo);
 

@@ -1,4 +1,4 @@
-{
+﻿{
   "exit.processes_title": "Proxied processes are still running",
   "exit.processes_warning": "Processes managed by this ProxyLane session that are still running: %u.\nIf you exit ProxyLane only, these applications' network connections will be interrupted, but some subsequent network activity may connect directly without using the proxy.",
   "exit.return": "Go back",
@@ -168,7 +168,7 @@
   "page3.completed": "Operation Complete",
   "page4.title": "Traffic Monitor",
   "page4.monitor": "Start monitoring",
-  "page4.monitor_decrypt": "Start monitoring with HTTPS decryption",
+  "page4.monitor_decrypt": "Start monitoring (decrypt HTTPS)",
   "page4.hex": "Show HEX",
   "page4.connections_zero": "TCP: 0    UDP: 0",
   "page4.connections": "TCP: %d    UDP: %d",
@@ -279,7 +279,7 @@
   "dialog.drop_failed_title": "Cannot Start Through Proxy",
   "automation.command_line_help_title": "ProxyLane Command-Line Help",
   "automation.command_line_help": "Usage\r\n\r\nStart an application through the transparent proxy:\r\nProxyLane.exe --auto --profile <profile name> --run <application path> [-- <application arguments...>]\r\n\r\nShow this help:\r\nProxyLane.exe /?\r\n\r\nOptions\r\n--auto       Use command-line automation mode.\r\n--profile    Select a saved profile.\r\n--run        Select the application to start through the proxy.\r\n--           Pass all remaining arguments to the application.\r\n/?, -?, --help    Show this help.\r\n\r\nExample\r\nProxyLane.exe --auto --profile \"Test\" --run \"C:\\Tools\\app.exe\" -- -arg value\r\n\r\nAn existing instance with the same installation, user session, and profile is reused.",
-  "mitm.ca": "HTTPS decryption options",
+  "mitm.ca": "Decryption options",
   "mitm.legacy_unavailable": "MITM and protocol monitoring are unavailable on Windows XP / Server 2003. Proxy features remain available.",
   "mitm.enable": "Decrypt HTTPS",
   "mitm.busy": "Preparing CA / TLS, please wait…",
@@ -290,8 +290,8 @@
   "mitm.refresh": "View details",
   "mitm.close": "Cancel",
   "mitm.trusted": "CA trusted by the current Windows user.",
-  "mitm.untrusted": "HTTPS decryption requires installing the CA certificate for the current Windows user. Click “Trust for this user”.",
-  "mitm.uninitialized": "HTTPS decryption requires installing the CA certificate for the current Windows user. Click “Trust for this user” to initialize and install it.",
+  "mitm.untrusted": "HTTPS / QUIC decryption requires installing the CA certificate for the current Windows user. Click “Trust for this user”.",
+  "mitm.uninitialized": "HTTPS / QUIC decryption requires installing the CA certificate for the current Windows user. Click “Trust for this user” to initialize and install it.",
   "mitm.enable_failed": "Cannot enable HTTPS decryption. Check the error below.",
   "monitor.preparing": "Preparing monitoring…",
   "monitor.limits": " · Dropped %I64u / Shortened %I64u / Evicted %I64u",
@@ -348,5 +348,9 @@
   "mitm.x64_required": "Traffic monitoring and HTTPS decryption require 64-bit ProxyLane.",
   "profile.secure_transport_unavailable": "This encrypted profile requires 64-bit ProxyLane on a supported Windows version. Use 64-bit ProxyLane or select a plain proxy profile. The saved encryption settings have not been changed.",
   "monitor.start_failed": "Cannot start monitoring. Check the error below.",
-  "mitm.next_monitor": "Restart monitoring to enable decryption"
+  "mitm.next_monitor": "Restart monitoring to enable decryption",
+  "mitm.quic": "Decrypt QUIC (experimental)",
+  "mitm.quic_hint": "Supports application HTTP/3 traffic on any port. Experimental: attempts to allow Chromium QUIC to accept system-trusted local or enterprise CAs while retaining normal certificate checks. Compatibility remains until the target process exits, even after monitoring stops. Fully exit and restart target applications after changing this option.",
+  "page4.monitor_quic": "Monitor (decrypt QUIC)",
+  "page4.monitor_both": "Monitor (decrypt HTTPS / QUIC)"
 }

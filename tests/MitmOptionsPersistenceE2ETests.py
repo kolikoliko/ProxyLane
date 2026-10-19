@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import time
 import uuid
+import psutil
 from MonitorLayoutE2ETests import u, k, CALLBACK, send, screenshot
 
 def wait(predicate, message):
@@ -28,7 +29,11 @@ def main():
     u.SetProcessDPIAware()
     for pattern in ('ProxyLane*.exe','ProxyLane*.dll'):
         for source in (root/'bin').glob(pattern):shutil.copy2(source,work/source.name)
-    ini=work/'ProxyLane.ini';ini.write_text((root/'examples/ProxyLane.ini').read_text().replace('[options]', '[options]\nlanguage='+args.language),encoding='utf-8')
+    ini=work/'ProxyLane.ini';ini.write_text((root/'examples/ProxyLane.ini').read_text().replace('DecryptHTTPS=1','DecryptHTTPS=0').replace('DecryptQUIC=1','DecryptQUIC=0').replace('[options]', '[options]\nlanguage='+args.language),encoding='utf-8')
+    config=configparser.ConfigParser();config.read(ini,encoding='utf-8-sig')
+    if not config.has_section('mitm'):config.add_section('mitm')
+    config.set('mitm','PreviewKiB','128')
+    with ini.open('w',encoding='utf-8') as output:config.write(output)
     env=dict(os.environ,PROXYLANE_MITM='0',PROXYLANE_MITM_HOME=str(work/'pki'))
     for phase,(expected,new_value,action) in enumerate([
         (False,True,'cancel'),(False,True,'close'),(False,True,'save'),
@@ -44,6 +49,8 @@ def main():
             u.EnumWindows(collect,0);return found
         try:
             main_window=wait(lambda:next((h for h in windows() if u.GetDlgItem(h,0x1006)),None),'main window missing')
+            time.sleep(.7)
+            assert not any(Path(m.path).name.lower()=='proxylanemitm64.dll' for m in psutil.Process(process.pid).memory_maps()),'Saved options must not load MITM on startup'
             nav=u.GetDlgItem(main_window,0x1006);pages=[]
             @CALLBACK
             def find(hwnd,_):

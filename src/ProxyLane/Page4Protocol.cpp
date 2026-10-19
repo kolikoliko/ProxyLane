@@ -55,6 +55,7 @@ struct ProtocolPageData {
     DWORD lastPoll = 0, lastStatus = 0;
     bool baseline = false, rebuilding = false, haveDetail = false;
     bool wasRecording = false;
+    bool finalPoll = false;
     bool columnsInitialized = false;
     CString error;
     std::string rawContext, hexContext, locateContext;
@@ -410,6 +411,7 @@ void CPage4::TickProtocolView() {
     CanFollowLatest();
     auto& state = *m_protocol;
     if (state.wasRecording != m_recording) {
+        state.finalPoll = !m_recording;
         ++state.epoch; state.wasRecording = m_recording;
     }
     if (state.job && state.job->done.load()) {
@@ -436,15 +438,27 @@ void CPage4::TickProtocolView() {
                 }
                 if (!job->batch.rows.empty()) RebuildRequests();
                 if (job->batch.lost || (discarded != state.history.discarded && state.selected.empty())) ShowProtocolDetail();
+                if(!m_recording && !state.selected.empty()) {
+                    state.haveDetail=false;state.displayed.clear();
+                }
             }
-            if (!job->error.empty()) ShowProtocolDetail();
+            if (!job->error.empty()) {
+                if(job->detail && job->key==state.selected) {
+                    state.detail=std::move(job->result);state.haveDetail=true;state.displayed=job->key;
+                }
+                ShowProtocolDetail();
+            }
         }
     }
-    if (state.job) return;
+    if (state.job || m_stopJob) return;
     const DWORD now = GetTickCount();
     bool statusOnly = state.haveDetail && state.selected == state.displayed;
-    bool detail = !state.selected.empty() && m_requests.IsWindowVisible() &&
-        (!statusOnly || now - state.lastStatus >= 2000);
+    bool detail = !state.finalPoll && !state.selected.empty() && m_requests.IsWindowVisible() &&
+        (!statusOnly || (m_recording && now - state.lastStatus >= 2000));
+    // Stopped history remains readable on demand. Drain the final results once
+    // after stop completes, but never poll an idle page or repeatedly re-read
+    // an unchanged historical selection (including while the page is hidden).
+    if (!m_recording && !detail && !state.finalPoll) return;
     if (!detail && !state.baseline && now - state.lastPoll < 500) return;
     auto job = std::make_shared<Job>(); job->epoch = state.epoch; job->detail = detail; job->key = state.selected;
     ProtocolView::Row selected;
@@ -453,15 +467,16 @@ void CPage4::TickProtocolView() {
     }
     auto query = QueryFor(m_tls);
     const auto run = state.run; const auto after = state.next;
-    const bool baseline = state.baseline || !m_recording;
+    const bool baseline = state.baseline;
+    const bool finalPoll = !m_recording && state.finalPoll && !detail;
     job->baseline = baseline;
     const auto cacheStamp = state.detail.cacheStamp;
     const auto previewLimit=state.previewLimit;
     if (detail) state.lastStatus = now;
-    else { state.baseline = false; state.lastPoll = now; }
+    else { state.baseline = false; state.finalPoll = false; state.lastPoll = now; }
     state.job = job;
     try {
-        std::thread([job, query, run, after, baseline, selected, statusOnly, cacheStamp, previewLimit]() {
+        std::thread([job, query, run, after, baseline, finalPoll, selected, statusOnly, cacheStamp, previewLimit]() {
             try {
                 if (job->detail) {
                     if (statusOnly && ProtocolView::CacheStamp(query, selected) == cacheStamp) job->updated = false;
@@ -469,6 +484,14 @@ void CPage4::TickProtocolView() {
                 }
                 else {
                     job->batch = ProtocolView::Poll(query, run, after, baseline);
+                    // The stopped backend retains at most 256 records. Drain
+                    // bounded pages in this one job, then stop polling entirely.
+                    if(finalPoll && !baseline) for(unsigned i=0;i<16;++i) {
+                        auto next=ProtocolView::Poll(query,job->batch.run,job->batch.next,false);
+                        if(next.next<=job->batch.next)break;
+                        job->batch.next=next.next;job->batch.lost+=next.lost;
+                        for(auto& row:next.rows)job->batch.rows.push_back(std::move(row));
+                    }
                 }
             } catch (const std::exception& e) {
                 job->error = e.what(); job->result.state = ProtocolView::Detail::Unavailable; job->result.note = e.what();

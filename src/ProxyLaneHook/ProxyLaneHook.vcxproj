@@ -320,6 +320,8 @@
     <ClCompile Include="PRCPipeServer.cpp" />
     <ClCompile Include="PRCTcpPeer.cpp" />
     <ClCompile Include="MitmBridge.cpp" />
+    <ClCompile Include="QuicBridge.cpp" />
+    <ClCompile Include="BrowserQuicPolicy.cpp" />
     <ClCompile Include="ProxyMonitor.cpp" />
     <ClCompile Include="PRCTcpServer.cpp" />
     <ClCompile Include="PRCUdpPeer.cpp" />
@@ -367,6 +369,8 @@
     <ClInclude Include="PRCPipeServer.h" />
     <ClInclude Include="PRCTcpPeer.h" />
     <ClInclude Include="MitmBridge.h" />
+    <ClInclude Include="QuicBridge.h" />
+    <ClInclude Include="BrowserQuicPolicy.h" />
     <ClInclude Include="MitmControl.h" />
     <ClInclude Include="PlatformSupport.h" />
     <ClInclude Include="ProxyMonitor.h" />

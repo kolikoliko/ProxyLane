@@ -4,6 +4,8 @@ mod options;
 mod dns;
 mod doh;
 mod quic_probe;
+mod quic_locator;
+mod quic_live;
 pub mod session;
 #[cfg(test)]
 mod tests;
@@ -60,7 +62,7 @@ unsafe fn write_error(output: *mut c_char, capacity: usize, error: &str) {
 }
 #[no_mangle]
 pub extern "C" fn plm_abi_version() -> u32 {
-    7
+    8
 }
 
 #[no_mangle]
@@ -332,6 +334,10 @@ pub unsafe extern "C" fn plm_protocol(
             return Err("protocol query exceeds 4 KiB".into());
         }
         let request: serde_json::Value = serde_json::from_str(input).map_err(|e| e.to_string())?;
+        if request["type"]=="quic_locate" {
+            return Ok(quic_locator::locate(request["path"].as_str().ok_or("missing module path")?)?.to_string());
+        }
+        if request["type"]=="quic_prepare" {quic_live::prepare().map_err(|e|e.to_string())?;return Ok("{}".into());}
         if request["type"] == "mitm_options" {
             use std::sync::atomic::Ordering;
             let validate_only=request["validate_only"].as_bool().unwrap_or(false);
@@ -396,4 +402,58 @@ pub unsafe extern "C" fn plm_protocol(
             -1
         }
     }
+}
+
+// Local-process locator only: the caller owns a readable immutable image snapshot.
+// Does not initialize CA, network, capture cache or Tokio.
+#[no_mangle]
+pub unsafe extern "C" fn plm_quic_locate_image(image:*const u8, length:usize, output:*mut c_char, capacity:usize)->i32 {
+    if image.is_null() || length < 4096 || length >= 1024*1024*1024 { return -1; }
+    let result=catch_unwind(AssertUnwindSafe(|| quic_locator::locate_image(slice::from_raw_parts(image,length),true)));
+    match result {
+        Ok(Ok(value))=>{let json=value.to_string(); if json.len()+1>capacity {return -1;} write_error(output,capacity,&json); (json.len()+1) as i32},
+        Ok(Err(e))=>{write_error(output,capacity,&e);-1},
+        Err(_)=>{write_error(output,capacity,"Local QUIC locator failed");-1}
+    }
+}
+
+// Internal optional-module ABI. Host owns Live handles on its PRC thread.
+#[no_mangle]
+pub unsafe extern "C" fn plm_quic_open(host:*const c_char, metadata:*const c_char, first:*const u8, length:usize, inspected:*const quic_probe::Probe,
+    notify:quic_live::Notify,user:usize,out:*mut *mut quic_live::Live,error:*mut c_char,capacity:usize)->i32 {
+    if out.is_null()||first.is_null()||length>65535 {return -1;}*out=ptr::null_mut();
+    let result=catch_unwind(AssertUnwindSafe(||->Result<Option<quic_live::Live>,String> {
+        let meta=serde_json::from_str(text(metadata)?).map_err(|e|e.to_string())?;
+        quic_live::Live::open(text(host)?,&meta,slice::from_raw_parts(first,length),inspected.as_ref(),notify,user).map_err(|e|e.to_string())
+    }));
+    match result {Ok(Ok(Some(live)))=>{*out=Box::into_raw(Box::new(live));1},Ok(Ok(None))=>0,
+        Ok(Err(e))=>{write_error(error,capacity,&e);-1},Err(_)=>{write_error(error,capacity,"QUIC initialization failed");-1}}
+}
+#[no_mangle]
+pub unsafe extern "C" fn plm_quic_io(handle:*mut quic_live::Live,op:u32,side:u32,data:*mut u8,len:usize)->i32 {
+    if handle.is_null()||side>1{return -1;}
+    catch_unwind(AssertUnwindSafe(||{let live=&*handle;
+        match op {
+            0 if !data.is_null()&&len<=65535=>{live.feed(side as usize,slice::from_raw_parts(data,len));0},
+            1 if !data.is_null()=>live.peek(side as usize,slice::from_raw_parts_mut(data,len)) as i32,
+            2=>{live.consume(side as usize);0},
+            3=>{drop(Box::from_raw(handle));0},
+            4=>live.finished() as i32,
+            5=>{write_error(data as *mut c_char,len,&live.error());0},_=>-1}
+    })).unwrap_or(-1)
+}
+
+/// Bounded admission inspector. No network output until a complete supported ClientHello.
+#[no_mangle]
+pub unsafe extern "C" fn plm_quic_inspect(handle:*mut *mut quic_probe::Probe,op:u32,data:*const u8,len:usize)->i32 {
+    if handle.is_null(){return -1;}
+    catch_unwind(AssertUnwindSafe(|| {
+        if op==1 {if !(*handle).is_null(){drop(Box::from_raw(*handle));*handle=ptr::null_mut();}return 0;}
+        if data.is_null()||len>65535{return -1;}
+        if (*handle).is_null(){*handle=Box::into_raw(Box::new(quic_probe::Probe::default()));}
+        let probe=&mut **handle;probe.feed(0,slice::from_raw_parts(data,len));
+        if probe.version!=Some(1){return -1;}
+        if !probe.complete(){return 0;}
+        if probe.alpn.iter().any(|a|a=="h3"){1}else{-1}
+    })).unwrap_or(-1)
 }

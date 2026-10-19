@@ -438,6 +438,9 @@ typedef struct _tagHookLogtext
 #define PRCPD_REGISTER_PROCESS_IDENTITY 12
 #define PRCPD_CHILD_RELEASED 13
 #define PRCPD_BLOCKED_IPV6 14
+#define PRCPD_QUIC_INIT_POLICY 15
+#define PRCPD_QUIC_LOCATE 16 // retired: no remote locator
+#define PRCPD_QUIC_STATUS 17
 
 #pragma pack(pop)
 

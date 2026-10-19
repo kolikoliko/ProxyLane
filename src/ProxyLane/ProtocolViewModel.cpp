@@ -61,13 +61,13 @@ Batch Poll(const Query& query, const std::string& run, uint64_t after, bool base
                 row.destination = row.destination.substr(0, ip) + row.destination.substr(port + 1);
         }
         row.endpoint = row.destination;
-        row.protocol = Str(record, "protocol") == "h2" ? "HTTP/2" :
+        row.protocol = Str(record, "protocol") == "h3" ? "HTTP/3" : Str(record, "protocol") == "h2" ? "HTTP/2" :
             Str(record, "protocol") == "http1" ? "HTTP/1.1" : "TLS";
         if (Str(record, "type") == "connection") {
             row.connectionRow = true; row.stream = true;
             row.key = row.run + ":connection:" + Str(connection, "id");
             row.protocol = Str(record,"protocol") == "tcp" ? "TCP" :
-                Str(record,"protocol") == "h2" ? "TLS/HTTP/2" : Str(record,"protocol") == "http1" ? "TLS/HTTP/1.1" : "TLS";
+                Str(record,"protocol") == "h3" ? "QUIC/HTTP/3" : Str(record,"protocol") == "h2" ? "TLS/HTTP/2" : Str(record,"protocol") == "http1" ? "TLS/HTTP/1.1" : "TLS";
             row.status = Str(record,"status");
         } else if (Str(record, "type") == "stream") {
             row.stream = true; row.quic = Str(record, "protocol") == "quic";
@@ -100,11 +100,16 @@ Batch Poll(const Query& query, const std::string& run, uint64_t after, bool base
             row.cacheId=Object(exchange,"cache").value("id",uint64_t(0));
         } else if (Str(record, "type") == "exchange") {
             auto& exchange = record.at("exchange");
+            // HTTP/3 publishes progress snapshots. A sequence identifies an event,
+            // whereas a stream identifies the request throughout its lifetime.
+            if (Str(record, "protocol") == "h3")
+                row.key = row.run + ":h3:" + Str(connection, "id") + ":" +
+                    std::to_string(exchange.at("id").get<uint64_t>());
             StripPayload(exchange["request"]); StripPayload(exchange["response"]);
             for (auto& info : exchange["informational"]) StripPayload(info);
             const auto& req = Object(exchange, "request");
             const auto& res = Object(exchange, "response");
-            if (connection.value("decrypted", false)) row.protocol = "TLS/" + row.protocol;
+            if (connection.value("decrypted", false)) row.protocol = (Str(record,"protocol")=="h3" ? "QUIC/" : "TLS/") + row.protocol;
             row.doh = record.contains("doh");
             if (row.doh) row.protocol += " / DoH";
             row.method = Str(req, "method"); row.target = Str(req, "target");
@@ -143,7 +148,8 @@ void History::Add(Row row) {
         if (sameConnection && row.connectionRow && !existing.connectionRow) return;
         if (sameConnection && existing.connectionRow && row.connectionRow && existing.status == "Failed") return;
     }
-    for (auto& existing : rows) if (((row.stream || row.dns) && existing.key == row.key) ||
+    for (auto& existing : rows) if (((row.stream || row.dns ||
+        (Str(row.record,"type") == "exchange" && Str(row.record,"protocol") == "h3")) && existing.key == row.key) ||
         (existing.connectionRow && existing.run == row.run &&
         Str(Object(existing.record,"connection"),"id") == Str(Object(row.record,"connection"),"id"))) {
         if (row.sequence <= existing.sequence) return;
@@ -193,7 +199,7 @@ static std::vector<unsigned char> Base64(const std::string& encoded) {
     data.resize(size); return data;
 }
 static void ReadSide(const Query& query, const Row& row, const Json& message, bool request, Detail& detail, Side& side, size_t previewLimit) {
-    std::string protocol = row.protocol.find("TLS/") == 0 ? row.protocol.substr(4) : row.protocol;
+    std::string protocol = row.protocol.find("QUIC/") == 0 ? row.protocol.substr(5) : row.protocol.find("TLS/") == 0 ? row.protocol.substr(4) : row.protocol;
     auto suffix = protocol.find(" / DoH"); if (suffix != std::string::npos) protocol.resize(suffix);
     side.headers = Headers(message, request, protocol);
     if (row.doh && request) {
@@ -266,8 +272,9 @@ Detail ReadDetail(const Query& query, const Row& row, size_t previewLimit) {
         // A client rejecting our CA or a transport failure must not suggest bypassing the target check.
         detail.targetCertificateRejected = row.status == "Failed" &&
             !row.record.value("upstream_verification_skipped",false) &&
-            detail.note.find("upstream TLS: invalid peer certificate:") == 0;
-        if (row.protocol.find("TLS") == 0 && row.record.value("upstream_verification_skipped",false)) detail.note += " Target certificate verification skipped.";
+            (detail.note.find("upstream TLS: invalid peer certificate:") == 0 ||
+             (detail.note.find("Upstream QUIC handshake failed:")==0 && detail.note.find("invalid peer certificate:")!=std::string::npos));
+        if ((row.protocol.find("TLS") == 0 || row.protocol.find("QUIC/")==0) && row.record.value("upstream_verification_skipped",false)) detail.note += " Target certificate verification skipped.";
         return detail;
     }
     const auto& exchange = Object(row.record, row.stream ? "stream" : "exchange");
@@ -370,7 +377,7 @@ Detail ReadDetail(const Query& query, const Row& row, size_t previewLimit) {
     auto info = exchange.find("informational");
     std::string informational;
     if (info != exchange.end()) for (const auto& message : *info)
-        informational += Headers(message, false, row.protocol.find("TLS/") == 0 ? row.protocol.substr(4) : row.protocol) + "\r\n";
+        informational += Headers(message, false, row.protocol.find("QUIC/") == 0 ? row.protocol.substr(5) : row.protocol.find("TLS/") == 0 ? row.protocol.substr(4) : row.protocol) + "\r\n";
     detail.response.headers = informational + detail.response.headers;
     return detail;
 }
@@ -389,10 +396,10 @@ std::vector<unsigned char> DisplayBytes(const Side& side) {
 bool Matches(const Row& row, const std::string& filter, int protocol) {
     if (protocol == 1 && row.protocol.find("HTTP/") == std::string::npos) return false;
     if (protocol == 2 && row.protocol != "TCP" && row.protocol != "DNS/TCP") return false;
-    if (protocol == 3 && !row.udp) return false;
-    if (protocol == 4 && row.protocol.find("TLS") != 0) return false;
+    if (protocol == 3 && !row.udp && row.protocol.find("QUIC/")!=0) return false;
+    if (protocol == 4 && row.protocol.find("TLS") != 0 && row.protocol.find("QUIC/")!=0) return false;
     if (protocol == 5 && !row.dns && !row.doh) return false;
-    if (protocol == 6 && !row.quic) return false;
+    if (protocol == 6 && !row.quic && row.protocol.find("QUIC/")!=0) return false;
     if (filter.empty()) return true;
     std::string needle = filter;
     std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return (char)tolower(c); });

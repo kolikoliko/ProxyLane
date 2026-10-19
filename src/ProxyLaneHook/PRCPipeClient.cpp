@@ -6,6 +6,7 @@
 
 #include "stdafx.h"
 #include "PRCPipeClient.h"
+#include "BrowserQuicPolicy.h"
 #include "AppContainerPipeAccess.h"
 
 CPRCPipeClient::CPRCPipeClient(void)
@@ -104,29 +105,25 @@ BOOL CPRCPipeClient::ReadPipe(LPVOID lpBuf, int size)
 }
 
 
-BOOL CPRCPipeClient::GetPRCStartupInfo(LPPRCINFO lpStartupInfo)
+BOOL CPRCPipeClient::GetPRCStartupInfo(LPPRCINFO lpStartupInfo, bool* quicPolicy)
 {
-	PRCPipeDataHead hdr;
-
-	hdr.action = PRCPD_GETSTARTUPINFO;
-	hdr.flag = 0;
-	hdr.dataSize = 0;
-
-	if(!WritePipe(&hdr, sizeof(hdr)))
-		return FALSE;
-
-	if(!ReadPipe(&hdr, sizeof(hdr)))
-		return FALSE;
-
-	if(hdr.action != PRCPD_REPLY || hdr.flag != 1 || hdr.dataSize != sizeof(*lpStartupInfo))
-		return FALSE;
-
-	if(!ReadPipe(lpStartupInfo, hdr.dataSize))
-		return FALSE;
-
-	return TRUE;
+    PRCPipeDataHead hdr={};hdr.action=PRCPD_GETSTARTUPINFO;
+    // Opt-in extension: old hosts ignore the flag and return the original size;
+    // old clients receive the original layout from new hosts.
+    hdr.flag=quicPolicy?2:0;if(quicPolicy)*quicPolicy=false;
+    if(!WritePipe(&hdr,sizeof(hdr))||!ReadPipe(&hdr,sizeof(hdr)))return FALSE;
+    if(hdr.action!=PRCPD_REPLY||hdr.flag!=1 ||
+        (hdr.dataSize!=sizeof(*lpStartupInfo)&&(!quicPolicy||hdr.dataSize!=sizeof(*lpStartupInfo)+sizeof(DWORD))))return FALSE;
+    if(!ReadPipe(lpStartupInfo,sizeof(*lpStartupInfo)))return FALSE;
+    if(hdr.dataSize>sizeof(*lpStartupInfo)) {DWORD flags=0;if(!ReadPipe(&flags,sizeof(flags)))return FALSE;*quicPolicy=(flags&1)!=0;}
+    return TRUE;
 }
-
+BOOL CPRCPipeClient::PRCReportQuicStatus(const BrowserQuicPolicy::Report& report)
+{
+    PRCPipeDataHead hdr={};hdr.action=PRCPD_QUIC_STATUS;hdr.flag=1;hdr.dataSize=sizeof(report);
+    return WritePipe(&hdr,sizeof(hdr))&&WritePipe(&report,sizeof(report))&&ReadPipe(&hdr,sizeof(hdr))
+        &&hdr.action==PRCPD_REPLY&&hdr.flag==1&&hdr.dataSize==0;
+}
 
 BOOL CPRCPipeClient::PRCRegisterClient(LPPRCClient lpClientInfo)
 {

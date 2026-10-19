@@ -151,6 +151,72 @@ extern "C" fn observe(user: usize, kind: u32, data: *const u8, length: usize) {
 }
 
 #[test]
+fn tls_large_response_drains_plaintext_between_record_reads() {
+    for (tls12, fragment) in [(false, 4096), (true, 4096), (false, 16384), (true, 16384)] {
+        let f = Fixture::new();
+        let mut m = f.session();
+        let (mut app, mut origin) = f.endpoints(tls12, true);
+        for _ in 0..30 { exchange(&mut m, &mut app, &mut origin, 4096).unwrap(); }
+        assert!(m.ready());
+        let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        origin.set_buffer_limit(None);
+        // Mix full records with short header/frame writes, like real HTTP/2
+        // servers. Uniform 16 KiB records alone do not expose this failure.
+        let mut at = 0;
+        for size in [16384, 47, 16384, 123, 3000, 16384, 16000, 1024].into_iter().cycle() {
+            let end = (at + size).min(payload.len());
+            origin.writer().write_all(&payload[at..end]).unwrap();
+            at = end;
+            if at == payload.len() { break; }
+        }
+        origin.send_close_notify();
+        let mut wire = Vec::new();
+        while origin.wants_write() { origin.write_tls(&mut wire).unwrap(); }
+        let mut position = 0;
+        let mut received = Vec::new();
+        let mut saw_backpressure = false;
+        let mut clean_eof = false;
+        for step in 0..200_000 {
+            if position < wire.len() && m.can_read() {
+                // PRC recv and maximum FFI input sizes, unaligned to TLS records.
+                let end = (position + fragment).min(wire.len());
+                m.feed(1, &wire[position..end]).unwrap();
+                position = end;
+            }
+            saw_backpressure |= !m.can_read();
+            // Slow downstream consumer builds pressure on all intermediate buffers.
+            if step % 3 == 0 || position == wire.len() {
+                let mut bytes = [0u8; 2048];
+                let n = m.peek(0, &mut bytes).unwrap();
+                if n != 0 {
+                    let mut input = Cursor::new(&bytes[..n]);
+                    while input.position() < n as u64 {
+                        assert!(app.read_tls(&mut input).unwrap() > 0);
+                        app.process_new_packets().unwrap();
+                        let mut plain = [0u8; 16384];
+                        loop {
+                            match app.reader().read(&mut plain) {
+                                Ok(0) => { clean_eof = true; break; },
+                                Ok(n) => received.extend_from_slice(&plain[..n]),
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(e) => panic!("{e}"),
+                            }
+                        }
+                    }
+                    m.consume(0, n).unwrap();
+                }
+            }
+            if m.shutdown_output(0) { break; }
+        }
+        assert_eq!(position, wire.len());
+        assert!(saw_backpressure && clean_eof);
+        assert_eq!(received.len(), payload.len());
+        assert_eq!(received, payload);
+        assert!(m.shutdown_output(0));
+    }
+}
+
+#[test]
 fn persistent_ca_and_signed_leaf() {
     let f = Fixture::new();
     let reloaded = pki::Authority::load(&f.path, false).unwrap();

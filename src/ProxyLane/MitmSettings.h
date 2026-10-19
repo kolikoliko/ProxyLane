@@ -20,6 +20,8 @@ inline const std::array<Field,9>& Fields() {
     return fields;
 }
 inline bool DecryptHTTPS() { return GetPrivateProfileInt(L"options",L"DecryptHTTPS",0,Localization::SettingsPath())==1; }
+inline bool DecryptQUIC() { return GetPrivateProfileInt(L"options",L"DecryptQUIC",0,Localization::SettingsPath())==1; }
+inline bool SaveDecryptQUIC(bool enabled) { return WritePrivateProfileString(L"options",L"DecryptQUIC",enabled ? L"1":L"0",Localization::SettingsPath())!=FALSE; }
 inline bool SaveDecryptHTTPS(bool enabled) { return WritePrivateProfileString(L"options",L"DecryptHTTPS",enabled ? L"1":L"0",Localization::SettingsPath())!=FALSE; }
 using Values=std::array<unsigned,9>;
 inline Values Defaults() {

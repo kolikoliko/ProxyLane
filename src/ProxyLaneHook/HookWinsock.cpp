@@ -4,6 +4,7 @@
 /************************************************************************/
 
 #include "stdafx.h"
+#include "BrowserQuicPolicy.h"
 #include "HookWinsock.h"
 #include <psapi.h>
 #include "GlobalProxy.h"
@@ -401,7 +402,8 @@ BOOL CHookWinsock::EnableHook()
 	}
 
 	PRCINFO startupInfo;
-	if (!PRCPipeClient.GetPRCStartupInfo(&startupInfo))
+	bool quicPolicy=false;
+	if (!PRCPipeClient.GetPRCStartupInfo(&startupInfo, &quicPolicy))
 		return FALSE;
 
 	DWORD localDnsHostNameLength = _countof(m_LocalDnsHostName);
@@ -438,6 +440,7 @@ BOOL CHookWinsock::EnableHook()
 
 	//hook API
 
+	BrowserQuicPolicy::Initialize(m_szPRCPipeName,quicPolicy && m_psi.bHookUDP && !m_psi.bBlockUDP);
 	BOOL bOK = HookWinsock();
 	if (!bOK && m_ChildGuardInstalled)
 	{
@@ -1188,6 +1191,7 @@ INT PASCAL CHookWinsock::inhook_WSASendMsg(SOCKET s, LPWSAMSG lpMsg,
 			WSASetLastError(WSAEMSGSIZE);
 			return SOCKET_ERROR;
 		}
+		if (connectedMaxPayload) NotifyQuicUdp();
 		return Original_WSASendMsg(s, lpMsg, dwFlags, lpNumberOfBytesSent,
 			lpOverlapped, lpCompletionRoutine);
 	}
@@ -1615,6 +1619,7 @@ int WSAAPI CHookWinsock::inhook_WSASendTo(
 			WSASetLastError(WSAEMSGSIZE);
 			return SOCKET_ERROR;
 		}
+		if (connectedMaxPayload) NotifyQuicUdp();
 		// Buffers and completion state remain owned by Winsock.
 		return CallTrampoline(WSASendTo)(s, lpBuffers, dwBufferCount,
 			lpNumberOfBytesSent, dwFlags, lpTo, iToLen, lpOverlapped,
@@ -1741,6 +1746,7 @@ HookDecision CHookWinsock::HackSendTo(SOCKET s, _SockAddr &addrname,
 		if (addrname.IsAny())
 			SetLoopbackAddress(&addrname, prcc.dstAddr.sa_family);
 
+		NotifyQuicUdp();
 		*lpC = prcc;
 		if (maxPayload)
 			m_HackedSocket.GetUDPMaxPayload(&prcc, maxPayload);
@@ -1768,6 +1774,7 @@ HookDecision CHookWinsock::HackSendTo(SOCKET s, _SockAddr &addrname,
 		addrname = prcc.udpAddr;
 		if (addrname.IsAny())
 			SetLoopbackAddress(&addrname, prcc.dstAddr.sa_family);
+		NotifyQuicUdp();
 		*lpC = prcc;
 		if (maxPayload)
 			m_HackedSocket.GetUDPMaxPayload(&prcc, maxPayload);
@@ -1785,6 +1792,7 @@ HookDecision CHookWinsock::HackSendTo(SOCKET s, _SockAddr &addrname,
 		return decision;
 	}
 
+	prcc.reserved=BrowserQuicPolicy::OnUdp();
 	if (!m_RequestPipe.PRCRegisterClient(&prcc))
 	{
 		const int registrationError = WSAGetLastError();
@@ -2420,6 +2428,39 @@ int WSAAPI CHookWinsock::inhook_WSAIoctl(
 	return ret;
 }
 
+void CHookWinsock::NotifyQuicUdp()
+{
+    if(!BrowserQuicPolicy::Enabled()||m_psi.bBlockUDP||!m_psi.bHookUDP)return;
+    int error=WSAGetLastError();
+    BrowserQuicPolicy::OnUdp();
+    if(!BrowserQuicPolicy::NeedsPublish()){WSASetLastError(error);return;}
+    CScopedCriticalSection pipeLock(&m_RequestPipeLock);
+    if(EnsureRequestPipe())BrowserQuicPolicy::Publish(m_RequestPipe);
+    WSASetLastError(error);
+}
+void CHookWinsock::NotifyConnectedQuicUdp(SOCKET s)
+{
+    if(!BrowserQuicPolicy::Enabled()||m_psi.bBlockUDP||!m_psi.bHookUDP)return;
+    size_t maxPayload=0;
+    if(m_HackedSocket.GetConnectedUDPMaxPayload(s,&maxPayload))NotifyQuicUdp();
+}
+MyDetourProc(has_Return, HMODULE, WINAPI, LoadLibraryExW, (LPCWSTR path,HANDLE file,DWORD flags))
+{
+    HMODULE result=Original_LoadLibraryExW(path,file,flags);DWORD error=GetLastError();
+    if(result)BrowserQuicPolicy::ModuleLoaded(path,flags);
+    SetLastError(error);return result;
+}
+MyDetourProc(has_Return, int, WSAAPI, send, (SOCKET s,const char* data,int len,int flags))
+{
+    if(g_pHookWinsock)g_pHookWinsock->NotifyConnectedQuicUdp(s);
+    return Original_send(s,data,len,flags);
+}
+MyDetourProc(has_Return, int, WSAAPI, WSASend, (SOCKET s,LPWSABUF buffers,DWORD count,LPDWORD sent,DWORD flags,LPWSAOVERLAPPED ov,LPWSAOVERLAPPED_COMPLETION_ROUTINE completion))
+{
+    if(g_pHookWinsock)g_pHookWinsock->NotifyConnectedQuicUdp(s);
+    return Original_WSASend(s,buffers,count,sent,flags,ov,completion);
+}
+
 BOOL CHookWinsock::HookWinsock()
 {
 	if (m_ProcessCreationTls == TLS_OUT_OF_INDEXES)
@@ -2483,7 +2524,18 @@ BOOL CHookWinsock::HookWinsock()
 				break;
 		}
 
-		return ApplyHooks(true);
+        if(BrowserQuicPolicy::Enabled()) {
+            // Kernel32's export resolves to KernelBase on modern Windows.
+            bool prepared=HookAPI(HOOKMODULE_KERNEL32,_EHF(LoadLibraryExW),"LoadLibraryExW",_HOOKFUNC(LoadLibraryExW),_TRAMPFUNC(LoadLibraryExW))
+                &&HookAPI(HOOKMODULE_WS2_32,_EHF(send),"send",_HOOKFUNC(send),_TRAMPFUNC(send))
+                &&HookAPI(HOOKMODULE_WS2_32,_EHF(WSASend),"WSASend",_HOOKFUNC(WSASend),_TRAMPFUNC(WSASend));
+            if(prepared && ApplyHooks(true))return TRUE;
+            // Optional compatibility must not prevent ordinary proxy injection.
+            // Failed Detours transactions have rolled back the entire batch.
+            for(int i=HOOKAPI_LoadLibraryExW;i<HOOKAPI_COUNT;++i)m_HookedInfo[i]={};
+            BrowserQuicPolicy::SetupFailed();
+        }
+        return ApplyHooks(true);
 	} while (FALSE);
 
 	return FALSE;

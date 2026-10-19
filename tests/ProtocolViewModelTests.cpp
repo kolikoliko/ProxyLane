@@ -42,6 +42,36 @@ struct Fixture {
     Row row() { return Poll(query(), "", 0, false).rows.at(0); }
 };
 int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--h3-history") {
+        std::cout << "Replaying " << argv[2] << std::endl;
+        try {
+        std::ifstream input(argv[2]); Json results; input >> results;
+        for (const auto& browser : results) {
+            History history; std::map<std::string, Row> latest; size_t events=0;
+            for (const auto& poll : browser.at("polls")) {
+                Json reply=poll.at("reply"), records=Json::array();
+                if(reply.value("type",std::string())=="inactive") continue;
+                for (const auto& record : reply.at("records"))
+                    if (record.value("type",std::string())=="exchange" && record.value("protocol",std::string())=="h3")
+                        records.push_back(record);
+                reply["records"]=records;
+                auto batch=Poll([&](const Json&){return reply;},"",0,false);
+                for (auto row : batch.rows) {
+                    ++events; latest[row.key]=row; history.Add(row);
+                    if(history.rows.size()!=latest.size()) throw std::runtime_error("duplicate history row");
+                }
+            }
+            if(latest.empty() || events<=latest.size()) throw std::runtime_error("missing real progress snapshots");
+            for (const auto& row : history.rows) {
+                assert(row.sequence==latest.at(row.key).sequence);
+                assert(row.responseBytes==latest.at(row.key).responseBytes);
+            }
+            std::cout << "PASS " << browser.at("browser").get<std::string>() << " real HTTP/3 history: "
+                << events << " snapshots -> " << latest.size() << " request rows\n";
+        }
+        return 0;
+        } catch(const std::exception& e) {std::cerr << "Replay failed: " << e.what() << std::endl;return 1;}
+    }
     if (argc == 2) {
         // Replay actual MITM queries saved by the injected TLS end-to-end host.
         std::ifstream input(argv[1]); std::string line; std::vector<Json> replies;
@@ -191,6 +221,8 @@ int main(int argc, char** argv) {
         f.record["detail"]=reason;
         assert(!ReadDetail(f.query(),f.row()).targetCertificateRejected);
     }
+    f.record["detail"]="Upstream QUIC handshake failed: invalid peer certificate: UnknownIssuer";
+    assert(ReadDetail(f.query(),f.row()).targetCertificateRejected);
     f.record["detail"]="upstream TLS: invalid peer certificate: BadSignature";
     f.record["upstream_verification_skipped"]=true;
     assert(!ReadDetail(f.query(),f.row()).targetCertificateRejected);
@@ -201,5 +233,31 @@ int main(int argc, char** argv) {
     detail=ReadDetail(f.query(),row);assert(detail.response.text.find("[Answer]")!=std::string::npos);
     assert(detail.response.headers.find("DoH")==std::string::npos && DisplayBytes(detail.response).size()>5);
     f.cache["evicted"]=true;detail=ReadDetail(f.query(),row);assert(detail.response.text.empty() && detail.response.body.empty());
+    f=Fixture();f.record["protocol"]="h3";f.record["connection"]["decrypted"]=true;
+    f.record["connection"]["transport"]="udp";f.record["exchange"]["id"]=0;
+    row=f.row();assert(row.protocol=="QUIC/HTTP/3" && !row.udp && !row.stream);
+    assert(Matches(row,"",1) && Matches(row,"",3) && Matches(row,"",4) && Matches(row,"",6));
+    detail=ReadDetail(f.query(),row);assert(detail.request.headers.find("HTTP/3")!=std::string::npos);
+    // One HTTP/3 request: headers, progress, end and final cache snapshot must
+    // update one row, including stream zero; keep the user's view and row identity.
+    history.Clear(); row.hex=true; history.Add(row);
+    const auto h3key=history.rows.front().key;
+    const auto h3number=history.rows.front().number;
+    const auto h3time=history.rows.front().firstSeenSeconds;
+    for(uint64_t seq=2;seq<=6;++seq) {
+        f.record["sequence"]=seq; f.record["exchange"]["response"]["body_bytes"]=seq*112;
+        history.Add(f.row());
+        assert(history.rows.size()==1 && history.rows.front().key==h3key);
+        assert(history.rows.front().number==h3number && history.rows.front().firstSeenSeconds==h3time);
+        assert(history.rows.front().hex && history.rows.front().responseBytes==seq*112);
+        assert(history.bytes==history.rows.front().bytes);
+    }
+    history.Add(row); // Delayed/replayed old snapshot cannot roll back progress.
+    assert(history.rows.size()==1 && history.rows.front().responseBytes==672);
+    f.record["sequence"]=7; f.record["exchange"]["id"]=4; history.Add(f.row());
+    assert(history.rows.size()==2); // Same URL on another stream is a real request.
+    f.record["sequence"]=8; f.record["connection"]["id"]="10"; f.record["exchange"]["id"]=0;
+    history.Add(f.row()); assert(history.rows.size()==3); // Stream IDs restart per connection.
+    f.run="run-B"; history.Add(f.row()); assert(history.rows.size()==4);
     std::cout << "PASS protocol view: HTTP, DNS transactions, QUIC metadata, raw bytes, filters, eviction and bounds\n";
 }

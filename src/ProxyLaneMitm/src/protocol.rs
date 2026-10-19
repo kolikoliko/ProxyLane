@@ -37,10 +37,12 @@ enum Event {
     Datagram(u64, usize, Vec<u8>, Arc<Ticket>),
     Eof(u64, usize, bool, Arc<Ticket>),
     State(u64, usize, Arc<Ticket>),
+    Http3(u64, usize, H3Part, Arc<Ticket>),
     Barrier(mpsc::Sender<()>),
     StopCapture(mpsc::Sender<()>),
     Shutdown,
 }
+pub enum H3Part { Head(proxylane_protocol::Message), Data(Vec<u8>), End(proxylane_protocol::Headers) }
 #[derive(Default)]
 struct Results {
     sequence: u64,
@@ -340,6 +342,8 @@ pub struct Tap {
     ended: [bool; 2],
 }
 impl Tap {
+    pub fn is_capturing(&self)->bool { *lock(&self.owner.capture_epoch)==self.epoch && self.epoch%2!=0 && self.accepting() }
+    pub fn http3(&self, side:usize, part:H3Part) { self.send(Event::Http3(self.id,side,part,self.ticket.clone())); }
     pub fn transport_result(&mut self, error: usize) { self.send(Event::State(self.id,error,self.ticket.clone())); }
     fn accepting(&self) -> bool {
         !self.ticket.lost.load(Ordering::Acquire) && !self.ticket.closed.load(Ordering::Acquire)
@@ -386,6 +390,7 @@ impl Drop for Tap {
 }
 
 struct Stream {
+    h3: Option<proxylane_protocol::http3::Capture>,
     dns: Option<crate::dns::Dns>,
     quic: crate::quic_probe::Probe,
     identity: Connection,
@@ -478,7 +483,11 @@ impl Worker {
             if stream.detect && !stream.sniff.is_empty() && stream.opened.elapsed() >= Duration::from_secs(2) {
                 self.opaque(&mut stream);
             }
-            if stream.analyzer.is_none() && !stream.detect && stream.dirty
+            if stream.h3.is_some() && stream.dirty && stream.published.elapsed()>=Duration::from_millis(500) {
+                lock(&self.results).add(json!({"type":"exchange","connection":stream.identity,"protocol":"h3","exchange":stream.h3.as_ref().unwrap().snapshot()}));
+                stream.dirty=false;stream.published=Instant::now();
+            }
+            if stream.h3.is_none() && stream.analyzer.is_none() && !stream.detect && stream.dirty
                 && stream.published.elapsed() >= Duration::from_millis(500) {
                 self.publish(&mut stream, false);
             }
@@ -494,7 +503,11 @@ impl Worker {
         for id in ids {
             let mut stream = self.connections.remove(&id).unwrap();
             let lost = stream.ticket.lost.load(Ordering::Acquire);
-            if let Some(dns) = &mut stream.dns {
+            if let Some(h3) = stream.h3.take() {
+                let exchange=h3.finish(if lost {"HTTP/3 observation queue overflow"} else {"capture ended before HTTP/3 exchange completed"});
+                let mut value=json!({"type":"exchange","connection":stream.identity,"protocol":"h3","exchange":exchange});
+                crate::doh::annotate(&mut value);lock(&self.results).add(value);
+            } else if let Some(dns) = &mut stream.dns {
                 self.records(dns.close(&stream.identity,self.cache.as_ref(),if lost {"DNS capture queue overflow"}else{"DNS capture ended before response"}));
             } else if let Some(parser) = &mut stream.analyzer {
                 self.output(parser.close());
@@ -517,6 +530,8 @@ impl Worker {
         loop {
             match receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(Event::Open(id, identity, alpn, decrypted, ticket)) => {
+                    let h3=alpn.as_ref().filter(|a|a.starts_with(b"h3:")).and_then(|a|std::str::from_utf8(&a[3..]).ok()).and_then(|s|s.parse::<u64>().ok())
+                        .map(|stream_id|proxylane_protocol::http3::Capture::new(stream_id,self.cache.as_ref()));
                     let protocol = match alpn.as_deref() {
                         Some(b"h2") => Some(Protocol::H2),
                         Some(b"http/1.1") => Some(Protocol::Http1),
@@ -526,11 +541,11 @@ impl Worker {
                     let dns = if identity.server_port==53 {Some(crate::dns::Dns::default())}else{None};
                     let is_dns=dns.is_some();
                     let analyzer = protocol.map(|p| self.parser(identity.clone(), p));
-                    let mut stream = Stream { identity, ticket, analyzer, sniff: Vec::new(), dns, quic:Default::default(),
+                    let mut stream = Stream { h3, identity, ticket, analyzer, sniff: Vec::new(), dns, quic:Default::default(),
                         detect: alpn.is_none() && !udp && !is_dns, decrypted, encrypted: false, cache: None,
                         counts: [0;2], datagrams: [Vec::new(), Vec::new()], packet_counts: [0;2], ended: [false;2], dirty: false,
                         published: Instant::now() - Duration::from_secs(1), opened: Instant::now() };
-                    if !is_dns && (udp || (protocol.is_none() && alpn.is_some())) { self.opaque(&mut stream); }
+                    if stream.h3.is_none() && !is_dns && (udp || (protocol.is_none() && alpn.is_some())) { self.opaque(&mut stream); }
                     if !udp && !decrypted {
                         lock(&self.results).add(json!({"type":"connection","connection":stream.identity,"protocol":"tcp","status":"Connecting"}));
                     }
@@ -582,6 +597,17 @@ impl Worker {
                         self.connections.insert(id, stream);
                     }
                     ticket.pending.fetch_sub(1, Ordering::AcqRel);
+                }
+                Ok(Event::Http3(id,side,part,ticket)) => {
+                    if let Some(stream)=self.connections.get_mut(&id) {
+                        if let Some(h3)=&mut stream.h3 {
+                            stream.dirty=true;
+                            let publish=matches!(&part,H3Part::Head(_)|H3Part::End(_));
+                            match part {H3Part::Head(m)=>h3.head(side,m),H3Part::Data(b)=>h3.data(side,&b),H3Part::End(t)=>h3.end(side,t)}
+                            if publish {lock(&self.results).add(json!({"type":"exchange","connection":stream.identity,"protocol":"h3","exchange":h3.snapshot()}));}
+                        }
+                    }
+                    ticket.pending.fetch_sub(1,Ordering::AcqRel);
                 }
                 Ok(Event::Datagram(id, side, bytes, ticket)) => {
                     if let Some(mut stream) = self.connections.remove(&id) {

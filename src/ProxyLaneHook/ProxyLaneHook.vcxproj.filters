@@ -274,4 +274,10 @@
       <Filter>Resource Files</Filter>
     </ResourceCompile>
   </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="QuicBridge.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="BrowserQuicPolicy.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClInclude Include="QuicBridge.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="BrowserQuicPolicy.h"><Filter>Header Files</Filter></ClInclude>
+  </ItemGroup>
 </Project>

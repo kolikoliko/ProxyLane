@@ -22,7 +22,7 @@ const CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
 
 // Only certificate trust/name/time checks are bypassed. TLS handshake signatures remain verified.
 #[derive(Debug)]
-struct SkipCertificateTrust;
+pub(crate) struct SkipCertificateTrust;
 impl rustls::client::danger::ServerCertVerifier for SkipCertificateTrust {
     fn verify_server_cert(&self, _: &rustls::pki_types::CertificateDer<'_>, _: &[rustls::pki_types::CertificateDer<'_>],
         _: &ServerName<'_>, _: &[u8], _: rustls::pki_types::UnixTime)
@@ -439,20 +439,25 @@ impl Session {
     }
 
     fn feed_tls(&mut self, side: usize, data: &[u8]) -> Result<()> {
-        let connection = self.connections[side]
-            .as_mut()
-            .ok_or("missing TLS endpoint")?;
         let mut input = Cursor::new(data);
         while (input.position() as usize) < data.len() {
-            if connection.read_tls(&mut input).map_err(|e| e.to_string())? == 0 {
-                return Err("TLS input made no progress".into());
-            }
-            let state = connection
-                .process_new_packets()
-                .map_err(|e| e.to_string())?;
+            let state = {
+                let connection = self.connections[side]
+                    .as_mut()
+                    .ok_or("missing TLS endpoint")?;
+                if connection.read_tls(&mut input).map_err(|e| e.to_string())? == 0 {
+                    return Err("TLS input made no progress".into());
+                }
+                connection.process_new_packets().map_err(|e| e.to_string())?
+            };
             if state.peer_has_closed() {
                 self.eof[side] = true;
             }
+            // read_tls may consume only a prefix of this socket read. Drain
+            // each decoded flight before feeding the remainder: mixed short
+            // and full records can fill rustls's 16 KiB plaintext buffer even
+            // when the socket read itself is only 4 KiB.
+            self.pump()?;
         }
         Ok(())
     }
@@ -465,7 +470,12 @@ impl Session {
         for side in 0..2 {
             if let Some(c) = self.connections[side].as_mut() {
                 let mut buf = [0u8; 16384];
-                while self.plaintext[1 - side].len() < HIGH_WATER {
+                // can_read() applies backpressure before accepting more input.
+                // Finish draining the already accepted, bounded TLS flight,
+                // even if it crosses the high-water mark by a record. Leaving
+                // plaintext in rustls can reject the rest of the current input
+                // and can send close_notify before those bytes are forwarded.
+                loop {
                     match c.reader().read(&mut buf) {
                         Ok(0) => {
                             // rustls Reader returns 0 only after buffered plaintext

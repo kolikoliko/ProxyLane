@@ -38,6 +38,9 @@ typedef enum
 	HOOKAPI_CreateProcessInternalW,
 	HOOKAPI_CreateProcessWithLogonW,
 
+	HOOKAPI_LoadLibraryExW,
+	HOOKAPI_send,
+	HOOKAPI_WSASend,
 	HOOKAPI_COUNT
 }eHOOKFUN; 
 
@@ -680,6 +683,8 @@ public:
 
 	int WSAAPI inhook_sendto(SOCKET s, const char* buf, int len, int flags, const struct sockaddr* to, int tolen);
 
+	void NotifyQuicUdp();
+	void NotifyConnectedQuicUdp(SOCKET s);
 	int WSAAPI inhook_WSASendTo(
 		SOCKET s,
 		LPWSABUF lpBuffers,

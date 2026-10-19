@@ -16,12 +16,13 @@ public:
     bool caOk=false, skipVerify=false, enabled=false, moduleOk=true, prepareOk=true;
     int caFlags=3;
     std::atomic<unsigned> starts{0}, caQueries{0};
-    bool lastDecrypt=false;
+    bool lastDecrypt=false, injectionQuic=false;
     nlohmann::json settings;
     std::atomic<unsigned> count{2};
     std::atomic<unsigned> delay{0};
     std::atomic<bool> packetPayload{false};
     std::atomic<unsigned> queries{0};
+    std::atomic<unsigned> polls{0};
     int ManageCA(CaAction, char* output, size_t capacity) override {
         ++caQueries;
         if(caOk) {if(output&&capacity) strcpy_s(output,capacity,"Test CA status");return caFlags;}
@@ -36,7 +37,8 @@ public:
         if (delay.load()) Sleep(delay.load());
         auto command = J::parse(request); J reply;
         std::string type = command.at("type");
-        if (type == "monitor_start") {
+        if(type=="quic_injection_policy") {injectionQuic=command.value("enabled",injectionQuic);reply={{"enabled",injectionQuic}};}
+        else if (type == "monitor_start") {
             ++starts;lastDecrypt=command.value("decrypt",false);
             if(!moduleOk || (lastDecrypt && !prepareOk)) {strcpy_s(output,capacity,"Injected dependency failure");return -1;}
             enabled=lastDecrypt;reply={{"type","monitor"}};
@@ -46,6 +48,7 @@ public:
             if(command.contains("skip_upstream_verify") && !command.value("validate_only",false)) skipVerify=command["skip_upstream_verify"].get<bool>();
             reply={{"settings",settings},{"skip_upstream_verify",skipVerify}};
         } else if (type == "poll") {
+            ++polls;
             J records = J::array(); uint64_t next = command.value("after", uint64_t(0));
             for (uint64_t id = next + 1; id <= count && records.size() < 32; ++id) {
                 J request = {{"method", "GET"}, {"target", "/ip"}, {"status", nullptr},
@@ -143,6 +146,13 @@ public:
 #endif
         Require(!page.GetDlgItem(IDC_MITM_ENABLE),"page exposes only one monitoring switch");
         page.m_tls = &fake;
+        auto idleFor=[&](DWORD duration) {
+            DWORD began=GetTickCount();
+            Pump(page,[&] {return GetTickCount()-began>=duration;},duration+3000);
+        };
+        const auto coldQueries=fake.queries.load();
+        idleFor(1200);
+        Require(fake.queries==coldQueries && !page.m_protocol->job,"cold idle page never queries optional module");
         auto waitJob=[](std::shared_ptr<MitmJob> job) {for(int i=0;i<200 && !job->done.load();++i) Sleep(10);Require(job->done.load(),"start worker completed");return job;};
         fake.caOk=true;fake.caFlags=0;
         auto start=waitJob(StartMonitorJob(&fake,true));
@@ -173,6 +183,26 @@ public:
         Require(page.m_requests.GetItemText(0, 3) == L"HTTP/1.1" && page.m_requests.GetItemText(1, 3) == L"HTTP/2", "protocol follows PID");
         Require(page.m_requests.GetItemText(0,4)==L"GET" && page.m_requests.GetItemText(0,6)==L"200", "method and status columns");
         Require(page.m_requests.GetColumnWidth(0) == UiTheme::ScaleForWindow(page.m_hWnd,38), "initial column sizing");
+        Pump(page,[&] {return !page.m_protocol->job;});
+        const auto pollsBeforeStop=fake.polls.load();
+        page.m_recording=false;
+        // The asynchronous stop must finish before requesting final records.
+        page.m_stopJob=std::make_shared<MitmJob>();
+        idleFor(650);
+        Require(fake.polls==pollsBeforeStop,"no polling while stop drains capture");
+        page.m_stopJob->result=1;page.m_stopJob->done=true;
+        Pump(page,[&] {return !page.m_stopJob && !page.m_protocol->finalPoll && !page.m_protocol->job;});
+        Require(fake.polls==pollsBeforeStop+2,"one final drain job after stopping");
+        const auto stoppedQueries=fake.queries.load();
+        idleFor(1200);
+        Require(fake.queries==stoppedQueries,"stopped page does not poll history");
+        page.m_requests.SetItemState(0,LVIS_SELECTED,LVIS_SELECTED);
+        Pump(page,[&] {return page.m_protocol->haveDetail && !page.m_protocol->job;});
+        const auto detailQueries=fake.queries.load();
+        idleFor(2300);
+        Require(fake.queries==detailQueries,"stopped selection is read once on demand");
+        page.m_follow.SetCheck(BST_CHECKED);page.OnFollowLatest();
+        page.m_recording=true;
         const int customWidths[] = {45,170,70,55,310,88,115,130};
         for (int col=0; col<8; ++col) page.m_requests.SetColumnWidth(col,customWidths[col]);
         auto checkWidths = [&] {
@@ -576,6 +606,8 @@ public:
             const auto original=MitmSettings::Load();
             wchar_t originalSkip[32]={};GetPrivateProfileString(L"options",L"MitmSkipUpstreamVerify",L"",originalSkip,32,path);
             wchar_t originalDecrypt[32]={};GetPrivateProfileString(L"options",L"DecryptHTTPS",L"",originalDecrypt,32,path);
+            wchar_t originalQuic[32]={};GetPrivateProfileString(L"options",L"DecryptQUIC",L"",originalQuic,32,path);
+            Require(MitmSettings::SaveDecryptQUIC(false),"start QUIC options test off");
             const bool hadIni=GetFileAttributes(path)!=INVALID_FILE_ATTRIBUTES;
             fake.caOk=true;
             // Hint follows an actual new decryption choice, never simply opening
@@ -624,7 +656,12 @@ public:
             options.CheckDlgButton(IDC_MITM_SKIP_VERIFY,BST_CHECKED);
             options.SendMessage(WM_COMMAND,MAKEWPARAM(IDC_MITM_SKIP_VERIFY,BN_CLICKED));
             Require(!fake.skipVerify && GetPrivateProfileInt(L"options",L"MitmSkipUpstreamVerify",0,path)==0,"verification checkbox stays draft until save");
+            options.CheckDlgButton(1303,BST_CHECKED);
+            options.SendMessage(WM_COMMAND,MAKEWPARAM(1303,BN_CLICKED));
+            for(int n=0;n<40;++n){Sleep(10);options.OnTimer(1);}
+            Require(!fake.injectionQuic && !MitmSettings::DecryptQUIC(),"QUIC draft does not change injection policy");
             options.SendMessage(WM_COMMAND,MAKEWPARAM(1301,BN_CLICKED));
+            Require(fake.injectionQuic && MitmSettings::DecryptQUIC(),"save publishes QUIC policy for future injections");
             Require(!options.IsWindowVisible(),"successful save closes options");
             Require(MitmSettings::Load()==changed,"all nine settings persisted to ini");
             Require(MitmSettings::DecryptHTTPS() && !fake.enabled,"Save persists decryption preference without starting interception");
@@ -638,6 +675,7 @@ public:
             for(int i=0;i<9;++i) Require(options.GetDlgItemInt(1310+i)==defaults[i],"restore drafts all nine defaults");
             Require(options.IsDlgButtonChecked(IDC_MITM_SKIP_VERIFY)==BST_UNCHECKED,"restore drafts strict verification");
             Require(options.IsDlgButtonChecked(IDC_MITM_ENABLE)==BST_UNCHECKED && MitmSettings::DecryptHTTPS(),"restore drafts decryption off until Save");
+            Require(fake.injectionQuic && MitmSettings::DecryptQUIC(),"restore defaults remains a draft for QUIC policy");
             Require(fake.queries==beforeReset && fake.skipVerify && fake.settings==MitmSettings::Json(changed),"restore makes no service call");
             Require(MitmSettings::Load()==changed && GetPrivateProfileInt(L"options",L"MitmSkipUpstreamVerify",0,path)==1,"restore makes no ini changes");
             page.ApplyMonitorSettings();
@@ -652,7 +690,9 @@ public:
             reopened.SetDlgItemInt(1310,99);
             reopened.CheckDlgButton(IDC_MITM_SKIP_VERIFY,BST_UNCHECKED);
             reopened.SendMessage(WM_COMMAND,MAKEWPARAM(IDC_MITM_SKIP_VERIFY,BN_CLICKED));
+            reopened.CheckDlgButton(1303,BST_UNCHECKED);
             reopened.SendMessage(WM_CLOSE);
+            Require(fake.injectionQuic && MitmSettings::DecryptQUIC(),"X does not publish QUIC draft");
             Require(fake.skipVerify && GetPrivateProfileInt(L"options",L"MitmSkipUpstreamVerify",0,path)==1,"X discards verification draft");
             reopened.KillTimer(1);reopened.DestroyWindow();
             Require(MitmSettings::Load()==changed,"closing without save preserves settings");
@@ -667,16 +707,45 @@ public:
             Require(MitmSettings::Save(original),"restore harness ini values");
             WritePrivateProfileString(L"options",L"MitmSkipUpstreamVerify",originalSkip[0] ? originalSkip : nullptr,path);
             WritePrivateProfileString(L"options",L"DecryptHTTPS",originalDecrypt[0] ? originalDecrypt : nullptr,path);
+            WritePrivateProfileString(L"options",L"DecryptQUIC",originalQuic[0] ? originalQuic : nullptr,path);
             if(!hadIni) Require(DeleteFile(path)!=FALSE,"remove owned harness ini");
             page.ApplyMonitorSettings();fake.caOk=false;
         }
         fake.delay=300;page.m_recording=true;page.m_monitor.SetCheck(BST_UNCHECKED);
+        const auto finalSequence=fake.count.load()+70;fake.count=finalSequence;
         const DWORD stopStarted=GetTickCount();page.UpdateMonitorStatus();
         Require(GetTickCount()-stopStarted<200,"monitor stop does not wait for disk work on the UI thread");
         Require(!page.IsMonitoring() && page.m_stopJob && !page.m_monitor.IsWindowEnabled(),"stop blocks rapid restart until drained");
         Pump(page,[&] {return !page.m_stopJob;});
         Require(page.m_monitor.IsWindowEnabled() && page.m_monitor.GetCheck()==BST_UNCHECKED,"stop completion restores controls without restarting capture");
         fake.delay=0;
+        Pump(page,[&] {return page.m_protocol->next==finalSequence && !page.m_protocol->finalPoll && !page.m_protocol->job;});
+        const auto finalQueries=fake.queries.load();idleFor(1200);
+        Require(fake.queries==finalQueries,"final multi-page drain leaves no recurring queries");
+        // HTTP/3 progress updates must preserve the selected list item and view.
+        using J=ProtocolView::Json;
+        auto h3=page.m_protocol->history.rows.back().record;
+        h3["protocol"]="h3";h3["connection"]["decrypted"]=true;h3["connection"]["id"]="h3-test";
+        h3["exchange"]["id"]=0;h3["sequence"]=1;
+        page.m_protocol->history.Clear();page.m_protocol->selected.clear();
+        auto pushH3=[&] {
+            auto batch=ProtocolView::Poll([&](const J&){return J{{"run_id","h3-page"},{"next",h3["sequence"]},
+                {"records",J::array({h3})}};},"",0,false);
+            page.m_protocol->history.Add(std::move(batch.rows.front()));page.RebuildRequests();
+        };
+        pushH3();page.m_requests.SetItemState(0,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);
+        const auto selectedH3=page.m_protocol->selected;
+        Require(!selectedH3.empty(),"HTTP/3 row selected");
+        page.m_protocol->history.rows.front().hex=true;
+        for(unsigned n=2;n<7;++n) {
+            h3["sequence"]=n;h3["exchange"]["response"]["body_bytes"]=n*112;pushH3();
+            Require(page.m_requests.GetItemCount()==1 && page.m_requests.GetItemText(0,0)==L"1","HTTP/3 progress updates original row");
+            Require(page.m_protocol->selected==selectedH3 && page.m_requests.GetNextItem(-1,LVNI_SELECTED)==0,"HTTP/3 selection preserved");
+            Require(page.m_protocol->history.rows.front().hex,"HTTP/3 HexView preference preserved");
+            Require(page.m_protocol->history.rows.front().responseBytes==n*112,"HTTP/3 body counter refreshed");
+        }
+        h3["sequence"]=7;h3["exchange"]["id"]=4;pushH3();
+        Require(page.m_requests.GetItemCount()==2 && page.m_protocol->selected==selectedH3,"another HTTP/3 stream gets its own row");
         page.DestroyWindow();parent.DestroyWindow();
         std::cout << "PASS actual page controls: saved process names, clean address, no raw log, per-request HEX, selection races, headers, decoded body, eviction, resize, bounds, clear\n";
     }

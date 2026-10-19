@@ -270,6 +270,7 @@ fn hello(bytes: &[u8]) -> Option<Hello> {
     Some(result)
 }
 impl Probe {
+    pub fn complete(&self)->bool {self.contexts.iter().any(|c|c.done)}
     pub fn feed(&mut self, side: usize, bytes: &[u8]) {
         if self.attempts >= 128 {
             if self.version.is_some() && !self.contexts.iter().any(|c| c.done) {

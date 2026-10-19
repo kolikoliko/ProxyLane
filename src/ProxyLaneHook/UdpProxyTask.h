@@ -7,6 +7,7 @@
 #include <vector>
 #include <memory>
 class CProtocolTap;
+class CQuicBridge;
 
 class CProxyUDPTaskMgr;
 
@@ -37,6 +38,7 @@ public:
 		const char *data, int length);
 	BOOL ForwardServerDatagram(_SockAddr source,
 		const char *data, int length);
+    BOOL ForwardUpstreamDatagram(CPRCUdpPeer::_CSAddrInfo target,const char *data,int length);
 	BOOL CreateServerPeer();
 	VOID ScheduleServerReconnect(int errorCode);
 	BOOL QueueDatagram(CPRCUdpPeer::_CSAddrInfo target,
@@ -63,8 +65,12 @@ private:
 		BOOL hasApplicationEndpoint;
 		BOOL firstDatagramLogged;
 		std::shared_ptr<CProtocolTap> capture;
+        std::shared_ptr<CQuicBridge> quic;
+        CPRCUdpPeer::_CSAddrInfo quicTarget;
 	};
 	typedef std::list<UdpRoute> UdpRouteList;
+    BOOL DeliverServerDatagram(UdpRoute&,const char*,int);
+    void PumpQuic(UdpRoute&);
 	UdpRouteList m_routes;
 	struct PendingDatagram
 	{
