@@ -9,7 +9,7 @@
   "exit.continue": "Continue cleanup",
   "exit.cleanup_error": "Cleanup could not finish (error %u). ProxyLane will stay open.",
   "exit.anyway": "Exit ProxyLane only",
-  "exit.terminate": "End all proxied processes and exit",
+  "exit.terminate": "Force end all and exit",
   "exit.terminate_failed": "%u processes could not be ended. ProxyLane will stay open. Resolve the errors and retry, or choose Exit ProxyLane only.",
   "log.connection_ipv6_blocked": "[Blocked] %s (%lu) → %s · %s · IPv6 disabled\r\n",
   "log.connection_task_detail": "[Failed] %s (%lu) → %s · %s · %s · Error %lu\r\n",

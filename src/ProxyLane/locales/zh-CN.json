@@ -9,7 +9,7 @@
   "exit.continue": "继续清理",
   "exit.cleanup_error": "清理未能完成（错误 %u），ProxyLane 已保持运行。",
   "exit.anyway": "仅退出 ProxyLane",
-  "exit.terminate": "结束所有已代理的进程并退出",
+  "exit.terminate": "强制结束所有并退出",
   "exit.terminate_failed": "%u 个进程未能结束，ProxyLane 已保持运行。您可以处理后重试，或选择“仅退出 ProxyLane”。",
   "log.connection_ipv6_blocked": "[拦截] %s (%lu) → %s · %s · IPv6 已禁用\r\n",
   "log.connection_task_detail": "[失败] %s (%lu) → %s · %s · %s · 错误 %lu\r\n",
