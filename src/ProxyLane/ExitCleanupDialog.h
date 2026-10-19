@@ -106,7 +106,7 @@ protected:
 private:
 	void RefreshProcesses()
 	{
-		// Enumerating system processes stays off the UI thread. At most one
+		// Checking registered processes stays off the UI thread. At most one
 		// refresh runs at a time; read its snapshot only after the thread exits.
 		if (m_refreshWorker)
 		{
@@ -226,10 +226,12 @@ private:
 		{
 			self->result = ExitProcessCleanup::Run<_myPROCESSINFO>(
 				[self](std::vector<_myPROCESSINFO>& processes) {
-					self->m_page->GetRunningHookedProcesses(processes);
+					if (!self->m_page->GetRunningHookedProcesses(processes)) throw DWORD(ERROR_RETRY);
 					InterlockedExchange(&self->m_hasProcesses, processes.empty() ? 0 : 1);
 				}, self->m_cancel);
 		}
+		catch (DWORD error)
+		{ self->workerError = error; self->result.status = ExitProcessCleanup::Failed; }
 		catch (...)
 		{ self->workerError = ERROR_NOT_ENOUGH_MEMORY; self->result.status = ExitProcessCleanup::Failed; }
 		return 0;

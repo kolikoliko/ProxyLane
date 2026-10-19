@@ -1,11 +1,11 @@
 ﻿{
   "exit.processes_title": "仍有已代理的进程在运行",
-  "exit.processes_warning": "当前有 %u 个由本次 ProxyLane 接管的进程仍在运行。\n如果仅退出ProxyLane，这些应用的网络连接将中断，但后续部分网络活动可能直接联网，不再经过代理。",
+  "exit.processes_warning": "当前有 %u 个由本次 ProxyLane 接管的进程仍在运行。\n如果仅退出ProxyLane，这些应用的网络连接将中断，但后续部分网络活动可能直接联网，不再经过代理。\n建议先手动关闭应用，以免丢失未保存的内容。所有已代理进程退出后，ProxyLane 将自动退出。",
   "exit.return": "返回",
   "exit.cleaning": "正在结束已代理进程…",
   "exit.stop_cleanup": "停止清理",
   "exit.stopping": "正在停止清理，请稍候…",
-  "exit.timeout": "清理已超时，当前仍有 %u 个已代理进程在运行。\n如果仅退出ProxyLane，这些应用的网络连接将中断，但后续部分网络活动可能直接联网，不再经过代理。",
+  "exit.timeout": "清理已超时，当前仍有 %u 个已代理进程在运行。\n如果仅退出ProxyLane，这些应用的网络连接将中断，但后续部分网络活动可能直接联网，不再经过代理。\n建议先手动关闭应用，以免丢失未保存的内容。所有已代理进程退出后，ProxyLane 将自动退出。",
   "exit.continue": "继续清理",
   "exit.cleanup_error": "清理未能完成（错误 %u），ProxyLane 已保持运行。",
   "exit.anyway": "仅退出 ProxyLane",

@@ -684,7 +684,13 @@ void CProxyLaneDlg::OnCancel()
 	// automation failures use EndDialog directly and remain non-interactive.
 	{
 		std::vector<_myPROCESSINFO> processes;
-		m_MainTab.GetPage3()->GetRunningHookedProcesses(processes);
+		if (!m_MainTab.GetPage3()->GetRunningHookedProcesses(processes))
+		{
+			MessageBox(Localization::Format(_T("exit.cleanup_error"), ERROR_RETRY),
+				Localization::Get(_T("exit.processes_title")), MB_OK | MB_ICONWARNING);
+			m_confirmingExit = FALSE;
+			return;
+		}
 		if (!processes.empty())
 		{
 			CString details;

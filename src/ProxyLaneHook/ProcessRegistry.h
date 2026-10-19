@@ -69,7 +69,7 @@ public:
 		}
 		for (Records::const_iterator it = snapshot.begin(); it != snapshot.end(); ++it)
 		{
-			if (!HasExited(it->second)) continue;
+			if (!ProxyProcessIdentity::HasExited(it->second)) continue;
 			ScopedLock lock(m_lock);
 			Records::iterator current = m_processes.find(it->first);
 			// A concurrent registration of a reused PID must survive this scan.
@@ -77,6 +77,20 @@ public:
 				current->second.processCreateTime == it->second.processCreateTime)
 				m_processes.erase(current);
 		}
+	}
+
+	DWORD SnapshotHooked(HookProcessIdentityInfo* identities, DWORD capacity) override
+	{
+		ScopedLock lock(m_lock);
+		DWORD count = 0;
+		for (Records::const_iterator it = m_processes.begin(); it != m_processes.end(); ++it)
+			if (it->second.hookState == PROCESS_HOOK_STATE_SUCCEEDED) ++count;
+		if (!identities || capacity < count) return count;
+		DWORD index = 0;
+		for (Records::const_iterator it = m_processes.begin(); it != m_processes.end(); ++it)
+			if (it->second.hookState == PROCESS_HOOK_STATE_SUCCEEDED)
+				identities[index++] = it->second;
+		return count;
 	}
 
 private:
@@ -89,22 +103,6 @@ private:
 	private:
 		CRITICAL_SECTION& m_lock;
 	};
-	static BOOL HasExited(const HookProcessIdentityInfo& identity)
-	{
-		HANDLE process = OpenProcess(SYNCHRONIZE | 0x1000 /* QUERY_LIMITED_INFORMATION */,
-			FALSE, identity.dwProcessId);
-		if (!process)
-			process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_INFORMATION, FALSE, identity.dwProcessId);
-		if (!process)
-			return GetLastError() == ERROR_INVALID_PARAMETER; // Access denied is not proof of exit.
-		BOOL exited = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
-		FILETIME created, ended, kernel, user;
-		if (!exited && GetProcessTimes(process, &created, &ended, &kernel, &user))
-			exited = (((ULONGLONG)created.dwHighDateTime << 32) | created.dwLowDateTime)
-				!= identity.processCreateTime;
-		CloseHandle(process);
-		return exited;
-	}
 	CProcessRegistry(const CProcessRegistry&);
 	CProcessRegistry& operator=(const CProcessRegistry&);
 	CRITICAL_SECTION m_lock;

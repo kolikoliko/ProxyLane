@@ -1,11 +1,11 @@
 ﻿{
   "exit.processes_title": "Proxied processes are still running",
-  "exit.processes_warning": "Processes managed by this ProxyLane session that are still running: %u.\nIf you exit ProxyLane only, these applications' network connections will be interrupted, but some subsequent network activity may connect directly without using the proxy.",
+  "exit.processes_warning": "Processes managed by this ProxyLane session that are still running: %u.\nIf you exit ProxyLane only, these applications' network connections will be interrupted, but some subsequent network activity may connect directly without using the proxy.\nClose applications manually first to avoid losing unsaved work. ProxyLane will exit automatically once all proxied processes have ended.",
   "exit.return": "Go back",
   "exit.cleaning": "Ending proxied processes…",
   "exit.stop_cleanup": "Stop cleanup",
   "exit.stopping": "Stopping cleanup. Please wait…",
-  "exit.timeout": "Cleanup timed out. Proxied processes still running: %u.\nIf you exit ProxyLane only, these applications' network connections will be interrupted, but some subsequent network activity may connect directly without using the proxy.",
+  "exit.timeout": "Cleanup timed out. Proxied processes still running: %u.\nIf you exit ProxyLane only, these applications' network connections will be interrupted, but some subsequent network activity may connect directly without using the proxy.\nClose applications manually first to avoid losing unsaved work. ProxyLane will exit automatically once all proxied processes have ended.",
   "exit.continue": "Continue cleanup",
   "exit.cleanup_error": "Cleanup could not finish (error %u). ProxyLane will stay open.",
   "exit.anyway": "Exit ProxyLane only",

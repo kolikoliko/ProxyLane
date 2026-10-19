@@ -477,9 +477,8 @@ static BOOL GetSnapshotProcessStartTimes(std::map<DWORD, ULONGLONG>& startTimes)
 	return !startTimes.empty();
 }
 
-int GetProcessList(list<_myPROCESSINFO> &ls, BOOL* complete = NULL)
+int GetProcessList(list<_myPROCESSINFO> &ls)
 {
-	if (complete) *complete = FALSE;
 	int nCount = 0;
 	PROCESSENTRY32 pe;
 	DWORD dwRet;
@@ -534,7 +533,6 @@ int GetProcessList(list<_myPROCESSINFO> &ls, BOOL* complete = NULL)
 			nCount++;
 		}
 
-		if (complete) *complete = GetLastError() == ERROR_NO_MORE_FILES;
 		::CloseHandle(hSP);
 	}
 
@@ -550,18 +548,39 @@ BOOL CPage3::GetRunningHookedProcesses(std::vector<_myPROCESSINFO>& processes)
 {
 	processes.clear();
 	if (!m_processRegistry) return FALSE;
-	std::list<_myPROCESSINFO> current;
-	BOOL complete = FALSE;
-	GetProcessList(current, &complete);
-	for (std::list<_myPROCESSINFO>::const_iterator it = current.begin();
-		it != current.end(); ++it)
+	// Fetch anew every round so hooks registered while the dialog is open are
+	// included. Retry a growing registry without accepting a truncated snapshot.
+	std::vector<HookProcessIdentityInfo> identities(64);
+	bool complete = false;
+	for (int attempt = 0; attempt < 8; ++attempt)
 	{
-		HookProcessIdentityInfo identity = { 0 };
-		if (it->hasStartTime && m_processRegistry->Get(it->pid, it->startTimeValue, &identity) &&
-			identity.hookState == PROCESS_HOOK_STATE_SUCCEEDED)
-			processes.push_back(*it);
+		const DWORD count = m_processRegistry->SnapshotHooked(&identities[0],
+			static_cast<DWORD>(identities.size()));
+		if (count <= identities.size())
+		{
+			identities.resize(count);
+			complete = true;
+			break;
+		}
+		identities.resize(static_cast<size_t>(count) + 64);
 	}
-	return complete;
+	if (!complete) return FALSE;
+	for (size_t i = 0; i < identities.size(); ++i)
+	{
+		const HookProcessIdentityInfo& identity = identities[i];
+		if (ProxyProcessIdentity::HasExited(identity)) continue;
+		_myPROCESSINFO process = {};
+		process.pid = identity.dwProcessId;
+		process.hasStartTime = TRUE;
+		process.startTimeValue = identity.processCreateTime;
+		_tcsncpy_s(process.propath, _countof(process.propath), identity.szAppPath, _TRUNCATE);
+		const TCHAR* name = _tcsrchr(process.propath, _T('\\'));
+		name = name ? name + 1 : process.propath;
+		const CString displayName = *name ? CString(name) : Localization::Get(_T("page3.unknown_process"));
+		_tcsncpy_s(process.proname, _countof(process.proname), displayName, _TRUNCATE);
+		processes.push_back(process);
+	}
+	return TRUE;
 }
 
 BOOL InjectDll2(HANDLE hProc, DWORD dwPid, DWORD dwTid, LPCSTR lpszPipeName)
