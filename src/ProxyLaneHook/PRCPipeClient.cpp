@@ -397,6 +397,14 @@ BOOL CPRCPipeClient::PRCLogBlockedIPv6(const HookBlockedIPv6Info& info)
 	return WritePipe(&header, sizeof(header)) && WritePipe(&info, sizeof(info));
 }
 
+BOOL CPRCPipeClient::PRCLogBlockedUDP(const HookBlockedUdpInfo& info)
+{
+	PRCPipeDataHead header = { 0 };
+	header.action = PRCPD_BLOCKED_UDP;
+	header.dataSize = sizeof(info);
+	return WritePipe(&header, sizeof(header)) && WritePipe(&info, sizeof(info));
+}
+
 BOOL CPRCPipeClient::PRCLogtext(LPCWSTR lpsz)
 {
 	PRCPipeDataHead hdr;

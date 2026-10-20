@@ -379,6 +379,27 @@ void CHookWinsock::LogBlockedIPv6(SOCKET socketHandle,
 		m_RequestPipe.Disconnect();
 }
 
+void CHookWinsock::LogBlockedUDP(SOCKET socketHandle, const SOCKADDR* destination, int length)
+{
+	HookBlockedUdpInfo info = { 0 };
+	GetSocketDestination(socketHandle, destination, length, &info.destination);
+	if (!m_udpBlockLogLimiter.Allow(info.destination)) return;
+	info.processId = GetCurrentProcessId();
+	info.socketType = SOCK_DGRAM;
+	WCHAR processPath[MAX_PATH] = L"";
+	GetModuleFileNameW(NULL, processPath, _countof(processPath));
+	processPath[_countof(processPath) - 1] = L'\0';
+	const WCHAR* name = wcsrchr(processPath, L'\\');
+	name = name ? name + 1 : processPath;
+	wcscpy_s(info.processName, name[0] ? name : L"Unknown");
+	if (info.destination.IsIPv4() && m_DummyDNS.IsDummyIP(info.destination.GetdwIP()))
+		m_DummyDNS.GetHostByIP(info.destination.GetdwIP(), info.domain, sizeof(info.domain) - 1);
+	else if (info.destination.IsIPv6() && m_DummyDNS.IsDummyIPv6(info.destination.GetAddr6()))
+		m_DummyDNS.GetHostByIPv6(info.destination.GetAddr6(), info.domain, sizeof(info.domain));
+	CScopedCriticalSection pipeLock(&m_RequestPipeLock);
+	if (EnsureRequestPipe() && !m_RequestPipe.PRCLogBlockedUDP(info)) m_RequestPipe.Disconnect();
+}
+
 CString CHookWinsock::GetLastError()
 {
 	return m_szLastError;
@@ -954,6 +975,7 @@ CHookWinsock::inhook_connect(SOCKET s, const struct sockaddr FAR * name, int nam
 		getsockopt(s, SOL_SOCKET, SO_TYPE, (char*)&socketType, &socketTypeLength) == 0 &&
 		socketType == SOCK_DGRAM && !addrname.IsLoopback())
 	{
+		LogBlockedUDP(s, name, namelen);
 		WSASetLastError(WSAEACCES);
 		return SOCKET_ERROR;
 	}
@@ -1011,6 +1033,7 @@ CHookWinsock::inhook_WSAConnect(SOCKET s, const struct sockaddr* name, int namel
 		getsockopt(s, SOL_SOCKET, SO_TYPE, (char*)&socketType, &socketTypeLength) == 0 &&
 		socketType == SOCK_DGRAM && !addrname.IsLoopback())
 	{
+		LogBlockedUDP(s, name, namelen);
 		WSASetLastError(WSAEACCES);
 		return SOCKET_ERROR;
 	}
@@ -1168,6 +1191,7 @@ INT PASCAL CHookWinsock::inhook_WSASendMsg(SOCKET s, LPWSAMSG lpMsg,
 	if (m_psi.bBlockUDP && (!lpMsg ||
 		!IsUdpLoopbackDestination(s, lpMsg->name, lpMsg->namelen)))
 	{
+		LogBlockedUDP(s, lpMsg ? lpMsg->name : NULL, lpMsg ? lpMsg->namelen : 0);
 		WSASetLastError(WSAEACCES);
 		return SOCKET_ERROR;
 	}
@@ -1249,14 +1273,6 @@ INT PASCAL CHookWinsock::inhook_WSASendMsg(SOCKET s, LPWSAMSG lpMsg,
 
 HookDecision CHookWinsock::HackConnect(SOCKET s, _SockAddr &addrname)
 {
-	if (addrname.IsIPv4() && *(DWORD*)&addrname.sa_data[6] == 'pass' &&
-		*(DWORD*)&addrname.sa_data[10] == 'port')
-	{
-		*(DWORD*)&addrname.sa_data[6] = 0;
-		*(DWORD*)&addrname.sa_data[10] = 0;
-		return HOOK_BYPASS;
-	}
-
 	//check SO_REUSEADDR?
 	int nSockType = SOCK_STREAM;
 	int nTypeLen = sizeof(nSockType);
@@ -1370,7 +1386,8 @@ HookDecision CHookWinsock::HackConnect(SOCKET s, _SockAddr &addrname)
 	{
 		const int registrationError = WSAGetLastError();
 		if (registrationError != WSAEOPNOTSUPP &&
-			registrationError != WSAEHOSTUNREACH)
+			registrationError != WSAEHOSTUNREACH &&
+			registrationError != WSAENETUNREACH)
 			m_RequestPipe.Disconnect();
 		return HOOK_FAILED;
 	}
@@ -1536,6 +1553,7 @@ int WSAAPI CHookWinsock::inhook_sendto(SOCKET s, const char* buf, int len, int f
 	if (m_psi.bBlockUDP &&
 		!IsUdpLoopbackDestination(s, to, tolen))
 	{
+		LogBlockedUDP(s, to, tolen);
 		WSASetLastError(WSAEACCES);
 		return SOCKET_ERROR;
 	}
@@ -1594,6 +1612,7 @@ int WSAAPI CHookWinsock::inhook_WSASendTo(
 	if (m_psi.bBlockUDP &&
 		!IsUdpLoopbackDestination(s, lpTo, iToLen))
 	{
+		LogBlockedUDP(s, lpTo, iToLen);
 		WSASetLastError(WSAEACCES);
 		return SOCKET_ERROR;
 	}
@@ -1674,14 +1693,6 @@ HookDecision CHookWinsock::HackSendTo(SOCKET s, _SockAddr &addrname,
 {
 	if (!m_psi.bHookUDP)
 		return HOOK_BYPASS;
-
-	if (addrname.IsIPv4() && *(DWORD*)&addrname.sa_data[6] == 'pass' &&
-		*(DWORD*)&addrname.sa_data[10] == 'port')
-	{
-		*(DWORD*)&addrname.sa_data[6] = 0;
-		*(DWORD*)&addrname.sa_data[10] = 0;
-		return HOOK_BYPASS;
-	}
 
 	int nSockType;
 	int nTypeLen = sizeof(nSockType);

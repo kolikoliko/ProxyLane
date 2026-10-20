@@ -1276,19 +1276,28 @@ BOOL CPage1::StartProxyTestPhase(const PRCClient& client, int phase,
 	LPCTSTR statusKey)
 {
 	if (!m_pTestProxy || m_pProxyTester)
+	{
+		WSASetLastError(WSAEINVAL);
 		return FALSE;
+	}
 
 	m_pProxyTester = m_pTestProxy->CreateTester();
 	if (!m_pProxyTester)
+	{
+		WSASetLastError(WSAENOBUFS);
 		return FALSE;
+	}
+	WSASetLastError(0);
 
 	m_proxyTestPhase = phase;
 	PRCClient mutableClient = client;
 	if (!m_pProxyTester->Start(this, &mutableClient, &m_testProxyInfo))
 	{
+		const int error = WSAGetLastError();
 		m_pProxyTester->Release();
 		m_pProxyTester = NULL;
 		m_proxyTestPhase = PROXY_TEST_NONE;
+		WSASetLastError(error);
 		return FALSE;
 	}
 
@@ -1298,15 +1307,51 @@ BOOL CPage1::StartProxyTestPhase(const PRCClient& client, int phase,
 	return TRUE;
 }
 
+static CString ProxyTestErrorDescription(int error)
+{
+	// Proxy negotiation errors share numeric values with Win32 errors; do not
+	// pass these application codes to the Windows system message table.
+	LPCTSTR key = NULL;
+	switch (error)
+	{
+	case PROXYERROR_NOCONN: key = _T("test.no_connection"); break;
+	case PROXYERROR_REQUESTFAILED: key = _T("test.target_failed"); break;
+	case PROXYERROR_AUTHREQUIRED: key = _T("test.auth_required"); break;
+	case PROXYERROR_AUTHTYPEUNKNOWN: key = _T("test.auth_unknown"); break;
+	case PROXYERROR_AUTHFAILED:
+	case PROXYERROR_AUTHNOLOGON: key = _T("test.auth_failed"); break;
+	case PROXYERROR_CANTRESOLVEHOST: key = _T("test.resolve_failed"); break;
+	case PROXYERROR_SECURE_UNAVAILABLE: key = _T("test.secure_unavailable"); break;
+	case PROXYERROR_SECURE_HANDSHAKE: key = _T("test.secure_handshake_failed"); break;
+	case PROXYERROR_UDP_UNSUPPORTED: key = _T("test.udp_unsupported"); break;
+	case PROXYERROR_UDP_RELAY_FAILED: key = _T("test.udp_relay_failed"); break;
+	}
+	if (key) return Localization::Get(key);
+
+	LPTSTR buffer = NULL;
+	CString description;
+	if (::FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+		FORMAT_MESSAGE_IGNORE_INSERTS, NULL, static_cast<DWORD>(error), 0,
+		reinterpret_cast<LPTSTR>(&buffer), 0, NULL))
+	{
+		description = buffer;
+		description.Trim();
+	}
+	if (buffer) LocalFree(buffer);
+	return description.IsEmpty() ? Localization::Get(_T("test.error_description_unavailable")) : description;
+}
+
 BOOL CPage1::SupportsIpv6ProxyTest()
 {
 	const int proxyType = m_testProxyInfo.GetProxyType();
-	return proxyType == PROXYTYPE_SOCKS5 ||
+	return proxyType == PROXYTYPE_NOPROXY || proxyType == PROXYTYPE_SOCKS5 ||
 		proxyType == PROXYTYPE_HTTP10 || proxyType == PROXYTYPE_HTTP11;
 }
 
 BOOL CPage1::StartIpv6ProxyTest()
 {
+	m_testIpv6Error = 0;
+	m_testIpv6Address.Empty();
 	if (!SupportsIpv6ProxyTest())
 	{
 		m_testIpv6Result = IPV6_TEST_UNSUPPORTED;
@@ -1337,8 +1382,15 @@ BOOL CPage1::StartIpv6ProxyTest()
 		return FALSE;
 	}
 	ipv6Client.dstAddr.SetPort(53);
-	return StartProxyTestPhase(ipv6Client, PROXY_TEST_IPV6,
-		_T("status.testing_ipv6"));
+	m_testIpv6Address = ipv6TestAddress;
+	if (StartProxyTestPhase(ipv6Client, PROXY_TEST_IPV6,
+		_T("status.testing_ipv6")))
+		return TRUE;
+	// A direct connect may fail immediately (for example, no IPv6 route).
+	m_testIpv6Error = WSAGetLastError();
+	if (!m_testIpv6Error) m_testIpv6Error = WSAEFAULT;
+	m_testIpv6Result = ClassifyIpv6TestResult(m_testIpv6Error);
+	return FALSE;
 }
 
 int CPage1::ClassifyIpv6TestResult(int errorCode) const
@@ -1346,17 +1398,14 @@ int CPage1::ClassifyIpv6TestResult(int errorCode) const
 	if (errorCode == 0)
 		return IPV6_TEST_AVAILABLE;
 
-	// The ordinary TCP test has already proved that the proxy and its
-	// authentication/secure transport work. A target negotiation failure here
-	// therefore means the proxy could not establish this literal IPv6 target.
+	// Failure of one target is not proof that IPv6 is unsupported.
 	if (errorCode == PROXYERROR_REQUESTFAILED ||
 		errorCode == WSAEAFNOSUPPORT || errorCode == WSAENETUNREACH ||
-		errorCode == WSAEHOSTUNREACH)
-		return IPV6_TEST_UNAVAILABLE;
+		errorCode == WSAEHOSTUNREACH || errorCode == WSAECONNREFUSED ||
+		errorCode == WSAEADDRNOTAVAIL || errorCode == WSAENETDOWN)
+		return IPV6_TEST_TARGET_FAILED;
 
-	// A new connection to the proxy can still fail transiently, and a timeout
-	// cannot distinguish proxy trouble from a temporarily unreachable public
-	// probe target. Report that as unknown instead of a false negative.
+	// Timeouts and unrelated setup/transport errors remain inconclusive.
 	return IPV6_TEST_UNKNOWN;
 }
 
@@ -1401,6 +1450,7 @@ void CPage1::OnProxyTesterCallback(IProxyTester *pTester, int nErrorCode, WPARAM
 
 		if (completedPhase == PROXY_TEST_IPV6)
 		{
+			m_testIpv6Error = nCode;
 			m_testIpv6Result = ClassifyIpv6TestResult(nCode);
 			// IPv6 capability is supplementary information. The ordinary proxy
 			// test remains successful even when IPv6 is unavailable or unknown.
@@ -1436,13 +1486,13 @@ void CPage1::OnProxyTesterCallback(IProxyTester *pTester, int nErrorCode, WPARAM
 
 		if(nCode == 0)
 		{
-			const BOOL ipv6Unavailable =
-				m_testIpv6Result == IPV6_TEST_UNAVAILABLE ||
+			const BOOL ipv6NeedsAttention =
+				m_testIpv6Result == IPV6_TEST_TARGET_FAILED ||
 				m_testIpv6Result == IPV6_TEST_UNSUPPORTED;
 			const BOOL ipv6AlreadyBlocked =
 				m_btnBlockIPv6.GetCheck() == BST_CHECKED;
 			const BOOL suggestIpv6Blocking =
-				ipv6Unavailable && !ipv6AlreadyBlocked;
+				ipv6NeedsAttention && !ipv6AlreadyBlocked;
 			szText = Localization::Get(m_testUdpRequested
 				? _T("test.success_tcp_udp") : _T("test.success"));
 			switch (m_testIpv6Result)
@@ -1450,8 +1500,8 @@ void CPage1::OnProxyTesterCallback(IProxyTester *pTester, int nErrorCode, WPARAM
 			case IPV6_TEST_AVAILABLE:
 				szText += Localization::Get(_T("test.ipv6_available"));
 				break;
-			case IPV6_TEST_UNAVAILABLE:
-				szText += Localization::Get(_T("test.ipv6_unavailable"));
+			case IPV6_TEST_TARGET_FAILED:
+				szText += Localization::Get(_T("test.ipv6_target_failed"));
 				break;
 			case IPV6_TEST_UNSUPPORTED:
 				szText += Localization::Get(_T("test.ipv6_unsupported"));
@@ -1462,6 +1512,20 @@ void CPage1::OnProxyTesterCallback(IProxyTester *pTester, int nErrorCode, WPARAM
 			default:
 				szText += Localization::Get(_T("test.ipv6_unknown"));
 				break;
+			}
+			if (!m_testIpv6Address.IsEmpty())
+			{
+				CString detail;
+				detail.Format(Localization::Get(_T("test.ipv6_target")),
+					static_cast<LPCTSTR>(m_testIpv6Address));
+				szText += detail;
+				if (m_testIpv6Error)
+				{
+					const CString description = ProxyTestErrorDescription(m_testIpv6Error);
+					detail.Format(Localization::Get(_T("test.ipv6_error")),
+						static_cast<LPCTSTR>(description));
+					szText += detail;
+				}
 			}
 			if (m_profileDirty && m_runtimeDirty)
 			{
@@ -1477,21 +1541,24 @@ void CPage1::OnProxyTesterCallback(IProxyTester *pTester, int nErrorCode, WPARAM
 			}
 			else if (m_testIpv6Result == IPV6_TEST_AVAILABLE)
 				m_staticTestProxy.SetStatus(Localization::Get(_T("status.test_passed_saved")), CStatusLabel::TONE_SUCCESS);
-			else if (ipv6Unavailable && ipv6AlreadyBlocked)
+			else if (ipv6NeedsAttention && ipv6AlreadyBlocked)
 				m_staticTestProxy.SetStatus(Localization::Get(
 					_T("status.test_passed_ipv6_blocked")),
 					CStatusLabel::TONE_INFO);
 			else
 				m_staticTestProxy.SetStatus(Localization::Get(
-					m_testIpv6Result == IPV6_TEST_UNAVAILABLE ||
 					m_testIpv6Result == IPV6_TEST_UNSUPPORTED
-						? _T("status.test_passed_ipv6_unavailable")
-						: _T("status.test_passed_ipv6_unknown")),
+						? _T("status.test_passed_ipv6_unsupported")
+						: m_testIpv6Result == IPV6_TEST_TARGET_FAILED
+							? _T("status.test_passed_ipv6_target_failed")
+							: _T("status.test_passed_ipv6_unknown")),
 					CStatusLabel::TONE_WARNING);
 
 			if (suggestIpv6Blocking)
 			{
-				szText += Localization::Get(_T("test.ipv6_block_suggestion"));
+				szText += Localization::Get(m_testIpv6Result == IPV6_TEST_UNSUPPORTED
+					? _T("test.ipv6_block_suggestion")
+					: _T("test.ipv6_failed_block_suggestion"));
 				if (MessageBox(szText, Localization::Get(_T("test.title")),
 					MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON1) == IDYES)
 				{
@@ -1503,7 +1570,7 @@ void CPage1::OnProxyTesterCallback(IProxyTester *pTester, int nErrorCode, WPARAM
 			else
 			{
 				const UINT icon = m_testIpv6Result == IPV6_TEST_AVAILABLE ||
-					(ipv6Unavailable && ipv6AlreadyBlocked)
+					(ipv6NeedsAttention && ipv6AlreadyBlocked)
 						? MB_ICONINFORMATION : MB_ICONWARNING;
 				MessageBox(szText, Localization::Get(_T("test.title")), icon);
 			}

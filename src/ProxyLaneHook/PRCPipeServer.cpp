@@ -718,13 +718,17 @@ DWORD WINAPI CPRCPipeServer::_InstanceThread(HANDLE hPipe, HANDLE hThread)
 			break;
 
 		case PRCPD_BLOCKED_IPV6:
+		case PRCPD_BLOCKED_UDP:
 		{
 			HookBlockedIPv6Info info;
 			if (hdr.dataSize != sizeof(info) ||
 				!ReadPipeExactly(hPipe, &info, sizeof(info)))
 				goto SEC_ERROR;
 			if ((pipeClientPid && info.processId != pipeClientPid) ||
-				!info.destination.IsIPv6() ||
+				(hdr.action == PRCPD_BLOCKED_IPV6 && !info.destination.IsIPv6()) ||
+				(hdr.action == PRCPD_BLOCKED_UDP && (info.socketType != SOCK_DGRAM ||
+					(!info.destination.IsIPv4() && !info.destination.IsIPv6() &&
+						info.destination.sa_family != AF_UNSPEC))) ||
 				!memchr(info.domain, 0, sizeof(info.domain)) ||
 				!wmemchr(info.processName, 0, _countof(info.processName)))
 				goto SEC_ERROR;
@@ -736,7 +740,8 @@ DWORD WINAPI CPRCPipeServer::_InstanceThread(HANDLE hPipe, HANDLE hThread)
 			client.dstAddr = info.destination;
 			strcpy_s(client.szDomainName, info.domain);
 			m_pPRC->m_pGlobalProxy->GetLogInstance()->OnConnectionEvent(
-				IProxyLog::IPV6_BLOCKED, &client, info.processName);
+				hdr.action == PRCPD_BLOCKED_UDP ? IProxyLog::UDP_BLOCKED : IProxyLog::IPV6_BLOCKED,
+				&client, info.processName);
 		}
 		break;
 

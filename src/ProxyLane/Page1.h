@@ -53,7 +53,7 @@ private:
 	{
 		IPV6_TEST_NOT_RUN = 0,
 		IPV6_TEST_AVAILABLE,
-		IPV6_TEST_UNAVAILABLE,
+		IPV6_TEST_TARGET_FAILED,
 		IPV6_TEST_UNKNOWN,
 		IPV6_TEST_UNSUPPORTED,
 		IPV6_TEST_INVALID_CONFIG
@@ -71,6 +71,8 @@ private:
 	BOOL m_bIsTesting;
 	int m_proxyTestPhase;
 	int m_testIpv6Result;
+	int m_testIpv6Error = 0;
+	CString m_testIpv6Address;
 	BOOL m_testUdpRequested;
 	ProxyInfo m_testProxyInfo;
 	BOOL m_profileDirty;

@@ -143,25 +143,6 @@ public:
 			reinterpret_cast<SOCKADDR_IN *>(this)->sin_port = htons(Port);
 	}
 
-	//
-	BYTE GetByte_sin_zero(int nPos)
-	{
-		SOCKADDR_IN *psa = (SOCKADDR_IN*)this;
-		return psa->sin_zero[nPos];
-	}
-
-	WORD GetWord_sin_zero(int nPos)
-	{
-		SOCKADDR_IN *psa = (SOCKADDR_IN*)this;
-		return *((WORD*)&psa->sin_zero[0]+nPos);
-	}
-
-	DWORD GetDword_sin_zero(int nPos)
-	{
-		SOCKADDR_IN *psa = (SOCKADDR_IN*)this;
-		return *((DWORD*)&psa->sin_zero[0]+nPos);
-	}
-
 	BOOL SameAddress(const _SockAddr &_dst) const
 	{
 		if (sa_family != _dst.sa_family)
@@ -412,6 +393,9 @@ struct HookBlockedIPv6Info
 	WCHAR processName[MAX_PATH];
 };
 
+// UDP uses the same fixed-width payload, with its own pipe action.
+typedef HookBlockedIPv6Info HookBlockedUdpInfo;
+
 #pragma warning(push)
 #pragma warning(disable : 4200)
 typedef struct _tagHookLogtext
@@ -441,6 +425,7 @@ typedef struct _tagHookLogtext
 #define PRCPD_QUIC_INIT_POLICY 15
 #define PRCPD_QUIC_LOCATE 16 // retired: no remote locator
 #define PRCPD_QUIC_STATUS 17
+#define PRCPD_BLOCKED_UDP 18
 
 #pragma pack(pop)
 

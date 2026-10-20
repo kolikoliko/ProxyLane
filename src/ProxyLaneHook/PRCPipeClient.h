@@ -40,6 +40,7 @@ public:
 	BOOL PRCNotifyHookWSockResult(DWORD err, ULONGLONG processCreateTime);
 	BOOL PRCLogtext(LPCWSTR lpsz);
 	BOOL PRCLogBlockedIPv6(const HookBlockedIPv6Info& info);
+	BOOL PRCLogBlockedUDP(const HookBlockedUdpInfo& info);
 
 private:
 

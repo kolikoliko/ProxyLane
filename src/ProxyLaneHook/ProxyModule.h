@@ -192,7 +192,8 @@ public:
 		ROUTE_BLOCKED,
 		TASK_FAILED,
 		SETTINGS_FAILED,
-		IPV6_BLOCKED
+		IPV6_BLOCKED,
+		UDP_BLOCKED
 	};
 	enum ConnectionStage
 	{
@@ -200,7 +201,8 @@ public:
 		STAGE_TRANSPORT,
 		STAGE_SOCKET,
 		STAGE_CONNECT,
-		STAGE_ATTACH
+		STAGE_ATTACH,
+		STAGE_IPV6_ROUTE
 	};
 	virtual ~IProxyLog(void){}
 

@@ -7,6 +7,7 @@
 #include "DnsRedirectPolicy.h"
 #include "HookDispatch.h"
 #include "DetourHooks.h"
+#include "UdpBlockLogLimiter.h"
 
 using namespace std;
 
@@ -796,6 +797,8 @@ private:
 	CRITICAL_SECTION m_RequestPipeLock;
 	BOOL EnsureRequestPipe();
 	void LogBlockedIPv6(SOCKET socketHandle, const _SockAddr& destination);
+	void LogBlockedUDP(SOCKET socketHandle, const SOCKADDR* destination, int length);
+	CUdpBlockLogLimiter m_udpBlockLogLimiter;
 
 };
 

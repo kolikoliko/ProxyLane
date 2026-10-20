@@ -15,7 +15,7 @@ try {
 @echo off
 call "$vcvars" $arch >nul
 if errorlevel 1 exit /b %errorlevel%
-cl /nologo /EHsc /O2 /DUNICODE /D_UNICODE tests\BypassTransportE2ETests.cpp /Fo:"$output\test.obj" /Fe:"$output\test.exe" /link /LIBPATH:bin\$platform\Release ProxyLaneHook.lib ws2_32.lib user32.lib
+cl /nologo /EHsc /O2 /DUNICODE /D_UNICODE tests\BypassTransportE2ETests.cpp /Fo:"$output\test.obj" /Fe:"$output\test.exe" /link /LIBPATH:bin\$platform\Release ProxyLaneHook.lib ws2_32.lib user32.lib iphlpapi.lib
 "@ | Set-Content -LiteralPath $compile -Encoding Default
         & $env:ComSpec /c $compile
         if ($LASTEXITCODE -ne 0) { throw "$arch compilation failed" }

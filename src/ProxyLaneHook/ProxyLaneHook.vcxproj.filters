@@ -73,6 +73,9 @@
     <ClCompile Include="ProxyModule.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="DirectIpv6Route.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="ProxyReceptionCentre.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -132,6 +135,9 @@
     <ClInclude Include="ProcessRegistry.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="UdpBlockLogLimiter.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="AppContainerPipeAccess.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -184,6 +190,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ProxyModule.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="DirectIpv6Route.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ProxyReceptionCentre.h">

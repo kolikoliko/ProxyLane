@@ -240,9 +240,6 @@ private:
 
 public:
 
-	DWORD m_connMainFlag;
-	DWORD m_connSubFlag;
-
 	__connect m_pReal_connect;
 	__gethostbyname m_pReal_gethostbyname;
 	__WSAAsyncGetHostByName m_pReal_WSAAsyncGetHostByName;
@@ -251,6 +248,5 @@ public:
 	__WSASendTo m_pReal_WSASendTo;
 	__WSARecvFrom m_pReal_WSARecvFrom;
 
-	void SetConnectionFlag(DWORD main, DWORD sub);
 	void BypassHook(BOOL bBypass);
 };

@@ -63,21 +63,8 @@ BOOL CPRCTcpPeer::ConnectProxy(LPPRCClient lpPRCClient, LPProxyInfo lpProxyInfo,
 		return FALSE;
 
 
-	//注意
-	//代理请求调用connect也会给HookWinsock拦截，
-	//旧方法1
-	//SetConnectionFlag 将设置一个8字节的标志， 告知HookWinsock直接调用系统的connect
-	//8字节的标志放置在sockaddr_in.sin_zero的中, :)
-	/*
-	struct sockaddr_in {
-	short   sin_family;
-	u_short sin_port;
-	struct  in_addr sin_addr;
-	char    sin_zero[8];
-	*/
-	//m_pProxyLayer->SetConnectionFlag('pass', 'port');
-
-	//方法2
+	// Upstream connections use the original Winsock entry points to avoid
+	// intercepting the proxy transport itself. Never mark address bytes.
 	m_pProxyLayer->BypassHook(TRUE);
 
 	BOOL bConnect = FALSE;

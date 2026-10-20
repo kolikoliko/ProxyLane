@@ -456,12 +456,15 @@ void CPage2::OnConnectionEvent(ConnectionEvent event, const LPPRCClient client,
 	case ROUTE_DIRECT: key = _T("log.connection_direct"); break;
 	case ROUTE_BLOCKED: key = _T("log.connection_blocked"); break;
 	case IPV6_BLOCKED: key = _T("log.connection_ipv6_blocked"); break;
+	case UDP_BLOCKED: key = _T("log.connection_udp_blocked"); break;
 	case TASK_FAILED: key = _T("log.connection_task_failed"); break;
 	case SETTINGS_FAILED: key = _T("log.connection_settings_failed"); break;
 	default: return;
 	}
 	CString name = LogProcessName(CString(processName ? processName : L""));
 	CString endpoint = LogEndpoint(*client);
+	if (event == UDP_BLOCKED && client->dstAddr.sa_family == AF_UNSPEC)
+		endpoint = Localization::Get(_T("common.unknown"));
 	AddLogText(Localization::Format(key, static_cast<LPCTSTR>(name), client->dwPid,
 		static_cast<LPCTSTR>(endpoint), client->sType == SOCK_DGRAM ? _T("UDP") :
 		client->sType == SOCK_STREAM ? _T("TCP") : _T("Socket")));
@@ -479,6 +482,7 @@ void CPage2::OnConnectionFailure(const LPPRCClient client, LPCWSTR processName,
 	case STAGE_SOCKET: stageKey = _T("log.stage_socket"); break;
 	case STAGE_CONNECT: stageKey = _T("log.stage_connect"); break;
 	case STAGE_ATTACH: stageKey = _T("log.stage_attach"); break;
+	case STAGE_IPV6_ROUTE: stageKey = _T("log.stage_ipv6_route"); break;
 	}
 	CString name = LogProcessName(CString(processName ? processName : L""));
 	CString endpoint = LogEndpoint(*client);

@@ -8,6 +8,7 @@
 #include "GlobalProxy.h"
 #include "ProxyDataHandle.h"
 #include "ProxyLog.h"
+#include "DirectIpv6Route.h"
 #include <vector>
 
 #define TIMER_CHECK_REGISTERED_CLIENT 0x100
@@ -914,6 +915,23 @@ BOOL CProxyReceptionCentre::RegisterTCPClient(LPPRCClient lpClientInfo)
 {
 	if(IsFiltered(lpClientInfo))
 		return FALSE;
+
+	// Resolve target-filtered routing on the service side before the application
+	// connects to our loopback listener. Only a definite 1231 rejects the attempt.
+	if (DirectIpv6Route::NeedsQuery(*lpClientInfo))
+	{
+		ProxyInfo route = {};
+		if (m_pGlobalProxy->GetSettingsInstance()->GetProxyInfo(lpClientInfo, &route) &&
+			DirectIpv6Route::ShouldReject(*lpClientInfo, route))
+		{
+			WCHAR processPath[MAX_PATH] = {};
+			GetProcessIdentity(lpClientInfo->dwPid, processPath, _countof(processPath));
+			LogConnectionFailure(lpClientInfo, processPath,
+				IProxyLog::STAGE_IPV6_ROUTE, WSAENETUNREACH);
+			WSASetLastError(WSAENETUNREACH);
+			return FALSE;
+		}
+	}
 
 	CTSList<PRCClient>::critical lc = m_RegisteredClient;
 	lpClientInfo->reserved = GetTickCount();

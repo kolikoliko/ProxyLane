@@ -44,7 +44,14 @@ BOOL CProxyTester::Start(IProxyTesterCallback *pCallback, const LPPRCClient lpPR
 	if (!AddProxyLayer(lpPI))
 		return FALSE;
 
-	if (!Create(0, lpPRCClient->sType))
+	// For direct literal destinations the transport must use that address
+	// family. Remote proxy connections still use the proxy transport family.
+	const bool direct = !lpPI || lpPI->GetProxyType() == PROXYTYPE_NOPROXY;
+	const int transportFamily = direct && !lpPRCClient->IsDNValid() &&
+		lpPRCClient->dstAddr.IsIPv6() ? AF_INET6 : AF_INET;
+	if (!Create(0, lpPRCClient->sType,
+		FD_READ | FD_WRITE | FD_OOB | FD_ACCEPT | FD_CONNECT | FD_CLOSE,
+		NULL, FALSE, transportFamily))
 	{
 		return FALSE;
 	}
@@ -56,7 +63,7 @@ BOOL CProxyTester::Start(IProxyTesterCallback *pCallback, const LPPRCClient lpPR
 		if(lpPRCClient->IsDNValid())
 			bConnect = CAsyncSocketEx::Connect(lpPRCClient->szDomainName, lpPRCClient->dstAddr.GetPort());
 		else
-			bConnect = CAsyncSocketEx::Connect(&lpPRCClient->dstAddr, sizeof(lpPRCClient->dstAddr));
+			bConnect = CAsyncSocketEx::Connect(&lpPRCClient->dstAddr, lpPRCClient->dstAddr.Size());
 
 		if(!bConnect)
 		{

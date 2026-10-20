@@ -332,6 +332,7 @@
     <ClCompile Include="PRCXServer.cpp" />
     <ClCompile Include="ProxyLog.cpp" />
     <ClCompile Include="ProxyModule.cpp" />
+    <ClCompile Include="DirectIpv6Route.cpp" />
     <ClCompile Include="ProxyReceptionCentre.cpp" />
     <ClCompile Include="ProxySettings.cpp" />
     <ClCompile Include="ProxyTaskMgr.cpp" />
@@ -359,6 +360,7 @@
     <ClInclude Include="GlobalProxy.h" />
     <ClInclude Include="ProcessIdentity.h" />
     <ClInclude Include="ProcessRegistry.h" />
+    <ClInclude Include="UdpBlockLogLimiter.h" />
     <ClInclude Include="AppContainerPipeAccess.h" />
     <ClInclude Include="HookWinsock.h" />
     <ClInclude Include="InjectDll.h" />
@@ -382,6 +384,7 @@
     <ClInclude Include="ProxyDataHandle.h" />
     <ClInclude Include="ProxyLog.h" />
     <ClInclude Include="ProxyModule.h" />
+    <ClInclude Include="DirectIpv6Route.h" />
     <ClInclude Include="ProxyReceptionCentre.h" />
     <ClInclude Include="ProxySettings.h" />
     <ClInclude Include="ProxyTaskMgr.h" />
