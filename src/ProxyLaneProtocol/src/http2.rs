@@ -18,7 +18,10 @@ struct Side {
 pub(crate) struct Http2 {
     sides: [Side; 2],
     preface: bool,
-    streams: BTreeMap<u64, Exchange>,
+    streams: crate::pending::Pending,
+    // Keep bounded reset tombstones so in-flight frames in the opposite
+    // direction cannot invalidate unrelated streams. HPACK still advances.
+    resets: BTreeMap<u32, usize>,
     highest_stream: u32,
     goaway: Option<u32>,
 }
@@ -84,6 +87,7 @@ impl Http2 {
         out: &mut Vec<Exchange>,
         cache: Option<&crate::cache::PayloadCache>,
     ) -> Result<()> {
+        self.streams.configure(cache,limits.pending);
         self.sides[side].buffer.extend_from_slice(data);
         if side == 0 && !self.preface {
             let buffer = &mut self.sides[side].buffer;
@@ -142,9 +146,12 @@ impl Http2 {
         match kind {
             0 => {
                 let data = unpad(payload, flags)?;
+                if self.resets.get(&stream).is_some_and(|sender| *sender != side) {
+                    return Ok(());
+                }
                 let exchange = self
                     .streams
-                    .get_mut(&(stream as u64))
+                    .get_mut(&(stream as u64))?
                     .ok_or("DATA on unknown HTTP/2 stream")?;
                 let head =
                     exchange.request.as_ref().and_then(|m| m.method.as_deref()) == Some("HEAD");
@@ -244,10 +251,15 @@ impl Http2 {
                 if stream == 0 || payload.len() != 4 {
                     return Err("invalid RST_STREAM".into());
                 }
-                if let Some(mut exchange) = self.streams.remove(&(stream as u64)) {
+                if stream <= self.highest_stream {
+                    self.resets.entry(stream).or_insert(side);
+                    if self.resets.len() > 1024 { self.resets.pop_first(); }
+                }
+                if let Some(mut exchange) = self.streams.remove(&(stream as u64))? {
                     exchange.problem = Some(format!(
-                        "RST_STREAM {}",
-                        u32::from_be_bytes(payload.try_into().unwrap())
+                        "RST_STREAM {} from {}",
+                        u32::from_be_bytes(payload.try_into().unwrap()),
+                        if side==0 {"application"} else {"upstream"}
                     ));
                     exchange.finish_cache();
                     out.push(exchange);
@@ -261,16 +273,13 @@ impl Http2 {
                 let code = u32::from_be_bytes(payload[4..8].try_into().unwrap());
                 if side == 1 {
                     self.goaway = Some(self.goaway.map_or(last, |old| old.min(last)));
-                    let ids: Vec<_> = self
-                        .streams
-                        .keys()
-                        .copied()
-                        .filter(|id| *id > last as u64)
-                        .collect();
+                    let ids=self.streams.keys()?;
                     for id in ids {
-                        let mut exchange = self.streams.remove(&id).unwrap();
+                        let id=id?;if id<=last as u64 {continue;}
+                        let mut exchange = self.streams.remove(&id)?.unwrap();
                         exchange.problem = Some(format!("GOAWAY {code}: stream not processed"));
                         exchange.finish_cache();
+                        if cache.is_some_and(crate::cache::PayloadCache::is_recording) && out.len()>=limits.pending {out.remove(0);}
                         out.push(exchange);
                     }
                 }
@@ -314,6 +323,11 @@ impl Http2 {
             }
         }
         let id = block.stream as u64;
+        // Decode even discarded HEADERS/CONTINUATION blocks above: their
+        // dynamic table entries may be referenced by the next live stream.
+        if self.resets.get(&block.stream).is_some_and(|sender| *sender != side) {
+            return Ok(());
+        }
         if side == 0 && !self.streams.contains_key(&id) {
             if block.stream <= self.highest_stream {
                 return Err("reused/closed HTTP/2 stream".into());
@@ -321,7 +335,7 @@ impl Http2 {
             if self.goaway.is_some_and(|last| block.stream > last) {
                 return Err("new stream after GOAWAY".into());
             }
-            if self.streams.len() >= limits.pending {
+            if self.streams.limited() {
                 return Err("pending exchange limit".into());
             }
             self.highest_stream = block.stream;
@@ -331,12 +345,12 @@ impl Http2 {
                     id,
                     ..Exchange::default()
                 },
-            );
-            self.streams.get_mut(&id).unwrap().start_cache(cache);
+            )?;
+            self.streams.get_mut(&id)?.unwrap().start_cache(cache);
         }
         let exchange = self
             .streams
-            .get_mut(&id)
+            .get_mut(&id)?
             .ok_or("response without captured request")?;
         let slot = if side == 0 {
             &mut exchange.request
@@ -406,7 +420,7 @@ impl Http2 {
     }
     fn end_stream(&mut self, side: usize, stream: u32, out: &mut Vec<Exchange>) -> Result<()> {
         let id = stream as u64;
-        let exchange = self.streams.get_mut(&id).unwrap();
+        let exchange = self.streams.get_mut(&id)?.unwrap();
         let head = exchange.request.as_ref().and_then(|r| r.method.as_deref()) == Some("HEAD");
         let message = if side == 0 {
             exchange.request.as_mut()
@@ -421,7 +435,7 @@ impl Http2 {
         }
         message.complete = true;
         if exchange.ready() {
-            let exchange = self.streams.remove(&id).unwrap();
+            let exchange = self.streams.remove(&id)?.unwrap();
             exchange.finish_cache();
             out.push(exchange);
         }
@@ -431,18 +445,11 @@ impl Http2 {
         if !self.sides[side].buffer.is_empty() || self.sides[side].block.is_some() {
             return Err("incomplete HTTP/2 frame/header block at EOF".into());
         }
-        if side == 0 && !self.preface {
-            return Err("missing HTTP/2 preface at EOF".into());
-        }
+        // ALPN can select h2 on an unused preconnection. No client bytes is
+        // not a truncated preface; a partial preface is caught by buffer above.
         Ok(())
     }
     pub(crate) fn drain(&mut self, reason: &str) -> Vec<Exchange> {
-        std::mem::take(&mut self.streams)
-            .into_values()
-            .map(|mut e| {
-                e.problem = Some(reason.into());
-                e
-            })
-            .collect()
+        self.streams.drain(reason)
     }
 }

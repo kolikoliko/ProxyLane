@@ -116,9 +116,13 @@ class Peer(QuicConnectionProtocol):
                     self.transmit()
                     del self.streams[item.stream_id]
                 else:
-                    self.waiters[item.stream_id].set_result(state)
+                    # Deliberately malformed/cancelled streams can receive a terminal
+                    # response without having a request() waiter.
+                    waiter = self.waiters.get(item.stream_id)
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(state)
 
-    async def request(self, method, body=b'', index=0):
+    async def request(self, method, body=b'', index=0, timeout=18):
         stream = self._quic.get_next_available_stream_id()
         waiter = self.waiters[stream] = asyncio.get_running_loop().create_future()
         self.h3.send_headers(stream, [(b':method', method.encode()), (b':scheme', b'https'),
@@ -127,7 +131,7 @@ class Peer(QuicConnectionProtocol):
         self.h3.send_data(stream, body, end_stream=True)
         self.transmit()
         try:
-            return await asyncio.wait_for(waiter, 18)
+            return await asyncio.wait_for(waiter, timeout)
         finally:
             self.waiters.pop(stream, None)
             self.streams.pop(stream, None)

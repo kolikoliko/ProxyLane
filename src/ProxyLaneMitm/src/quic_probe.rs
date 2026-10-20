@@ -15,6 +15,7 @@ pub struct Probe {
     pub version: Option<u32>,
     pub name: String,
     pub alpn: Vec<String>,
+    pub raw_alpn: Vec<Vec<u8>>,
     pub ech: bool,
     pub note: String,
 }
@@ -193,6 +194,7 @@ impl Initial {
 struct Hello {
     name: String,
     alpn: Vec<String>,
+    raw_alpn: Vec<Vec<u8>>,
     ech: bool,
 }
 fn hello(bytes: &[u8]) -> Option<Hello> {
@@ -216,6 +218,7 @@ fn hello(bytes: &[u8]) -> Option<Hello> {
     let mut result = Hello {
         name: String::new(),
         alpn: Vec::new(),
+        raw_alpn: Vec::new(),
         ech: false,
     };
     while e.at < ext.len() {
@@ -255,6 +258,7 @@ fn hello(bytes: &[u8]) -> Option<Hello> {
                     if n == 0 || result.alpn.len() >= 32 {
                         return None;
                     }
+                    result.raw_alpn.push(value.to_vec());
                     result.alpn.push(
                         value
                             .iter()
@@ -398,6 +402,7 @@ impl Probe {
                     Ok(Some(h)) => {
                         self.name = h.name;
                         self.alpn = h.alpn;
+                        self.raw_alpn = h.raw_alpn;
                         self.ech = h.ech;
                         self.note.clear();
                     }

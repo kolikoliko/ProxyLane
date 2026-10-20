@@ -93,8 +93,8 @@ Release 回归，日志位于 `build/qa/hook-lifecycle/regression.log`。未进�
 日志保存在 `build/qa/detours-merge`。运行中的另一套 ProxyLane 曾向测试服务和探针
 注入第二份 Hook DLL，导致 UDP 超时；流量测试现与托管启动测试一样，仅解除一次性
 Python 测试进程继承的 hook，再创建受控子进程，不修改用户正在运行的代理。
-上述为原迁移时的验证记录。当前发行包只在根目录携带 `LICENSE-Detours.txt`，
-不附带来源说明，也不创建 `third_party` 目录。
+上述为原迁移时的验证记录。当前发行包将 Detours 许可证全文收录在根目录的
+`LICENSE` 中，位于 `Third-Party Software Licenses` 下，不创建 `third_party` 目录。
 迁移 worktree 的构建产物及日志另存于 `build/detours-migration-archive`。
 
 ## 2026-10-16：同一宿主跨服务退出重开的重绑定修复

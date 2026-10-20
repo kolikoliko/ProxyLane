@@ -4,6 +4,7 @@
 #include "Localization.h"
 #include "ProtocolViewModel.h"
 #include "MitmSettings.h"
+#include "ProcessIconCache.h"
 #include <atomic>
 #include <thread>
 #include <map>
@@ -50,6 +51,10 @@ struct ProtocolPageData {
     std::shared_ptr<Job> job;
     std::string run, selected, displayed, firstRow;
     std::vector<std::string> shownKeys;
+    ProcessIconCache icons;
+    std::vector<std::wstring> shownIconKeys;
+    std::vector<std::string> shownIconPaths;
+    std::vector<int> shownIcons;
     ProtocolView::Detail detail;
     uint64_t next = 0, epoch = 0, lost = 0;
     DWORD lastPoll = 0, lastStatus = 0;
@@ -75,8 +80,14 @@ void CPage4::InitProtocolView() {
     m_protocol = std::make_shared<ProtocolPageData>();
     const DWORD child = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
     CRect empty;
-    m_requests.Create(child | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, empty, this, IDC_PROTOCOL_REQUESTS);
-    m_requests.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_INFOTIP);
+    m_requests.Create(child | WS_BORDER | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_SHAREIMAGELISTS, empty, this, IDC_PROTOCOL_REQUESTS);
+    m_requests.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | LVS_EX_INFOTIP | LVS_EX_SUBITEMIMAGES);
+    const int iconSize=UiTheme::ScaleForWindow(m_hWnd,16);
+    if(m_processIcons.Create(iconSize,iconSize,ILC_COLOR32|ILC_MASK,1,8)) {
+        if(m_processIcons.Add(LoadIcon(nullptr,IDI_APPLICATION))>=0)
+            m_requests.SetImageList(&m_processIcons,LVSIL_SMALL);
+        else m_processIcons.DeleteImageList();
+    }
     m_requests.SetBkColor(UiTheme::PageBackground()); m_requests.SetTextBkColor(UiTheme::PageBackground());
     const LPCTSTR columns[] = {L"#", L"protocol.process", L"PID", L"protocol.version", L"protocol.method", L"protocol.address", L"protocol.status", L"protocol.size"};
     for (int i = 0; i < _countof(columns); ++i)
@@ -119,7 +130,7 @@ void CPage4::InitProtocolColumns() {
     CRect client; m_requests.GetClientRect(client);
     if (client.Width() <= 0) return;
     auto s = [this](int v) { return UiTheme::ScaleForWindow(m_hWnd, v); };
-    const int widths[] = {38, 100, 62, 105, 50, 0, 90, 115};
+    const int widths[] = {38, 118, 62, 105, 50, 0, 90, 115};
     int remaining = client.Width() - s(20);
     for (int col = 0; col < 8; ++col) if (col != 5) {
         m_requests.SetColumnWidth(col, s(widths[col])); remaining -= s(widths[col]);
@@ -203,6 +214,9 @@ void CPage4::OnRequestSelected(NMHDR*, LRESULT* result) {
     std::string key = item >= 0 && (size_t)item < state.shownKeys.size() ? state.shownKeys[item] : "";
     if (!key.empty()) m_follow.SetCheck(BST_UNCHECKED);
     if (key == state.selected) return;
+    for(const auto& row:state.history.rows) if(row.key==key && row.websocket) {
+        const auto& exchange=row.record.at("exchange");m_detailTabs.SetCurSel(exchange["request"].is_null()?1:0);break;
+    }
     state.selected = key; state.locateContext.clear(); state.haveDetail = false; state.displayed.clear(); ShowProtocolDetail();
     CRect r; GetClientRect(r); LayoutControls(r.Width(),r.Height());
 }
@@ -323,7 +337,7 @@ void CPage4::ShowProtocolDetail() {
             else if(selected && !selected->quic) m_detail.LocatePacket(packet);
         }
         if(packet<side.datagrams.size()) {
-            CString prefix=Localization::Format(L"protocol.datagram",(unsigned)packet+1,(uint64_t)side.datagrams[packet].second);
+            CString prefix=Localization::Format(selected && selected->protocol=="QUIC/DATAGRAM" ? L"protocol.quic_datagram" : L"protocol.datagram",(unsigned)packet+1,(uint64_t)side.datagrams[packet].second);
             if(hex && packet<side.packets.size()) {
                 CString offset;offset.Format(L" | Offset 0x%X",(unsigned)m_hexView.SelectedOffset());prefix+=offset;
             }
@@ -379,10 +393,20 @@ void CPage4::RebuildRequests() {
     state.rebuilding = true; m_requests.SetRedraw(FALSE);
     if (rebuild) m_requests.DeleteAllItems();
     int selected = -1;
+    state.shownIconKeys.resize(visible.size());state.shownIconPaths.resize(visible.size());state.shownIcons.resize(visible.size());
     for (size_t index=0;index<visible.size();++index) {
         const auto& row = *visible[index]; CString number; number.Format(L"%I64u",row.number);
-        if ((int)index >= existing) m_requests.InsertItem((int)index, number); else m_requests.SetItemText((int)index,0,number);
+        if ((int)index >= existing) m_requests.InsertItem((int)index, number,I_IMAGENONE); else m_requests.SetItemText((int)index,0,number);
         m_requests.SetItemText((int)index,1,Text(row.process)); CString pid; pid.Format(L"%u",row.pid); m_requests.SetItemText((int)index,2,pid);
+        if(rebuild || (int)index>=existing || state.shownIconPaths[index]!=row.processPath) {
+            state.shownIconPaths[index]=row.processPath;
+            state.shownIconKeys[index]=ProcessIconCache::Key(Text(row.processPath));
+        }
+        int icon=m_processIcons.GetSafeHandle()?state.icons.Request(state.shownIconKeys[index]):I_IMAGENONE;
+        if(rebuild || (int)index>=existing || state.shownIcons[index]!=icon) {
+            LVITEM item={};item.mask=LVIF_IMAGE;item.iItem=(int)index;item.iSubItem=1;item.iImage=icon;m_requests.SetItem(&item);
+        }
+        state.shownIcons[index]=icon;
         m_requests.SetItemText((int)index,3,Text(row.protocol)); m_requests.SetItemText((int)index,4,Text(row.method));
         m_requests.SetItemText((int)index,5,Text(row.destination+" "+row.target)); m_requests.SetItemText((int)index,6,Text(row.status));
         CString size; size.Format(L"%I64u / %I64u",row.requestBytes,row.responseBytes); m_requests.SetItemText((int)index,7,size);
@@ -391,12 +415,15 @@ void CPage4::RebuildRequests() {
     state.shownKeys = std::move(keys);
     if (selected >= 0) m_requests.SetItemState(selected,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);
     else if (!state.selected.empty()) { state.selected.clear(); state.displayed.clear(); state.haveDetail=false; ShowProtocolDetail(); }
+    // Re-enable layout before restoring scroll: image-list row height and newly
+    // visible scrollbars can change the page size while redraw is disabled.
+    m_requests.SetRedraw(TRUE);
     if (follow && !state.shownKeys.empty()) m_requests.EnsureVisible((int)state.shownKeys.size()-1,FALSE);
     else if (restoreTop) for (size_t i=0;i<state.shownKeys.size();++i) if (state.shownKeys[i] == topKey) {
         m_requests.EnsureVisible((int)i,FALSE); CRect r;
         if (m_requests.GetItemRect((int)i,r,LVIR_BOUNDS)) m_requests.Scroll(CSize(0,r.top-topRect.top)); break;
     }
-    m_requests.SetRedraw(TRUE); m_requests.Invalidate(FALSE); state.rebuilding=false;
+    m_requests.Invalidate(FALSE); state.rebuilding=false;
 }
 void CPage4::ClearProtocolView() {
     auto& state = *m_protocol;
@@ -407,6 +434,16 @@ void CPage4::ClearProtocolView() {
 }
 void CPage4::TickProtocolView() {
     if (!m_protocol || !m_mitmSupported) return;
+    if(m_processIcons.GetSafeHandle() && m_protocol->icons.Apply(m_processIcons)) {
+        // Update only image cells. No list rebuild, selection change or scroll.
+        for(size_t i=0;i<m_protocol->shownIconKeys.size();++i) {
+            int icon=m_protocol->icons.Lookup(m_protocol->shownIconKeys[i]);
+            if(icon!=m_protocol->shownIcons[i]) {
+                LVITEM item={};item.mask=LVIF_IMAGE;item.iItem=(int)i;item.iSubItem=1;item.iImage=icon;
+                m_requests.SetItem(&item);m_protocol->shownIcons[i]=icon;
+            }
+        }
+    }
     if (m_protocol->pendingDisplay && (::GetCapture() != m_detail.GetSafeHwnd() && ::GetCapture() != m_hexView.GetSafeHwnd())) ShowProtocolDetail();
     CanFollowLatest();
     auto& state = *m_protocol;

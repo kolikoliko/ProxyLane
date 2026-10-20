@@ -13,6 +13,8 @@ pub struct Connection {
     /// Snapshot taken while the originating process is still connected.
     #[serde(default)]
     pub process_name: String,
+    #[serde(default)]
+    pub process_path: String,
     pub socket: u64,
     pub generation: u64,
     pub destination: String,
@@ -26,6 +28,13 @@ pub struct Connection {
     pub upstream_verification_skipped: bool,
     #[serde(default)]
     pub transport: String,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub quic_stream_id: Option<u64>,
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub quic_alpn: Option<String>,
+    /// Decrypted connection-level QUIC DATAGRAMs, not UDP wire packets or streams.
+    #[serde(default, skip_serializing_if="std::ops::Not::not")]
+    pub quic_datagrams: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +57,8 @@ impl Direction {
 pub enum Protocol {
     Http1,
     H2,
+    #[serde(rename="websocket")]
+    WebSocket,
 }
 
 #[derive(Clone, Debug)]
@@ -74,8 +85,10 @@ impl Default for Limits {
     }
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Message {
+    #[serde(default)]
+    pub observed_start_unix_ms:u64,
     #[serde(skip)]
     pub(crate) cache_writer: Option<(crate::cache::CacheRef, usize)>,
     pub method: Option<String>,
@@ -86,7 +99,7 @@ pub struct Message {
     pub body_bytes: u64,
     pub complete: bool,
     /// Transfer framing removed, Content-Encoding still applied.
-    #[serde(rename = "body_base64", serialize_with = "as_base64")]
+    #[serde(rename = "body_base64", serialize_with = "as_base64", deserialize_with = "from_base64")]
     pub body: Vec<u8>,
     pub decoded_base64: Option<String>,
     /// Only present for valid UTF-8; no guessed charset conversion.
@@ -99,7 +112,14 @@ fn as_base64<S: serde::Serializer>(
 ) -> std::result::Result<S::Ok, S::Error> {
     serializer.serialize_str(&STANDARD.encode(bytes))
 }
+fn from_base64<'de,D:serde::Deserializer<'de>>(d:D)->std::result::Result<Vec<u8>,D::Error> {
+    STANDARD.decode(String::deserialize(d)?).map_err(serde::de::Error::custom)
+}
 impl Message {
+    pub(crate) fn metadata(&self)->serde_json::Value {
+        serde_json::json!({"observed_start_unix_ms":self.observed_start_unix_ms,"method":self.method,"target":self.target,"status":self.status,
+            "headers":self.headers,"trailers":self.trailers,"body_bytes":self.body_bytes,"complete":self.complete})
+    }
     pub(crate) fn append(&mut self, bytes: &[u8], limits: &Limits) {
         self.body_bytes += bytes.len() as u64;
         if let Some((cache, side)) = &self.cache_writer {
@@ -141,9 +161,9 @@ impl Message {
     }
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Exchange {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none",skip_deserializing)]
     pub cache: Option<crate::cache::CacheRef>,
     /// HTTP/1 sequence number or HTTP/2 stream ID.
     pub id: u64,
@@ -164,25 +184,31 @@ impl Exchange {
             &mut self.response
         };
         if let (Some(message), Some(cache)) = (message, &self.cache) {
+            if message.observed_start_unix_ms==0 {message.observed_start_unix_ms=crate::recording::observed_ms();}
             message.cache_writer = Some((cache.clone(), side));
+            if cache.is_recording() {cache.record(serde_json::json!({"type":"message_head","exchange_id":self.id,"side":side,"message":message.metadata()}));}
         }
     }
     pub(crate) fn finish_cache(&self) {
         let Some(cache) = &self.cache else {
             return;
         };
+        if cache.is_recording() && !cache.snapshot().finished {
+            cache.record(serde_json::json!({"type":"exchange_end","exchange_id":self.id,
+                "request":self.request.as_ref().map(Message::metadata),"response":self.response.as_ref().map(Message::metadata),
+                "informational":self.informational.iter().map(Message::metadata).collect::<Vec<_>>(),"problem":self.problem}));
+        }
         let head = self.request.as_ref().and_then(|r| r.method.as_deref()) == Some("HEAD");
         let make = |message: Option<&Message>, response: bool| {
             let Some(message) = message else {
                 return crate::cache::BodyInfo::default();
             };
             let encodings = tokens(&message.headers, "content-encoding");
-            let valid =
-                encodings.len() <= 4 && encodings.iter().map(String::len).sum::<usize>() <= 1024;
             crate::cache::BodyInfo {
+                present: true,
                 bytes: message.body_bytes,
-                complete: message.complete && valid,
-                headers: if valid && !encodings.is_empty() {
+                complete: message.complete,
+                headers: if !encodings.is_empty() {
                     vec![("content-encoding".into(), encodings.join(","))]
                 } else {
                     Vec::new()

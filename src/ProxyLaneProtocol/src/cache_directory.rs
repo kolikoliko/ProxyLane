@@ -9,6 +9,29 @@ use std::{
 
 const MARKER: &[u8] = b"ProxyLaneProtocolCache/v1\n";
 
+#[cfg(windows)]
+fn recording_time() -> String {
+    #[repr(C)]
+    #[derive(Default)]
+    struct SystemTime {
+        year: u16, month: u16, day_of_week: u16, day: u16,
+        hour: u16, minute: u16, second: u16, milliseconds: u16,
+    }
+    #[link(name = "kernel32")]
+    extern "system" { fn GetLocalTime(time: *mut SystemTime); }
+    let mut time = SystemTime::default();
+    unsafe { GetLocalTime(&mut time); }
+    format!("{:04}{:02}{:02}{:02}{:02}{:02}",
+        time.year, time.month, time.day, time.hour, time.minute, time.second)
+}
+
+// Portable protocol tests also run outside the Windows application.
+#[cfg(not(windows))]
+fn recording_time() -> String {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_secs().to_string()
+}
+
 fn plain(path: &Path, directory: bool) -> std::io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     #[cfg(windows)]
@@ -120,8 +143,32 @@ pub(crate) struct RunDirectory {
     owner: Option<File>,
     pub recovered: usize,
     pub warnings: Vec<String>,
+    pub retained: bool,
 }
 impl RunDirectory {
+    pub fn recording(root: &Path) -> std::io::Result<Self> {
+        let absolute = if root.is_absolute() { root.to_owned() } else { std::env::current_dir()?.join(root) };
+        for parent in absolute.ancestors() { if parent.exists() { plain(parent, true)?; } }
+        fs::create_dir_all(&absolute)?;
+        let root = fs::canonicalize(absolute)?;
+        let time = recording_time();
+        let mut created = None;
+        for _ in 0..8 {
+            let mut random = [0u8; 8];
+            getrandom::getrandom(&mut random).map_err(|e| std::io::Error::other(e.to_string()))?;
+            let path = root.join(format!("recording-{time}-{:016x}", u64::from_le_bytes(random)));
+            match fs::create_dir(&path) {
+                Ok(()) => {created=Some(path);break;},
+                Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        let path=created.ok_or_else(||std::io::Error::new(std::io::ErrorKind::AlreadyExists,"cannot allocate unique recording directory"))?;
+        let owner = OpenOptions::new().read(true).write(true).create_new(true).open(path.join("owner.lock"))?;
+        owner.lock_exclusive()?;
+        // Persistent recordings deliberately never enter the temporary run-* cleanup namespace.
+        Ok(Self { root, path, owner: Some(owner), recovered: 0, warnings: vec![], retained: true })
+    }
     pub fn create(root: &Path) -> std::io::Result<Self> {
         let absolute = if root.is_absolute() {
             root.to_owned()
@@ -212,6 +259,7 @@ impl RunDirectory {
                 owner: Some(owner),
                 recovered,
                 warnings,
+                retained: false,
             }),
             Err(error) => {
                 let _ = remove_flat(&root, &path);
@@ -220,6 +268,7 @@ impl RunDirectory {
         }
     }
     pub fn cleanup(&mut self) -> std::io::Result<()> {
+        if self.retained { self.owner.take(); return Ok(()); }
         if self.owner.is_none() {
             return Ok(());
         }

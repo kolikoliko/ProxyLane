@@ -5,7 +5,7 @@ use rustls::{
     pki_types::ServerName,
     server::{Accepted, Acceptor, ClientHello, ResolvesServerCert},
     sign::CertifiedKey,
-    ClientConnection, Connection, RootCertStore, ServerConfig, ServerConnection,
+    ClientConnection, Connection, ServerConfig, ServerConnection,
 };
 use serde_json::{json, Value};
 use std::{
@@ -44,22 +44,23 @@ impl rustls::client::danger::ServerCertVerifier for SkipCertificateTrust {
 
 pub struct Context {
     pub ca: Arc<Authority>,
-    pub roots: Arc<RootCertStore>,
+    pub verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    pub async_handshake: bool,
+    #[cfg(test)]
+    pub roots: Arc<rustls::RootCertStore>,
     pub crl: crate::pki::CrlServer,
 }
 impl Context {
     pub fn open() -> Result<Arc<Self>> {
         let ca = Arc::new(Authority::load(&crate::pki::directory()?, true)?);
-        let mut roots = RootCertStore::empty();
-        let native = rustls_native_certs::load_native_certs();
-        let (added, _) = roots.add_parsable_certificates(native.certs);
-        if added == 0 {
-            return Err(format!("No system trust roots: {:?}", native.errors));
-        }
+        let verifier = crate::verification::platform()?;
         let crl = ca.serve_crl()?;
         Ok(Arc::new(Self {
             ca,
-            roots: Arc::new(roots),
+            verifier,
+            async_handshake: true,
+            #[cfg(test)]
+            roots: Arc::new(rustls::RootCertStore::empty()),
             crl,
         }))
     }
@@ -117,12 +118,16 @@ pub struct Session {
     accepted: Option<Accepted>,
     deferred: Vec<u8>,
     connections: [Option<Connection>; 2],
+    handshake: Option<crate::verification::HandshakeJob>,
     output: [VecDeque<u8>; 2],
     plaintext: [VecDeque<u8>; 2],
+    capture_pending: Option<(usize,Vec<u8>)>,
+    encrypted_pending: [Vec<u8>;2],
     pub eof: [bool; 2],
     close_sent: [bool; 2],
     started: Instant,
     pub error: String,
+    drain_error: String,
     capture: Option<Capture>,
     protocol_source: Option<(
         Arc<crate::protocol::Runtime>,
@@ -180,12 +185,16 @@ impl Session {
             accepted: None,
             deferred: vec![],
             connections: [None, None],
+            handshake: None,
             output: Default::default(),
             plaintext: Default::default(),
+            capture_pending:None,
+            encrypted_pending:Default::default(),
             eof: [false; 2],
             close_sent: [false; 2],
             started: Instant::now(),
             error: String::new(),
+            drain_error: String::new(),
             capture: log,
             protocol_source: None,
             protocol: None,
@@ -218,6 +227,9 @@ impl Session {
         else { self.fail(format!("TCP connection failed: {error}")); }
     }
     fn status(&mut self, state: &str, problem: &str) {
+        let (state, problem) = if Self::quiet_application_close(problem) {
+            ("Closed", "")
+        } else { (state, problem) };
         if state == self.last_status { return; }
         self.last_status = state.into();
         if let Some((runtime, identity)) = &mut self.lifecycle {
@@ -238,6 +250,10 @@ impl Session {
     }
 
     fn event(&mut self, value: Value) -> Result<()> {
+        if value["event"] == "error"
+            && value["message"].as_str().map(Self::quiet_application_close).unwrap_or(false) {
+            return Ok(());
+        }
         // The simple monitor shows useful data and one error, not TLS internals.
         // In particular, Drop must not duplicate a previously reported error.
         if value["event"] == "error" {
@@ -257,17 +273,47 @@ impl Session {
     }
     pub fn fail(&mut self, error: String) {
         if self.error.is_empty() {
+            self.finish_pending_capture();
             // Close means capture stopped, never fabricate a clean TLS EOF.
             self.status("Failed", &error);
+            if let Some(t)=&self.protocol {t.close_reason(format!("TLS transport failed: {error}"));}
             self.protocol.take();
             let _ = self.event(json!({"event":"error", "message":error}));
             self.error = error;
         }
     }
+    fn finish_pending_capture(&mut self) {
+        if let Some((side,bytes))=self.capture_pending.take() {
+            if let Some(t)=&mut self.protocol {t.data(side,&bytes);}
+        }
+        // A cancelled socket can still have authenticated plaintext buffered
+        // inside rustls. Retain that prefix before retiring its capture.
+        if let Some(t)=&mut self.protocol {
+            for side in 0..2 {
+                if let Some(c)=self.connections[side].as_mut() {
+                    let mut buf=[0u8;16384];
+                    while let Ok(n)=c.reader().read(&mut buf) {
+                        if n==0 {break;}t.data(side,&buf[..n]);
+                    }
+                }
+            }
+        }
+    }
+    fn quiet_application_close(error: &str) -> bool {
+        // Presentation only: preserve unclean EOF and draining internally.
+        error.starts_with("TLS truncated: application TCP EOF without close_notify (")
+            && (error.ends_with("(during transfer)")
+                || error.ends_with("(opposite peer already sent close_notify)"))
+    }
     pub fn can_read(&self) -> bool {
-        self.error.is_empty()
-            && self.output.iter().all(|q| q.len() < HIGH_WATER)
-            && self.plaintext.iter().all(|q| q.len() < HIGH_WATER)
+        self.can_read_side(0) && self.can_read_side(1)
+    }
+    pub fn can_read_side(&self, side: usize) -> bool {
+        self.error.is_empty() && self.drain_error.is_empty() && !self.eof[side]
+            && self.capture_pending.is_none() && self.encrypted_pending.iter().all(Vec::is_empty)
+            && !(side == 1 && self.handshake.is_some())
+            && self.output[1 - side].len() < HIGH_WATER
+            && self.plaintext[1 - side].len() < HIGH_WATER
     }
     pub fn ready(&self) -> bool {
         self.state == 1
@@ -277,9 +323,19 @@ impl Session {
                     .iter()
                     .all(|c| c.as_ref().map(|c| !c.is_handshaking()).unwrap_or(false)))
     }
+    pub fn handshake_pending(&self) -> bool { self.handshake.is_some() }
+    pub fn recording_pending(&self)->bool {self.capture_pending.is_some() || self.encrypted_pending.iter().any(|b|!b.is_empty())}
     pub fn tick(&mut self) -> Result<()> {
         if !self.error.is_empty() {
             return Err(self.error.clone());
+        }
+        // Keep authenticated output readable after an unclean TCP EOF. Only
+        // fail the host once it has sent every queued byte; never forge TLS EOF.
+        if !self.drain_error.is_empty()
+            && self.output.iter().all(|q| q.is_empty())
+            && self.plaintext.iter().all(|q| q.is_empty())
+            && self.connections.iter().flatten().all(|c| !c.wants_write()) {
+            return Err(self.drain_error.clone());
         }
         // Idle/server-first protocols are allowed. Only a partial handshake has a deadline.
         if !self.ready()
@@ -296,7 +352,7 @@ impl Session {
         if self.eof[side] {
             return Err("data received after EOF".into());
         }
-        if data.len() > 16384 || !self.can_read() {
+        if data.len() > 16384 || !self.can_read_side(side) {
             return Err("MITM input exceeds bounded buffer capacity".into());
         }
         if self.state == 0 {
@@ -353,9 +409,6 @@ impl Session {
         }
         self.feed_tls(side, data)
             .map_err(|e| format!("{} TLS: {e}", Self::side_name(side)))?;
-        if self.state == 3 && !self.connections[1].as_ref().unwrap().is_handshaking() {
-            self.finish_upstream()?;
-        }
         self.pump()
     }
 
@@ -383,7 +436,8 @@ impl Session {
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
                 .map_err(|e| e.to_string())?
-                .with_root_certificates(self.context.roots.clone())
+                .dangerous()
+                .with_custom_certificate_verifier(self.context.verifier.clone())
                 .with_no_client_auth();
         if self.skip_upstream_verify { config.dangerous().set_certificate_verifier(Arc::new(SkipCertificateTrust)); }
         config.alpn_protocols = hello
@@ -439,6 +493,15 @@ impl Session {
     }
 
     fn feed_tls(&mut self, side: usize, data: &[u8]) -> Result<()> {
+        if self.capture_pending.is_some() {
+            if self.encrypted_pending[side].len()+data.len()>HIGH_WATER {return Err("TLS input while recording paused".into());}
+            self.encrypted_pending[side].extend_from_slice(data);return Ok(());
+        }
+        if side == 1 && self.state == 3 && self.context.async_handshake {
+            let connection = self.connections[1].take().ok_or("missing upstream TLS endpoint")?;
+            self.handshake = Some(crate::verification::HandshakeJob::start(connection, data.to_vec())?);
+            return Ok(());
+        }
         let mut input = Cursor::new(data);
         while (input.position() as usize) < data.len() {
             let state = {
@@ -451,6 +514,7 @@ impl Session {
                 connection.process_new_packets().map_err(|e| e.to_string())?
             };
             if state.peer_has_closed() {
+                if let Some(t)=&self.protocol {t.close_reason(format!("{} TLS close_notify",Self::side_name(side)));}
                 self.eof[side] = true;
             }
             // read_tls may consume only a prefix of this socket read. Drain
@@ -458,16 +522,53 @@ impl Session {
             // and full records can fill rustls's 16 KiB plaintext buffer even
             // when the socket read itself is only 4 KiB.
             self.pump()?;
+            if self.capture_pending.is_some() {
+                self.encrypted_pending[side].extend_from_slice(&data[input.position() as usize..]);
+                return Ok(());
+            }
         }
         Ok(())
     }
 
     pub fn pump(&mut self) -> Result<()> {
+        if let Some((side,bytes))=self.capture_pending.take() {
+            if self.protocol.as_mut().is_some_and(|t|!t.try_data(side,&bytes)) {
+                self.capture_pending=Some((side,bytes));return Ok(());
+            }
+            if let Some((callback,user))=self.observer {callback(user,side as u32+1,bytes.as_ptr(),bytes.len());}
+            if let Some(log)=&mut self.capture {log.data(side,&bytes)?;}
+            self.plaintext[1-side].extend(bytes);
+        }
+        for side in 0..2 {
+            if !self.encrypted_pending[side].is_empty() {
+                let bytes=std::mem::take(&mut self.encrypted_pending[side]);
+                self.feed_tls(side,&bytes)?;
+                if self.capture_pending.is_some() {return Ok(());}
+            }
+        }
+        if let Some(job) = &self.handshake {
+            let Some(flight) = job.poll().map_err(|e| format!("upstream TLS: {e}"))? else { return Ok(()); };
+            self.handshake = None;
+            self.connections[1] = Some(flight.connection);
+            if flight.closed { self.eof[1] = true; }
+            // Drain this flight before reading more records, including a
+            // handshake coalesced with the first application data.
+            self.pump()?;
+            if !flight.remainder.is_empty() { self.feed_tls(1, &flight.remainder)?; }
+            return Ok(());
+        }
         if self.state < 3 {
             return Ok(());
         }
+        // A final upstream handshake flight may already contain HTTP/2 SETTINGS.
+        // Establish the downstream TLS endpoint and analysis tap BEFORE draining
+        // any plaintext, including when pump is called from inside feed_tls.
+        if self.state == 3 && !self.connections[1].as_ref().unwrap().is_handshaking() {
+            self.finish_upstream()?;
+        }
         if self.ready() { self.status("Established", ""); }
         for side in 0..2 {
+            if self.capture_pending.is_some() {break;}
             if let Some(c) = self.connections[side].as_mut() {
                 let mut buf = [0u8; 16384];
                 // can_read() applies backpressure before accepting more input.
@@ -487,7 +588,9 @@ impl Session {
                         }
                         Ok(n) => {
                             if let Some(tap) = &mut self.protocol {
-                                tap.data(side, &buf[..n]);
+                                if !tap.try_data(side,&buf[..n]) {
+                                    self.capture_pending=Some((side,buf[..n].to_vec()));break;
+                                }
                             }
                             if let Some((callback, user)) = self.observer {
                                 callback(user, side as u32 + 1, buf.as_ptr(), n);
@@ -516,6 +619,9 @@ impl Session {
                         self.plaintext[side].drain(..n);
                     }
                     if self.eof[1 - side]
+                        && self.drain_error.is_empty()
+                        && self.capture_pending.is_none()
+                        && self.encrypted_pending.iter().all(Vec::is_empty)
                         && self.plaintext[side].is_empty()
                         && !self.close_sent[side]
                     {
@@ -559,9 +665,10 @@ impl Session {
         }
         if self.state != 1 && !self.eof[side] {
             if let Some(tap) = &mut self.protocol {
+                tap.close_reason(format!("{} TCP EOF without TLS close_notify",Self::side_name(side)));
                 tap.eof(side, false);
             }
-            return Err(format!(
+            let error = format!(
                 "TLS truncated: {} TCP EOF without close_notify ({})",
                 Self::side_name(side),
                 if self.eof[1 - side] {
@@ -571,7 +678,14 @@ impl Session {
                 } else {
                     "during transfer"
                 }
-            ));
+            );
+            if !self.ready() { return Err(error); }
+            self.pump()?;
+            self.drain_error = error;
+            self.eof[side] = true;
+            self.status("Failed", &self.drain_error.clone());
+            self.protocol.take();
+            return Ok(());
         }
         if self.state == 1 {
             if let Some(tap) = &mut self.protocol { tap.eof(side, true); }
@@ -587,7 +701,8 @@ impl Session {
         }
     }
     pub fn shutdown_output(&self, side: usize) -> bool {
-        self.eof[1 - side]
+        self.drain_error.is_empty() && self.eof[1 - side]
+            && !self.recording_pending()
             && self.output[side].is_empty()
             && self.plaintext[side].is_empty()
             && (self.state == 1
@@ -600,7 +715,10 @@ impl Session {
 }
 impl Drop for Session {
     fn drop(&mut self) {
-        if self.error.is_empty() { self.status("Closed", ""); }
-        let _ = self.event(json!({"event":"closed", "state":self.state, "error":self.error}));
+        // Teardown must not discard a decoded fragment waiting for recording.
+        self.finish_pending_capture();
+        if self.error.is_empty() && self.drain_error.is_empty() { self.status("Closed", ""); }
+        let error = if Self::quiet_application_close(&self.error) { "" } else { &self.error };
+        let _ = self.event(json!({"event":"closed", "state":self.state, "error":error}));
     }
 }

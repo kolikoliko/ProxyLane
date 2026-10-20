@@ -551,7 +551,10 @@ void CUdpProxyTask::PumpQuic(UdpRoute& route) {
         route.quic->Consume(side);m_lastActivity=GetTickCount();
         if(n==63)route.peer->TriggerEvent(FD_WRITE);
     }
-    if(route.quic->Drained())route.quic.reset();
+    if(route.quic->Drained()) {
+        route.quicRetired = route.quic->WasMitm();
+        route.quic.reset();
+    }
 }
 
 BOOL CUdpProxyTask::ForwardClientDatagram(CPRCUdpPeer *routePeer,
@@ -568,6 +571,19 @@ BOOL CUdpProxyTask::ForwardClientDatagram(CPRCUdpPeer *routePeer,
 		{
 			it->applicationEndpoint = application;
 			it->hasApplicationEndpoint = TRUE;
+            if(it->quic) PumpQuic(*it);
+            if(it->quicRetired) {
+                // Late packets belong to retired MITM keys, never forward them
+                // to the origin. A fresh v1/v2 Initial can reuse this route
+                // (v2 is currently admitted as ordinary passthrough).
+                const unsigned char* p=(const unsigned char*)data;
+                if(length<1200)return TRUE;
+                bool v1=(p[0]&0xf0)==0xc0 && !p[1] && !p[2] && !p[3] && p[4]==1;
+                bool v2=(p[0]&0xf0)==0xd0 && p[1]==0x6b && p[2]==0x33 && p[3]==0x43 && p[4]==0xcf;
+                if(!v1 && !v2)return TRUE;
+                it->quicRetired=false;
+                it->firstDatagramLogged=FALSE;
+            }
             if(it->quic) {bool retained=it->quic->Feed(0,data,length);PumpQuic(*it);return retained?TRUE:ForwardUpstreamDatagram(target,data,length);}
 			if (!it->firstDatagramLogged)
 			{
@@ -661,6 +677,7 @@ BOOL CUdpProxyTask::ForwardServerDatagram(_SockAddr source,
 		return FALSE;
 	m_lastActivity = GetTickCount();
 	if(selected->quic) {selected->quic->Feed(1,data,length);PumpQuic(*selected);return TRUE;}
+    if(selected->quicRetired)return TRUE;
 
 	if (!CProtocolTap::Enabled()) selected->capture.reset();
 	if (selected->capture) selected->capture->Data(1, data, length);
@@ -789,13 +806,14 @@ VOID CUdpProxyTask::EndTask()
 	}
 }
 
-VOID CUdpProxyTask::CloseTask()
+VOID CUdpProxyTask::CloseTask(const char* reason)
 {
 	m_upstreamState = UdpAssociationPolicy::UPSTREAM_CLOSING;
 	m_pendingReplies.clear();
 	m_pendingReplyBytes = 0;
 	for (UdpRouteList::iterator it = m_routes.begin(); it != m_routes.end(); ++it)
 	{
+		if(it->capture) it->capture->CloseReason(reason);
 		it->capture.reset();
 		if (it->peer) it->peer->Close();
 	}

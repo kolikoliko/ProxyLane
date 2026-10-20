@@ -42,11 +42,13 @@ Batch Poll(const Query& query, const std::string& run, uint64_t after, bool base
         Row row;
         row.run = batch.run;
         row.sequence = record.at("sequence").get<uint64_t>();
+        row.firstSeenSeconds=record.value("observed_unix_ms",uint64_t(0))/1000;
         row.key = row.run + ":" + std::to_string(row.sequence);
         const auto& connection = Object(record, "connection");
         row.pid = connection.value("pid", 0u);
         row.processStart = connection.value("process_start", uint64_t(0));
         row.process = Str(connection, "process_name");
+        row.processPath = Str(connection, "process_path");
         row.destination = Str(connection, "destination");
         auto server = Str(connection, "server_name");
         if (!server.empty()) {
@@ -67,11 +69,11 @@ Batch Poll(const Query& query, const std::string& run, uint64_t after, bool base
             row.connectionRow = true; row.stream = true;
             row.key = row.run + ":connection:" + Str(connection, "id");
             row.protocol = Str(record,"protocol") == "tcp" ? "TCP" :
-                Str(record,"protocol") == "h3" ? "QUIC/HTTP/3" : Str(record,"protocol") == "h2" ? "TLS/HTTP/2" : Str(record,"protocol") == "http1" ? "TLS/HTTP/1.1" : "TLS";
+                Str(record,"protocol") == "quic" ? "QUIC" : Str(record,"protocol") == "quic_stream" ? "QUIC/Raw" : Str(record,"protocol") == "h3" ? "QUIC/HTTP/3" : Str(record,"protocol") == "h2" ? "TLS/HTTP/2" : Str(record,"protocol") == "http1" ? "TLS/HTTP/1.1" : "TLS";
             row.status = Str(record,"status");
         } else if (Str(record, "type") == "stream") {
             row.stream = true; row.quic = Str(record, "protocol") == "quic";
-            row.udp = Str(record, "protocol") == "udp" || row.quic;
+            row.udp = Str(record, "protocol") == "udp" || Str(record,"protocol")=="quic_datagram" || row.quic;
             row.key = row.run + ":stream:" + Str(connection, "id");
             row.protocol = row.udp ? "UDP" : Str(record, "protocol") == "tls_stream" ? "TLS" :
                 Str(record, "protocol") == "tls_encrypted" ? "TLS (encrypted)" : "TCP";
@@ -81,6 +83,15 @@ Batch Poll(const Query& query, const std::string& run, uint64_t after, bool base
             row.requestBytes = stream.value("sent_bytes", uint64_t(0));
             row.responseBytes = stream.value("received_bytes", uint64_t(0));
             row.cacheId = Object(stream, "cache").value("id", uint64_t(0));
+            if(Str(record,"protocol")=="quic_stream") {
+                const auto id=connection.at("quic_stream_id").get<uint64_t>();
+                row.key+=":"+std::to_string(id);row.protocol="QUIC/Raw";
+                row.method="Stream "+std::to_string(id);row.target=Str(connection,"quic_alpn");
+            }
+            if(Str(record,"protocol")=="quic_datagram") {
+                row.key+=":datagrams";row.protocol="QUIC/DATAGRAM";
+                row.method="DATAGRAM";row.target=Str(connection,"quic_alpn");
+            }
             if (row.quic) {
                 const auto& quic = Object(record,"quic");
                 row.protocol = quic.value("version",uint64_t(0)) == 1 ? "QUIC v1" : "QUIC v2";
@@ -112,6 +123,7 @@ Batch Poll(const Query& query, const std::string& run, uint64_t after, bool base
             if (connection.value("decrypted", false)) row.protocol = (Str(record,"protocol")=="h3" ? "QUIC/" : "TLS/") + row.protocol;
             row.doh = record.contains("doh");
             if (row.doh) row.protocol += " / DoH";
+            if(req.value("observed_start_unix_ms",uint64_t(0))) row.firstSeenSeconds=req["observed_start_unix_ms"].get<uint64_t>()/1000;
             row.method = Str(req, "method"); row.target = Str(req, "target");
             std::string authority;
             auto headers = req.find("headers");
@@ -131,11 +143,20 @@ Batch Poll(const Query& query, const std::string& run, uint64_t after, bool base
             row.requestBytes = req.value("body_bytes", uint64_t(0));
             row.responseBytes = res.value("body_bytes", uint64_t(0));
             row.cacheId = Object(exchange, "cache").value("id", uint64_t(0));
+            if(Str(record,"protocol")=="websocket") {
+                row.websocket=true;row.stream=true;
+                row.key=row.run+":websocket:"+Str(connection,"id")+":"+std::to_string(exchange.at("id").get<uint64_t>());
+                row.protocol=connection.value("decrypted",false)?"TLS/WebSocket":"WebSocket";
+                const auto& message=req.empty()?res:req;
+                row.method=Str(message,"method");row.target=Str(message,"target");
+                row.status=message.value("complete",false)?(req.empty()?"Received":"Sent"):"Incomplete";
+                row.firstSeenSeconds=message.value("observed_start_unix_ms",uint64_t(0))/1000;
+            }
         } else {
             row.status = "Diagnostic"; row.target = Str(record, "detail");
         }
         row.record = std::move(record);
-        row.bytes = row.record.dump().size() + row.target.size() + row.destination.size() + 512;
+        row.bytes = row.record.dump().size() + row.target.size() + row.destination.size() + row.processPath.size() + 512;
         batch.rows.push_back(std::move(row));
     }
     return batch;
@@ -163,7 +184,7 @@ void History::Add(Row row) {
         bytes -= rows.front().bytes; rows.pop_front(); ++discarded;
     }
     row.number = nextNumber++;
-    row.firstSeenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    if(!row.firstSeenSeconds) row.firstSeenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     bytes += row.bytes; rows.push_back(std::move(row));
 }
 void History::Clear() { rows.clear(); bytes = 0; discarded = 0; nextNumber = 1; }
@@ -214,6 +235,9 @@ static void ReadSide(const Query& query, const Row& row, const Json& message, bo
     }
     Json command{{"type", "cache_decode"}, {"run_id", row.run}, {"cache_id", row.cacheId},
         {"direction", request ? "client" : "server"},{"preview_bytes",previewLimit}};
+    // WebSocket messages are already unmasked and inflated by the stream parser.
+    // Read only the display prefix, including for messages above the HTTP decode budget.
+    if (row.websocket) { command["type"]="cache_read"; command["offset"]=0; command["length"]=previewLimit; }
     try {
             if (row.doh) for (const auto& pair : message.at("headers")) {
         auto name = pair.at(0).get<std::string>(), value = pair.at(1).get<std::string>();
@@ -228,8 +252,11 @@ static void ReadSide(const Query& query, const Row& row, const Json& message, bo
         auto decodeError = Str(reply,"decode_error");
         if (!decodeError.empty()) side.note += "DNS decoding unavailable: " + decodeError + "\r\n";
         side.body = Base64(payload.at("data_base64").get<std::string>());
-        side.note += "Decoded body: " + std::to_string(payload.value("decoded_bytes",side.body.size())) + " bytes.";
-        if(payload.value("decoded_bytes",side.body.size())>side.body.size()) side.note += " Display limited to the first " + std::to_string(previewLimit/1024) + " KiB; cached payload is unchanged.";
+        auto warning=Str(payload,"warning");
+        if(!warning.empty()) {side.note+=warning+"\r\n";detail.state=Detail::Truncated;}
+        auto bytes=row.websocket ? message.value("body_bytes",uint64_t(0)) : payload.value("decoded_bytes",uint64_t(side.body.size()));
+        side.note += std::string(row.websocket ? "Message payload: " : "Decoded body: ") + std::to_string(bytes) + " bytes.";
+        if(bytes>side.body.size()) side.note += " Display limited to the first " + std::to_string(previewLimit/1024) + " KiB; cached payload is unchanged.";
     } catch (const std::exception& error) {
         side.note += std::string("Full body decoding unavailable: ") + error.what() + "\r\n";
         // Partial/compressed bytes must never be presented as decoded text.
@@ -274,14 +301,22 @@ Detail ReadDetail(const Query& query, const Row& row, size_t previewLimit) {
             !row.record.value("upstream_verification_skipped",false) &&
             (detail.note.find("upstream TLS: invalid peer certificate:") == 0 ||
              (detail.note.find("Upstream QUIC handshake failed:")==0 && detail.note.find("invalid peer certificate:")!=std::string::npos));
-        if ((row.protocol.find("TLS") == 0 || row.protocol.find("QUIC/")==0) && row.record.value("upstream_verification_skipped",false)) detail.note += " Target certificate verification skipped.";
+        if ((row.protocol.find("TLS") == 0 || row.protocol.find("QUIC")==0) && row.record.value("upstream_verification_skipped",false)) detail.note += " Target certificate verification skipped.";
         return detail;
     }
-    const auto& exchange = Object(row.record, row.stream ? "stream" : "exchange");
+    const auto& exchange = Object(row.record, row.stream && !row.websocket ? "stream" : "exchange");
     if (exchange.empty()) { detail.note = Str(row.record, "detail"); detail.state = Detail::Unavailable; return detail; }
     if (!row.stream) detail.context += "Request/stream " + std::to_string(exchange.value("id", uint64_t(0))) + "\r\n";
     detail.note = Str(exchange, "problem");
-    if (!detail.note.empty()) detail.state = Detail::Truncated;
+    if(Str(row.record,"protocol")=="quic_datagram")
+        detail.note="Connection DATAGRAMs | ALPN: "+Str(connection,"quic_alpn")+(detail.note.empty()?"":" | "+detail.note);
+    if(Str(row.record,"protocol")=="quic_stream") {
+        const auto id=connection.at("quic_stream_id").get<uint64_t>();
+        detail.note="Stream "+std::to_string(id)+(id&2?" | Unidirectional":" | Bidirectional")+
+            (id&1?" | Server-initiated":" | Client-initiated")+" | ALPN: "+Str(connection,"quic_alpn")+
+            (detail.note.empty()?"":" | "+detail.note);
+    }
+    if (!Str(exchange,"problem").empty()) detail.state = Detail::Truncated;
     try {
         if (!row.cacheId) throw std::runtime_error("Payload cache unavailable");
         auto status = query(Json{{"type", "cache_status"}, {"run_id", row.run}, {"cache_id", row.cacheId}}).at("cache");
@@ -313,6 +348,14 @@ Detail ReadDetail(const Query& query, const Row& row, size_t previewLimit) {
                 if (!error.empty()) { detail.state=Detail::Truncated;detail.note+="\r\n"+error; }
             } catch (const std::exception& error) {detail.state=Detail::Unavailable;detail.note+="\r\n"+std::string(error.what());}
         }
+        return detail;
+    }
+    if(row.websocket) {
+        detail.note="WebSocket message " + std::to_string(exchange.value("id",uint64_t(0)))+" | "+row.method+
+            (detail.note.empty()?"":" | "+detail.note);
+        ReadSide(query,row,Object(exchange,"request"),true,detail,detail.request,previewLimit);
+        ReadSide(query,row,Object(exchange,"response"),false,detail,detail.response,previewLimit);
+        detail.request.headers.clear();detail.response.headers.clear();
         return detail;
     }
     if (row.stream) {
@@ -396,10 +439,10 @@ std::vector<unsigned char> DisplayBytes(const Side& side) {
 bool Matches(const Row& row, const std::string& filter, int protocol) {
     if (protocol == 1 && row.protocol.find("HTTP/") == std::string::npos) return false;
     if (protocol == 2 && row.protocol != "TCP" && row.protocol != "DNS/TCP") return false;
-    if (protocol == 3 && !row.udp && row.protocol.find("QUIC/")!=0) return false;
-    if (protocol == 4 && row.protocol.find("TLS") != 0 && row.protocol.find("QUIC/")!=0) return false;
+    if (protocol == 3 && !row.udp && row.protocol!="QUIC" && row.protocol.find("QUIC/")!=0) return false;
+    if (protocol == 4 && row.protocol.find("TLS") != 0 && row.protocol!="QUIC" && row.protocol.find("QUIC/")!=0) return false;
     if (protocol == 5 && !row.dns && !row.doh) return false;
-    if (protocol == 6 && !row.quic && row.protocol.find("QUIC/")!=0) return false;
+    if (protocol == 6 && !row.quic && row.protocol!="QUIC" && row.protocol.find("QUIC/")!=0) return false;
     if (filter.empty()) return true;
     std::string needle = filter;
     std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) { return (char)tolower(c); });

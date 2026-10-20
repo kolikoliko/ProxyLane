@@ -6,6 +6,8 @@ mod doh;
 mod quic_probe;
 mod quic_locator;
 mod quic_live;
+mod quic_raw;
+mod verification;
 pub mod session;
 #[cfg(test)]
 mod tests;
@@ -62,7 +64,7 @@ unsafe fn write_error(output: *mut c_char, capacity: usize, error: &str) {
 }
 #[no_mangle]
 pub extern "C" fn plm_abi_version() -> u32 {
-    8
+    9
 }
 
 #[no_mangle]
@@ -212,7 +214,8 @@ pub unsafe extern "C" fn plm_stream_io(handle: *mut protocol::Tap, op: u32, side
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if op == 2 { drop(Box::from_raw(handle)); }
         else if side < 2 {
-            if op == 4 { (*handle).transport_result(len); }
+            if op == 5 && !bytes.is_null() && len<=4096 {(*handle).close_reason(String::from_utf8_lossy(slice::from_raw_parts(bytes,len)).into_owned());}
+            else if op == 4 { (*handle).transport_result(len); }
             else if op == 1 { (*handle).eof(side as usize, true); }
             else if op == 3 && !bytes.is_null() && len <= 65535 {
                 (*handle).datagram(side as usize, slice::from_raw_parts(bytes, len));
@@ -243,6 +246,7 @@ fn call(session: &mut Session, f: impl FnOnce(&mut Session) -> Result<i32, Strin
 // op: 0 feed, 1 peek output, 2 consume output, 3 EOF, 4 status/tick.
 // status bits: 1 can read; 2 shutdown application output; 4 shutdown upstream output;
 //              8 application input EOF; 16 upstream input EOF; 32 ready.
+//              64 application can read; 128 upstream can read.
 #[no_mangle]
 /// # Safety
 /// `handle` must be a live session from plm_create, used on one thread at a time.
@@ -290,7 +294,11 @@ pub unsafe extern "C" fn plm_io(
                     | (i32::from(s.shutdown_output(1)) << 2)
                     | (i32::from(s.eof[0]) << 3)
                     | (i32::from(s.eof[1]) << 4)
-                    | (i32::from(s.ready()) << 5))
+                    | (i32::from(s.ready()) << 5)
+                    | (i32::from(s.can_read_side(0)) << 6)
+                    | (i32::from(s.can_read_side(1)) << 7)
+                    | (i32::from(s.handshake_pending()) << 8)
+                    | (i32::from(s.recording_pending()) << 9))
             }
             5 => { s.transport_result(len); Ok(0) },
             _ => Err("invalid operation".into()),
@@ -353,14 +361,23 @@ pub unsafe extern "C" fn plm_protocol(
             use std::sync::atomic::Ordering;
             let _control = PROTOCOL_CONTROL.lock().map_err(|e| e.to_string())?;
             if request["type"] == "analysis_start" {
+                // Exclude lazy initialization by arriving connections while the
+                // old runtime is drained and the new recording is constructed.
+                // A failed start must also leave capture disabled.
+                MONITORING.store(false, Ordering::Release);
                 let (changed, old) = {
                     let mut slot = PROTOCOL.lock().map_err(|e| e.to_string())?;
-                    let changed = slot.as_ref().is_some_and(|r| !r.options.same_analysis(&options::current()));
+                    let changed = slot.as_ref().is_some_and(|r| r.is_recording() || !r.options.same_analysis(&options::current()));
                     let old = if changed { slot.take() } else { None };
                     if let Some(runtime) = slot.as_ref() { runtime.start_capture(); }
                     (changed, old)
                 };
                 if let Some(runtime) = old { runtime.shutdown()?; }
+                // Recording must create and sync its manifest before monitoring can start.
+                if options::current().recording.enabled {
+                    let runtime=protocol::Runtime::configured()?;
+                    *PROTOCOL.lock().map_err(|e|e.to_string())?=Some(runtime);
+                }
                 MONITORING.store(true, Ordering::Release);
                 return Ok(serde_json::json!({"type":"analysis_started","reset":changed}).to_string());
             }
@@ -454,6 +471,6 @@ pub unsafe extern "C" fn plm_quic_inspect(handle:*mut *mut quic_probe::Probe,op:
         let probe=&mut **handle;probe.feed(0,slice::from_raw_parts(data,len));
         if probe.version!=Some(1){return -1;}
         if !probe.complete(){return 0;}
-        if probe.alpn.iter().any(|a|a=="h3"){1}else{-1}
+        if quic_live::admissible(probe){1}else{-1}
     })).unwrap_or(-1)
 }

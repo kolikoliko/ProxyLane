@@ -137,10 +137,15 @@
     <ClInclude Include="Page3.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="ProcessIconCache.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="ProtocolViewModel.h">
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="MitmSettings.h"><Filter>头文件</Filter></ClInclude>
+    <ClInclude Include="RecordingSettings.h"><Filter>头文件</Filter></ClInclude>
+    <ClInclude Include="RecordingDialog.h"><Filter>头文件</Filter></ClInclude>
     <ClInclude Include="ByteHexView.h" />
     <ClInclude Include="ProtocolRawView.h" />
     <ClInclude Include="Page4.h">

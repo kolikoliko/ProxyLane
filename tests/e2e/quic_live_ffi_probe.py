@@ -16,7 +16,7 @@ CALLBACK = C.CFUNCTYPE(None, C.c_size_t)
 
 class Engine:
     def __init__(self):
-        self.dll = C.CDLL(str(ROOT/'src/ProxyLaneMitm/target/x86_64-pc-windows-msvc/release/proxylane_mitm.dll'))
+        self.dll = C.CDLL(os.environ.get('PROXYLANE_TEST_MITM_DLL') or str(ROOT/'src/ProxyLaneMitm/target/x86_64-pc-windows-msvc/release/proxylane_mitm.dll'))
         self.dll.plm_protocol.argtypes=[C.c_char_p,C.c_void_p,C.c_size_t]
         self.dll.plm_quic_open.argtypes=[C.c_char_p,C.c_char_p,C.c_void_p,C.c_size_t,C.c_void_p,CALLBACK,C.c_size_t,C.POINTER(C.c_void_p),C.c_void_p,C.c_size_t]
         self.dll.plm_quic_io.argtypes=[C.c_void_p,C.c_uint32,C.c_uint32,C.c_void_p,C.c_size_t]
@@ -75,8 +75,13 @@ async def negative_upstream(engine,work,client_config):
                 assert failed== (not skip),('upstream certificate policy',skip,failed)
                 if not skip:
                     assert not any(e['event']=='request' for e in events)
-                    rows=engine.query(type='poll',limit=512)['records']
-                    assert any(r.get('status')=='Failed' and 'UnknownIssuer' in r.get('detail','') for r in rows)
+                    # Final lifecycle follows transport close/draining, not the client's first error.
+                    rows=[]
+                    for _ in range(80):
+                        rows.extend(engine.query(type='poll',limit=512)['records'])
+                        if any(r.get('status')=='Failed' and 'UnknownIssuer' in r.get('detail','') for r in rows):break
+                        await asyncio.sleep(.05)
+                    else:raise AssertionError(rows)
             finally:bridge.close()
         print('PASS strict upstream rejection and explicit verification override')
     finally:server.close();engine.query(type='mitm_options',skip_upstream_verify=False)
@@ -101,7 +106,7 @@ async def run():
         server=await probe.serve('127.0.0.1',origin_port,configuration=config,create_protocol=origin_peer)
         engine=Engine();engine.query(type='analysis_start')
         transport,bridge=await asyncio.get_running_loop().create_datagram_endpoint(lambda:Bridge(engine,origin_port),local_addr=('127.0.0.1',0))
-        client_config=probe.QuicConfiguration(is_client=True,alpn_protocols=['h3'],server_name=probe.NAME,supported_versions=[1])
+        client_config=probe.QuicConfiguration(is_client=True,alpn_protocols=['custom-first','h3'],server_name=probe.NAME,supported_versions=[1])
         client_config.load_verify_locations(cadata=ca.public_bytes(serialization.Encoding.PEM))
         try:
             async with probe.connect('127.0.0.1',transport.get_extra_info('sockname')[1],configuration=client_config,create_protocol=probe.Peer) as peer:

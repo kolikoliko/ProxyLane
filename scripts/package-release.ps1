@@ -29,16 +29,35 @@ $packageFiles = @(
     @{ Source = (Join-Path $binaryDirectory 'ProxyLaneSecureTransport64.dll'); Entry = 'ProxyLaneSecureTransport64.dll'; Versioned = $false },
     @{ Source = (Join-Path $binaryDirectory 'ProxyLaneMitm64.dll'); Entry = 'ProxyLaneMitm64.dll'; Versioned = $false },
     @{ Source = $exampleConfig;                                     Entry = 'ProxyLane.ini';       Versioned = $false },
-    @{ Source = (Join-Path $repositoryRoot 'LICENSE');              Entry = 'LICENSE';             Versioned = $false },
-    @{ Source = (Join-Path $repositoryRoot 'third_party\detours\LICENSE.md'); Entry = 'LICENSE-Detours.txt'; Versioned = $false },
     @{ Source = (Join-Path $repositoryRoot 'README.md');            Entry = 'README.md';           Versioned = $false },
     @{ Source = (Join-Path $repositoryRoot 'README_EN.md');         Entry = 'README_EN.md';        Versioned = $false }
 )
 
-foreach ($packageFile in $packageFiles) {
+$projectLicense = Join-Path $repositoryRoot 'LICENSE'
+$thirdPartyLicenses = @(
+    @{ Name = 'Microsoft Detours'; Source = (Join-Path $repositoryRoot 'third_party\detours\LICENSE.md') },
+    @{ Name = 'nlohmann/json'; Source = (Join-Path $repositoryRoot 'third_party\nlohmann\LICENSE.MIT') },
+    @{ Name = 'TLS trust notices'; Source = (Join-Path $repositoryRoot 'third_party\tls-trust\NOTICE.txt') },
+    @{ Name = 'webpki-root-certs'; Source = (Join-Path $repositoryRoot 'third_party\tls-trust\LICENSE-webpki-root-certs.txt') },
+    @{ Name = 'rustls-platform-verifier'; Source = (Join-Path $repositoryRoot 'third_party\tls-trust\LICENSE-rustls-platform-verifier.txt') },
+    @{ Name = 'h3-quinn'; Source = (Join-Path $repositoryRoot 'third_party\h3-quinn\LICENSE') }
+)
+foreach ($packageFile in @($packageFiles) + @(@{ Source = $projectLicense }) + @($thirdPartyLicenses)) {
     if (-not (Test-Path -LiteralPath $packageFile.Source -PathType Leaf)) {
         throw "Required release file is missing: $($packageFile.Source)"
     }
+}
+
+# Generate only the archive's LICENSE; keep upstream license files unchanged.
+$separator = '=' * 72
+$combinedLicense = New-Object System.Text.StringBuilder
+[void]$combinedLicense.Append([System.IO.File]::ReadAllText($projectLicense))
+[void]$combinedLicense.Append("`r`n`r`n$separator`r`nThird-Party Software Licenses`r`n$separator`r`n")
+foreach ($license in $thirdPartyLicenses) {
+    $sourceName = [System.IO.Path]::GetFileName($license.Source)
+    [void]$combinedLicense.Append("`r`n$($license.Name) ($sourceName)`r`n$separator`r`n`r`n")
+    [void]$combinedLicense.Append([System.IO.File]::ReadAllText($license.Source))
+    [void]$combinedLicense.Append("`r`n")
 }
 
 $versions = @(
@@ -82,6 +101,16 @@ try {
             $packageFile.Source,
             $packageFile.Entry,
             [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+    }
+    $licenseEntry = $archive.CreateEntry('LICENSE', [System.IO.Compression.CompressionLevel]::Optimal)
+    $licenseStream = $licenseEntry.Open()
+    try {
+        $encoding = New-Object System.Text.UTF8Encoding($false)
+        $licenseBytes = $encoding.GetBytes($combinedLicense.ToString())
+        $licenseStream.Write($licenseBytes, 0, $licenseBytes.Length)
+    }
+    finally {
+        $licenseStream.Dispose()
     }
 }
 finally {

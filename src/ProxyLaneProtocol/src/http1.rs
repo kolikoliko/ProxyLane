@@ -1,5 +1,5 @@
 use crate::model::*;
-use std::collections::BTreeMap;
+use crate::pending::Pending;
 
 enum Framing {
     Fixed(u64),
@@ -15,9 +15,10 @@ struct Active {
 }
 #[derive(Default)]
 pub(crate) struct Http1 {
+    upgrade:Option<crate::websocket::Config>,
     buffers: [Vec<u8>; 2],
     active: [Option<Active>; 2],
-    pending: BTreeMap<u64, Exchange>,
+    pending: Pending,
     requests: u64,
     responses: u64,
 }
@@ -96,6 +97,7 @@ fn framing(message: &Message, method: &str, client: bool) -> Result<Framing> {
 }
 
 impl Http1 {
+    pub(crate) fn take_upgrade(&mut self)->Option<(crate::websocket::Config,[Vec<u8>;2])>{self.upgrade.take().map(|c|(c,std::mem::take(&mut self.buffers)))}
     pub(crate) fn feed(
         &mut self,
         side: usize,
@@ -104,6 +106,7 @@ impl Http1 {
         out: &mut Vec<Exchange>,
         cache: Option<&crate::cache::PayloadCache>,
     ) -> Result<()> {
+        self.pending.configure(cache,limits.pending);
         self.buffers[side].extend_from_slice(data);
         loop {
             if self.active[side].is_none() {
@@ -123,7 +126,7 @@ impl Http1 {
                     message.method.as_deref().unwrap_or("")
                 } else {
                     self.pending
-                        .get(&id)
+                        .get_mut(&id)?
                         .and_then(|e| e.request.as_ref())
                         .and_then(|r| r.method.as_deref())
                         .ok_or("response without captured request")?
@@ -136,7 +139,7 @@ impl Http1 {
                         .status
                         .is_some_and(|s| (100..200).contains(&s) && s != 101)
                 {
-                    let exchange = self.pending.get_mut(&id).unwrap();
+                    let exchange = self.pending.get_mut(&id)?.unwrap();
                     if exchange.informational.len() >= 16 {
                         return Err("informational response limit".into());
                     }
@@ -149,7 +152,7 @@ impl Http1 {
                         || (method == "CONNECT"
                             && message.status.is_some_and(|s| (200..300).contains(&s))));
                 if side == 0 {
-                    if self.pending.len() >= limits.pending {
+                    if self.pending.limited() {
                         return Err("pending exchange limit".into());
                     }
                     self.requests = id;
@@ -160,22 +163,25 @@ impl Http1 {
                             request: Some(message),
                             ..Exchange::default()
                         },
-                    );
-                    self.pending.get_mut(&id).unwrap().start_cache(cache);
+                    )?;
+                    self.pending.get_mut(&id)?.unwrap().start_cache(cache);
                 } else {
-                    self.pending.get_mut(&id).unwrap().response = Some(message);
-                    self.pending.get_mut(&id).unwrap().bind_cache(1);
+                    self.pending.get_mut(&id)?.unwrap().response = Some(message);
+                    self.pending.get_mut(&id)?.unwrap().bind_cache(1);
                 }
                 self.active[side] = Some(Active { id, framing: frame });
                 if tunnel {
-                    self.complete(side, out);
+                    let exchange=self.pending.get_mut(&id)?.unwrap();
+                    let websocket=crate::websocket::negotiated(exchange.request.as_ref().unwrap(),exchange.response.as_ref().unwrap())?;
+                    self.complete(side, out)?;
+                    if let Some(config)=websocket {self.upgrade=Some(config);return Ok(());}
                     return Err(
                         "protocol switched: tunnel/WebSocket/h2c decoding not implemented".into(),
                     );
                 }
             }
             let active = self.active[side].as_mut().unwrap();
-            let exchange = self.pending.get_mut(&active.id).unwrap();
+            let exchange = self.pending.get_mut(&active.id)?.unwrap();
             let message = if side == 0 {
                 exchange.request.as_mut()
             } else {
@@ -184,7 +190,7 @@ impl Http1 {
             .unwrap();
             let buffer = &mut self.buffers[side];
             match active.framing {
-                Framing::Fixed(0) => self.complete(side, out),
+                Framing::Fixed(0) => self.complete(side, out)?,
                 Framing::Fixed(ref mut left) | Framing::ChunkData(ref mut left) => {
                     if buffer.is_empty() {
                         break;
@@ -253,7 +259,7 @@ impl Http1 {
                                 .map(|h| (h.name.to_ascii_lowercase(), text(h.value)))
                                 .collect();
                             buffer.drain(..length);
-                            self.complete(side, out);
+                            self.complete(side, out)?;
                         }
                     }
                 }
@@ -261,9 +267,9 @@ impl Http1 {
         }
         Ok(())
     }
-    fn complete(&mut self, side: usize, out: &mut Vec<Exchange>) {
+    fn complete(&mut self, side: usize, out: &mut Vec<Exchange>) -> Result<()> {
         let active = self.active[side].take().unwrap();
-        let exchange = self.pending.get_mut(&active.id).unwrap();
+        let exchange = self.pending.get_mut(&active.id)?.unwrap();
         if side == 0 {
             exchange.request.as_mut().unwrap().complete = true;
         } else {
@@ -271,15 +277,16 @@ impl Http1 {
             self.responses = active.id;
         }
         if exchange.ready() {
-            let exchange = self.pending.remove(&active.id).unwrap();
+            let exchange = self.pending.remove(&active.id)?.unwrap();
             exchange.finish_cache();
             out.push(exchange);
         }
+        Ok(())
     }
     pub(crate) fn eof(&mut self, side: usize, clean: bool, out: &mut Vec<Exchange>) -> Result<()> {
         if let Some(active) = &self.active[side] {
             if matches!(active.framing, Framing::UntilEof) && clean {
-                self.complete(side, out);
+                self.complete(side, out)?;
             } else {
                 return Err("incomplete HTTP/1 message at EOF".into());
             }
@@ -290,12 +297,6 @@ impl Http1 {
         Ok(())
     }
     pub(crate) fn drain(&mut self, reason: &str) -> Vec<Exchange> {
-        std::mem::take(&mut self.pending)
-            .into_values()
-            .map(|mut e| {
-                e.problem = Some(reason.into());
-                e
-            })
-            .collect()
+        self.pending.drain(reason)
     }
 }

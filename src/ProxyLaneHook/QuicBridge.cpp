@@ -113,3 +113,10 @@ void CQuicBridge::Consume(unsigned side) {
     if(m_handle){m_io(m_handle,2,side,NULL,0);return;}
     if(side==1&&!m_initial.empty()){m_bytes-=m_initial.front().size();initialBytes.fetch_sub(m_initial.front().size());m_initial.pop_front();}
 }
+bool CQuicBridge::Drained() {
+    if(!m_handle)return m_rejected && m_initial.empty();
+    if(m_io(m_handle,4,0,NULL,0)!=1)return false;
+    char packet[65536];
+    return m_io(m_handle,1,0,(uint8_t*)packet,sizeof(packet))==0 &&
+           m_io(m_handle,1,1,(uint8_t*)packet,sizeof(packet))==0;
+}

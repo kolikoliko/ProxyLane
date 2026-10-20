@@ -14,7 +14,7 @@ impl Capture {
         Self {
             exchange,
             limits: Limits {
-                encoded_body: 65536,
+                encoded_body: if cache.is_some_and(PayloadCache::is_recording) {0}else{65536},
                 decoded_body: 65536,
                 ..Default::default()
             },

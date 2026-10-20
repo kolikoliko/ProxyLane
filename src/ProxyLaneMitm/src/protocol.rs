@@ -1,5 +1,5 @@
-//! Passive analysis is deliberately independent of TLS forwarding and of the GUI
-//! preview queue. Only this worker parses/decompresses; the PRC uses try_send.
+//! Ordinary previews are best effort. Retained recordings use bounded,
+//! lossless queues and may wait for the independent analysis/disk workers.
 use proxylane_protocol::{
     cache::{CacheConfig, CacheRef, PayloadCache},
     Analyzer, Connection, Direction, Limits, Output, Protocol,
@@ -18,33 +18,50 @@ use std::{
 
 const QUEUE: usize = 512; // <= 32 MiB for maximum-size UDP datagrams; TCP chunks stay 16 KiB
 #[cfg(test)]
-const CONNECTIONS: usize = 32;
+const CONNECTIONS: usize = 128;
 const RECORDS: usize = 256;
 const RECORD_BYTES: usize = 16 * 1024 * 1024;
 const POLL_BYTES: usize = 2 * 1024 * 1024;
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
+// Never occupy a QUIC executor worker while waiting for analysis/disk capacity.
+// Callers that lock a shared tap must put the lock INSIDE this boundary.
+pub(crate) fn blocking<T>(f:impl FnOnce()->T)->T {
+    if tokio::runtime::Handle::try_current().is_ok_and(|h|h.runtime_flavor()==tokio::runtime::RuntimeFlavor::MultiThread) {
+        tokio::task::block_in_place(f)
+    } else {f()}
+}
 
 struct Ticket {
+    close_reason: Mutex<Option<(u64,String)>>,
+    parser_slot: AtomicBool,
+    http3_stream_id: Option<u64>,
+    identity: Connection,
     pending: AtomicUsize,
     closed: AtomicBool,
     lost: AtomicBool,
 }
 enum Event {
+    Timed(u64,Box<Event>),
+    #[cfg(test)]
+    Pause(mpsc::Receiver<()>,mpsc::Sender<()>),
     Open(u64, Connection, Option<Vec<u8>>, bool, Arc<Ticket>),
     Data(u64, usize, u64, Vec<u8>, Arc<Ticket>),
     Datagram(u64, usize, Vec<u8>, Arc<Ticket>),
     Eof(u64, usize, bool, Arc<Ticket>),
     State(u64, usize, Arc<Ticket>),
     Http3(u64, usize, H3Part, Arc<Ticket>),
+    Note(u64, String, Arc<Ticket>),
     Barrier(mpsc::Sender<()>),
     StopCapture(mpsc::Sender<()>),
     Shutdown,
 }
+impl Event { fn timed(self)->Self { if matches!(self,Self::Timed(..)) {self} else {Self::Timed(proxylane_protocol::recording::observed_ms(),Box::new(self))} } }
 pub enum H3Part { Head(proxylane_protocol::Message), Data(Vec<u8>), End(proxylane_protocol::Headers) }
 #[derive(Default)]
 struct Results {
+    archive: Option<PayloadCache>,
     sequence: u64,
     bytes: usize,
     evicted: u64,
@@ -54,6 +71,8 @@ impl Results {
     fn add(&mut self, mut value: Value) {
         self.sequence += 1;
         value["sequence"] = self.sequence.into();
+        value["observed_unix_ms"] = proxylane_protocol::recording::observed_ms().into();
+        if let Some(cache)=&self.archive {cache.record(json!({"type":"observation","record":record_metadata(value.clone())}));}
         let size = serde_json::to_vec(&value).map_or(POLL_BYTES + 1, |v| v.len());
         // Keep each poll bounded, including a single pathological record.
         if size > POLL_BYTES {
@@ -71,8 +90,18 @@ impl Results {
         }
     }
 }
+fn record_metadata(mut value:Value)->Value {
+    match &mut value {
+        Value::Object(map)=>{for key in ["body_base64","decoded_base64","text"] {map.remove(key);}
+            for child in map.values_mut() {*child=record_metadata(child.take());}}
+        Value::Array(items)=>for child in items {*child=record_metadata(child.take());},
+        _=>()
+    }
+    value
+}
 
 pub struct Runtime {
+    space: Arc<tokio::sync::Notify>,
     pub(crate) options: crate::options::Options,
     sender: SyncSender<Event>,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -81,6 +110,7 @@ pub struct Runtime {
     capture_epoch: Mutex<u64>,
     next: AtomicU64,
     active: Arc<AtomicUsize>,
+    parsers: Arc<AtomicUsize>,
     rejected: AtomicU64,
     results: Arc<Mutex<Results>>,
     cache: Option<PayloadCache>,
@@ -88,9 +118,19 @@ pub struct Runtime {
     pub run_id: String,
 }
 impl Runtime {
+    pub fn recording_status(&self)->Value {self.cache.as_ref().map_or(json!({"enabled":false}),PayloadCache::recording_status)}
+    pub fn recording_failed(&self)->bool {self.cache.as_ref().is_some_and(PayloadCache::recording_failed)}
+    pub fn is_recording(&self)->bool {self.cache.as_ref().is_some_and(PayloadCache::is_recording)}
+    fn fail_recording(&self, reason:&str) {if let Some(cache)=&self.cache {cache.fail_recording(reason);}}
+    fn issue(&self, gap:bool, reason:&str, context:Value) {
+        if let Some(cache)=&self.cache {cache.recording_issue(gap,reason,context);}
+    }
     pub fn lifecycle(&self, epoch: u64, identity: &Connection, state: &str, protocol: &str, problem: &str, skipped: bool) {
+        blocking(||self.lifecycle_inner(epoch,identity,state,protocol,problem,skipped));
+    }
+    fn lifecycle_inner(&self, epoch:u64, identity:&Connection, state:&str, protocol:&str, problem:&str, skipped:bool) {
         let gate = lock(&self.capture_epoch);
-        if *gate != epoch || epoch % 2 == 0 || self.stopping.load(Ordering::Acquire) { return; }
+        if *gate != epoch || epoch % 2 == 0 || self.stopping.load(Ordering::Acquire) || self.recording_failed() { return; }
         lock(&self.results).add(json!({"type":"connection", "connection":identity, "protocol":protocol,
             "status":state,"detail":problem,"upstream_verification_skipped":skipped}));
     }
@@ -107,10 +147,10 @@ impl Runtime {
             if *epoch % 2 != 0 { *epoch += 1; }
         }
         let (tx, rx) = mpsc::channel();
-        self.sender.send(Event::StopCapture(tx)).map_err(|_| "analysis worker unavailable")?;
+        self.sender.send(Event::StopCapture(tx).timed()).map_err(|_| "analysis worker unavailable")?;
         rx.recv().map_err(|_| "analysis worker unavailable")?;
         // stats is a FIFO disk-worker barrier, retaining all existing payloads.
-        if let Some(cache) = &self.cache { cache.stats()?; }
+        if let Some(cache) = &self.cache { cache.stats()?;cache.finish_recording()?; }
         Ok(())
     }
     pub fn configured() -> Result<Arc<Self>, String> {
@@ -130,27 +170,42 @@ impl Runtime {
         if std::env::var_os("PROXYLANE_PROTOCOL_ENTRY_BYTES").is_none() {config.entry_bytes=options.entry_mib*1024*1024;}
         if std::env::var_os("PROXYLANE_PROTOCOL_TOTAL_BYTES").is_none() {config.total_bytes=options.total_mib*1024*1024;}
         config.max_entries=(options.history_rows*2).max(4096);
+        if options.recording.enabled {
+            config.queue_chunks=1024;
+            config.root=options.recording.directory.clone().into();
+            config.recording=Some(proxylane_protocol::recording::RecordingConfig {
+                total_bytes:options.recording.capacity_mib*1024*1024,min_free_bytes:options.recording.reserve_mib*1024*1024});
+        }
         Self::with_options(config,options)
     }
     pub fn new(config: CacheConfig) -> Result<Arc<Self>, String> {
         Self::with_options(config,crate::options::Options::default())
     }
-    fn with_options(mut config:CacheConfig, options:crate::options::Options) -> Result<Arc<Self>,String> {
+    fn with_options(config:CacheConfig, options:crate::options::Options) -> Result<Arc<Self>,String> {
+        Self::with_queue(config,options,QUEUE)
+    }
+    fn with_queue(mut config:CacheConfig, options:crate::options::Options,queue:usize) -> Result<Arc<Self>,String> {
         options.validate()?;
         config.decode_bytes=options.decode_mib*1024*1024;
         config.decode_input_bytes=config.entry_bytes.min(64*1024*1024) as usize;
         let worker_options=options.clone();
         let mut random = [0u8; 16];
         getrandom::getrandom(&mut random).map_err(|e| e.to_string())?;
+        let retained=config.recording.is_some();
         let (cache, cache_error) = match PayloadCache::new(config) {
             Ok(cache) => (Some(cache), None),
+            Err(e) if retained => return Err(e),
             Err(e) => (None, Some(e)),
         };
-        let results = Arc::new(Mutex::new(Results::default()));
+        let results = Arc::new(Mutex::new(Results {archive:if retained {cache.clone()}else{None},..Default::default()}));
         let active = Arc::new(AtomicUsize::new(0));
-        let (sender, receiver) = mpsc::sync_channel(QUEUE);
+        let parsers = Arc::new(AtomicUsize::new(0));
+        let (sender, receiver) = mpsc::sync_channel(queue);
+        let space=Arc::new(tokio::sync::Notify::new());
+        let worker_space=space.clone();
         let worker_results = results.clone();
         let worker_active = active.clone();
+        let worker_parsers = parsers.clone();
         let worker_cache = cache.clone();
         let worker = thread::Builder::new()
             .name("protocol-analysis".into())
@@ -161,11 +216,13 @@ impl Runtime {
                     cache: worker_cache,
                     results: worker_results,
                     active: worker_active,
+                    parsers: worker_parsers,
                 }
-                .run(receiver);
+                .run_notifying(receiver,worker_space);
             })
             .map_err(|e| e.to_string())?;
         Ok(Arc::new(Self {
+            space,
             options,
             sender,
             worker: Mutex::new(Some(worker)),
@@ -173,6 +230,7 @@ impl Runtime {
             capture_epoch: Mutex::new(1),
             next: AtomicU64::new(1),
             active,
+            parsers,
             rejected: AtomicU64::new(0),
             results,
             cache,
@@ -180,41 +238,76 @@ impl Runtime {
             run_id: format!("{:032x}", u128::from_le_bytes(random)),
         }))
     }
+    #[cfg(test)]
+    pub(crate) fn test_small_queue(config:CacheConfig)->Arc<Self> {
+        Self::with_queue(config,Default::default(),2).unwrap()
+    }
+    #[cfg(test)]
+    pub(crate) fn pause_worker(&self)->mpsc::Sender<()> {
+        let (resume,wait)=mpsc::channel();let (entered,ready)=mpsc::channel();
+        self.sender.send(Event::Pause(wait,entered)).unwrap();ready.recv().unwrap();resume
+    }
+    #[cfg(test)]
+    pub(crate) fn fill_paused_queue(&self) {
+        for _ in 0..2 {let(tx,_)=mpsc::channel();assert!(self.sender.try_send(Event::Barrier(tx)).is_ok());}
+    }
     pub fn tap(self: &Arc<Self>, connection: Connection, alpn: Option<Vec<u8>>) -> Option<Tap> {
         self.tap_transport(connection, alpn, true)
+    }
+    pub async fn tap_at_async(self:&Arc<Self>,epoch:u64,connection:Connection,alpn:Option<Vec<u8>>,decrypted:bool)->Option<Tap> {
+        // Admission is rare and synchronous; bound the replacement threads.
+        static ADMISSION:tokio::sync::Semaphore=tokio::sync::Semaphore::const_new(4);
+        let _permit=ADMISSION.acquire().await.ok()?;
+        blocking(||self.tap_at(epoch,connection,alpn,decrypted))
     }
     pub fn tap_transport(self: &Arc<Self>, connection: Connection, alpn: Option<Vec<u8>>, decrypted: bool) -> Option<Tap> {
         self.tap_at(self.capture_epoch(), connection, alpn, decrypted)
     }
     pub fn tap_at(self: &Arc<Self>, epoch: u64, mut connection: Connection, alpn: Option<Vec<u8>>, decrypted: bool) -> Option<Tap> {
         let gate = lock(&self.capture_epoch);
-        if *gate != epoch || epoch % 2 == 0 || self.stopping.load(Ordering::Acquire) {
+        if *gate != epoch || epoch % 2 == 0 || self.stopping.load(Ordering::Acquire) || self.recording_failed() {
             return None;
         }
+        connection.decrypted = decrypted;
+        let retained=self.is_recording();
+        let h3=alpn.as_ref().is_some_and(|a|a.starts_with(b"h3:"));
+        let raw_quic=connection.quic_stream_id.is_some() || connection.quic_datagrams;
         if self
             .active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.options.connections).then_some(n + 1)
+                (retained || n < self.options.connections).then_some(n + 1)
             })
             .is_err()
         {
             self.rejected.fetch_add(1, Ordering::Relaxed);
+            self.issue(true,"capture stream safety limit reached",json!({"connection":connection,"alpn":alpn,
+                "scope":"entire connection/request was not admitted"}));
             return None;
         }
-        connection.decrypted = decrypted;
+        // HTTP/3 arrives as decoded messages, not wire bytes for another parser.
+        let parser_slot=!h3 && !raw_quic && self.parsers.fetch_update(Ordering::AcqRel,Ordering::Acquire,
+            |n|(n<self.options.connections).then_some(n+1)).is_ok();
+        if !h3 && !raw_quic && !parser_slot && !retained {
+            self.active.fetch_sub(1,Ordering::AcqRel);self.rejected.fetch_add(1,Ordering::Relaxed);return None;
+        }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let ticket = Arc::new(Ticket {
+            close_reason: Mutex::new(None),
+            parser_slot: AtomicBool::new(parser_slot),
+            http3_stream_id: alpn.as_ref().and_then(|a|a.strip_prefix(b"h3:")).and_then(|a|std::str::from_utf8(a).ok()).and_then(|s|s.parse().ok()),
+            identity: connection.clone(),
             pending: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             lost: AtomicBool::new(false),
         });
-        if self
-            .sender
-            .try_send(Event::Open(id, connection, alpn, decrypted, ticket.clone()))
-            .is_err()
+        if let Err(error)=self.submit(Event::Open(id, connection, alpn, decrypted, ticket.clone()))
         {
             self.active.fetch_sub(1, Ordering::AcqRel);
+            if parser_slot {self.parsers.fetch_sub(1,Ordering::AcqRel);}
             self.rejected.fetch_add(1, Ordering::Relaxed);
+            self.issue(true,"analysis admission queue unavailable",json!({"connection":ticket.identity,"http3_stream_id":ticket.http3_stream_id,
+                "scope":"entire connection/request was not admitted"}));
+            if matches!(error,mpsc::TrySendError::Disconnected(_)) {self.fail_recording("analysis worker unavailable");}
             return None;
         }
         Some(Tap {
@@ -226,8 +319,15 @@ impl Runtime {
             ended: [false; 2],
         })
     }
+    fn submit(&self,event:Event)->Result<(),mpsc::TrySendError<Event>> {
+        let event=event.timed();
+        if self.is_recording() {
+            blocking(||self.sender.send(event).map_err(|e|mpsc::TrySendError::Disconnected(e.0)))
+        } else {self.sender.try_send(event)}
+    }
     // Query calls belong on a consumer/background thread, never the PRC thread.
     pub fn query(&self, request: &Value) -> Result<Value, String> {
+        if request["type"]=="recording_status" {return Ok(self.recording_status());}
         if self.stopping.load(Ordering::Acquire) {
             return Err("analysis stopped".into());
         }
@@ -242,6 +342,7 @@ impl Runtime {
                 let cache = self.cache.as_ref().map(PayloadCache::stats).transpose()?;
                 let records = lock(&self.results);
                 json!({"type":"stats", "active_connections":self.active.load(Ordering::Acquire),
+                    "active_parsers":self.parsers.load(Ordering::Acquire),
                     "rejected_connections":self.rejected.load(Ordering::Relaxed),
                     "last_sequence":records.sequence, "retained_records":records.records.len(),
                     "retained_bytes":records.bytes, "evicted_records":records.evicted,
@@ -341,13 +442,86 @@ pub struct Tap {
     offsets: [u64; 2],
     ended: [bool; 2],
 }
+struct PendingSend<'a> {tap:&'a Tap,event:Option<Event>}
+impl Drop for PendingSend<'_> {
+    fn drop(&mut self) {
+        // Cancelling a QUIC forwarding future must not discard plaintext that
+        // was already read while waiting for the recording queue.
+        if let Some(event)=self.event.take() {blocking(||self.tap.send(event));}
+    }
+}
 impl Tap {
+    pub fn try_data(&mut self,side:usize,bytes:&[u8])->bool {
+        if !self.owner.is_recording() {self.data(side,bytes);return true;}
+        assert!(bytes.len()<=16384);
+        let gate=match self.owner.capture_epoch.try_lock() {
+            Ok(g)=>g,
+            Err(std::sync::TryLockError::Poisoned(e))=>e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock)=>return false,
+        };
+        if *gate!=self.epoch || self.epoch%2==0 || !self.accepting() {return true;}
+        self.ticket.pending.fetch_add(1,Ordering::AcqRel);
+        let event=Event::Data(self.id,side,self.offsets[side],bytes.to_vec(),self.ticket.clone()).timed();
+        match self.owner.sender.try_send(event) {
+            Ok(())=>{self.offsets[side]+=bytes.len() as u64;true}
+            Err(e)=>{
+                self.ticket.pending.fetch_sub(1,Ordering::AcqRel);
+                if matches!(e,mpsc::TrySendError::Disconnected(_)) {self.owner.fail_recording("analysis worker unavailable");true}
+                else {false}
+            }
+        }
+    }
+    async fn send_async(&self,event:Event) {
+        if !self.owner.is_recording() {self.send(event);return;}
+        let mut queued=PendingSend {tap:self,event:Some(event.timed())};
+        loop {
+            let wake=self.owner.space.notified();tokio::pin!(wake);wake.as_mut().enable();
+            let busy = {
+                match self.owner.capture_epoch.try_lock() {
+                    Err(std::sync::TryLockError::WouldBlock)=>true,
+                    guard=>{
+                        let gate=guard.unwrap_or_else(|e|match e {std::sync::TryLockError::Poisoned(e)=>e.into_inner(),_=>unreachable!()});
+                        if *gate!=self.epoch || self.epoch%2==0 || !self.accepting() {queued.event.take();return;}
+                        self.ticket.pending.fetch_add(1,Ordering::AcqRel);
+                        match self.owner.sender.try_send(queued.event.take().unwrap()) {
+                            Ok(())=>return,
+                            Err(mpsc::TrySendError::Full(e))=>{queued.event=Some(e);self.ticket.pending.fetch_sub(1,Ordering::AcqRel);}
+                            Err(mpsc::TrySendError::Disconnected(_))=>{
+                                self.ticket.pending.fetch_sub(1,Ordering::AcqRel);
+                                self.owner.fail_recording("analysis worker unavailable");return;
+                            }
+                        }
+                        false
+                    }
+                }
+            };
+            if busy {tokio::time::sleep(Duration::from_millis(1)).await;} else {wake.await;}
+        }
+    }
+    pub async fn http3_async(&self,side:usize,part:H3Part) {
+        self.send_async(Event::Http3(self.id,side,part,self.ticket.clone())).await;
+    }
+    pub async fn data_async(&mut self,side:usize,bytes:&[u8]) {
+        for chunk in bytes.chunks(16384) {
+            self.send_async(Event::Data(self.id,side,self.offsets[side],chunk.to_vec(),self.ticket.clone())).await;
+            self.offsets[side]+=chunk.len() as u64;
+        }
+    }
+    pub async fn datagram_async(&mut self,side:usize,bytes:&[u8]) {
+        self.send_async(Event::Datagram(self.id,side,bytes.to_vec(),self.ticket.clone())).await;
+    }
+    pub async fn note_async(&self,note:String) {self.send_async(Event::Note(self.id,note,self.ticket.clone())).await;}
+    pub async fn eof_async(&mut self,side:usize,clean:bool) {
+        if !self.ended[side] {self.ended[side]=true;self.send_async(Event::Eof(self.id,side,clean,self.ticket.clone())).await;}
+    }
     pub fn is_capturing(&self)->bool { *lock(&self.owner.capture_epoch)==self.epoch && self.epoch%2!=0 && self.accepting() }
     pub fn http3(&self, side:usize, part:H3Part) { self.send(Event::Http3(self.id,side,part,self.ticket.clone())); }
+    pub fn close_reason(&self,reason:String) {let mut slot=lock(&self.ticket.close_reason);if slot.is_none(){*slot=Some((proxylane_protocol::recording::observed_ms(),reason));}}
+    pub fn note(&self, note:String) {self.send(Event::Note(self.id,note,self.ticket.clone()));}
     pub fn transport_result(&mut self, error: usize) { self.send(Event::State(self.id,error,self.ticket.clone())); }
     fn accepting(&self) -> bool {
         !self.ticket.lost.load(Ordering::Acquire) && !self.ticket.closed.load(Ordering::Acquire)
-            && !self.owner.stopping.load(Ordering::Acquire)
+            && !self.owner.stopping.load(Ordering::Acquire) && !self.owner.recording_failed()
     }
     fn send(&self, event: Event) {
         let gate = lock(&self.owner.capture_epoch);
@@ -356,9 +530,13 @@ impl Tap {
     }
     fn enqueue(&self, event: Event) {
         self.ticket.pending.fetch_add(1, Ordering::AcqRel);
-        if self.owner.sender.try_send(event).is_err() {
+        if let Err(error)=self.owner.submit(event) {
             // Out-of-band terminal flag cannot itself be lost in the full queue.
             self.ticket.lost.store(true, Ordering::Release);
+            self.owner.issue(true,"analysis queue overflow",json!({"connection":self.ticket.identity,
+                "capture_id":self.id,"http3_stream_id":self.ticket.http3_stream_id,
+                "scope":"capture is incomplete from the first rejected event until this connection/request ends"}));
+            if matches!(error,mpsc::TrySendError::Disconnected(_)) {self.owner.fail_recording("analysis worker unavailable");}
             self.ticket.pending.fetch_sub(1, Ordering::AcqRel);
         }
     }
@@ -385,11 +563,17 @@ impl Tap {
 }
 impl Drop for Tap {
     fn drop(&mut self) {
+        self.close_reason("capture owner released; transport close cause unavailable".into());
         self.ticket.closed.store(true, Ordering::Release);
     }
 }
 
 struct Stream {
+    deferred: Option<CacheRef>,
+    deferred_alpn: Option<Vec<u8>>,
+    deferred_bytes: u64,
+    fallback: bool,
+    analysis_note: Option<String>,
     h3: Option<proxylane_protocol::http3::Capture>,
     dns: Option<crate::dns::Dns>,
     quic: crate::quic_probe::Probe,
@@ -415,150 +599,50 @@ struct Worker {
     cache: Option<PayloadCache>,
     results: Arc<Mutex<Results>>,
     active: Arc<AtomicUsize>,
+    parsers: Arc<AtomicUsize>,
 }
 impl Worker {
     fn records(&self, records: Vec<Value>) {
         let mut results=lock(&self.results);for record in records {results.add(record);}
     }
-    fn output(&self, out: Vec<Output>) {
+    fn output(&self, out: Vec<Output>) -> Option<String> {
+        let mut error=None;
         for output in out {
+            // A malformed/partially captured protocol affects this connection,
+            // not the lifetime of all other recordings. Persist the diagnostic.
+            if let Output::Diagnostic {detail,..}=&output {error=Some(detail.clone());}
             if let Ok(mut value) = serde_json::to_value(output) {
                 crate::doh::annotate(&mut value);
                 lock(&self.results).add(value);
             }
         }
+        error
     }
-    fn diagnostic(&self, identity: &Connection, detail: &str) {
-        lock(&self.results)
-            .add(json!({"type":"analysis_diagnostic", "connection":identity, "detail":detail}));
-    }
-    fn parser(&self, identity: Connection, protocol: Protocol) -> Analyzer {
-        let limits = Limits {
-            encoded_body: 65536,
-            decoded_body: 65536,
-            pending: self.options.pending_requests,
-            ..Limits::default()
-        };
-        if let Some(cache) = &self.cache {
-            Analyzer::with_cache(identity, protocol, limits, cache.clone())
-        } else {
-            Analyzer::new(identity, protocol, limits)
+    fn fallback(&self, stream:&mut Stream, reason:&str) {
+        if !stream.fallback {
+            if let Some(cache)=&self.cache {
+                cache.recording_analysis_fallback(reason,json!({"connection":stream.identity}));
+            }
         }
-        .expect("constant valid limits")
+        stream.analyzer=None;stream.detect=false;stream.sniff.clear();stream.fallback=true;
+        stream.analysis_note=Some(reason.to_owned());
+        stream.cache=self.cache.as_ref().map(|c|c.scoped(json!({"connection":stream.identity,
+            "protocol":"tcp","kind":"analysis_fallback","reason":reason,
+            "note":"Raw data from the failing input chunk onward; that first chunk may overlap an earlier parsed payload."})).stream());
+        stream.dirty=true;
     }
-    fn opaque(&self, stream: &mut Stream) {
-        stream.detect = false;
-        stream.cache = self.cache.as_ref().map(PayloadCache::stream);
-        if !stream.sniff.is_empty() {
-            let bytes = std::mem::take(&mut stream.sniff);
-            self.opaque_data(stream, 0, &bytes);
-        }
-        stream.dirty = true;
+    fn fallback_data(&self, stream:&mut Stream, side:usize, source_offset:u64, bytes:&[u8]) {
+        if let Some(c)=&stream.cache {c.record(json!({"type":"analysis_fallback_chunk","side":side,
+            "source_offset":source_offset,"offset":stream.counts[side],"length":bytes.len()}));}
+        self.opaque_data(stream,side,bytes);
     }
-    fn opaque_data(&self, stream: &mut Stream, side: usize, bytes: &[u8]) {
-        stream.counts[side] += bytes.len() as u64;
-        if let Some(cache) = &stream.cache { cache.append_stream(direction(side), bytes); }
-        stream.dirty = true;
-    }
-    fn publish(&self, stream: &mut Stream, finished: bool) {
-        if stream.dns.is_some() { stream.dirty=false; return; }
-        if stream.counts == [0,0] && stream.packet_counts == [0,0] { return; }
-        let lost = stream.ticket.lost.load(Ordering::Acquire);
-        lock(&self.results).add(json!({"type":"stream", "connection":stream.identity,
-            "protocol":if stream.quic.version.is_some() {"quic"} else if stream.identity.transport == "udp" {"udp"} else if stream.decrypted {"tls_stream"} else if stream.encrypted {"tls_encrypted"} else {"tcp"},
-            "quic":stream.quic.summary(),
-            "stream":{"sent_bytes":stream.counts[0], "received_bytes":stream.counts[1],
-                "finished":finished, "complete":stream.ended.iter().all(|v| *v) && !lost,
-                "problem":if lost {Some("analysis queue overflow; only a contiguous prefix was captured")} else {None},
-                "cache":stream.cache, "datagrams":stream.datagrams, "packet_counts":stream.packet_counts}}));
-        stream.dirty = false;
-        stream.published = Instant::now();
-    }
-    fn progress(&mut self) {
-        let ids: Vec<_> = self.connections.keys().copied().collect();
-        for id in ids {
-            let mut stream = self.connections.remove(&id).unwrap();
-            if let Some(dns)=&mut stream.dns {self.records(dns.expire(&stream.identity,None));}
-            // Bound detection latency for small/idle ASCII protocols as well as memory.
-            if stream.detect && !stream.sniff.is_empty() && stream.opened.elapsed() >= Duration::from_secs(2) {
-                self.opaque(&mut stream);
-            }
-            if stream.h3.is_some() && stream.dirty && stream.published.elapsed()>=Duration::from_millis(500) {
-                lock(&self.results).add(json!({"type":"exchange","connection":stream.identity,"protocol":"h3","exchange":stream.h3.as_ref().unwrap().snapshot()}));
-                stream.dirty=false;stream.published=Instant::now();
-            }
-            if stream.h3.is_none() && stream.analyzer.is_none() && !stream.detect && stream.dirty
-                && stream.published.elapsed() >= Duration::from_millis(500) {
-                self.publish(&mut stream, false);
-            }
-            self.connections.insert(id, stream);
-        }
-    }
-    fn reap(&mut self, all: bool, stopped: bool) {
-        let ids: Vec<_> = self.connections.iter().filter_map(|(id, stream)| {
-            (all || (stream.ticket.pending.load(Ordering::Acquire) == 0 &&
-                (stream.ticket.closed.load(Ordering::Acquire) || stream.ticket.lost.load(Ordering::Acquire))))
-                .then_some(*id)
-        }).collect();
-        for id in ids {
-            let mut stream = self.connections.remove(&id).unwrap();
-            let lost = stream.ticket.lost.load(Ordering::Acquire);
-            if let Some(h3) = stream.h3.take() {
-                let exchange=h3.finish(if lost {"HTTP/3 observation queue overflow"} else {"capture ended before HTTP/3 exchange completed"});
-                let mut value=json!({"type":"exchange","connection":stream.identity,"protocol":"h3","exchange":exchange});
-                crate::doh::annotate(&mut value);lock(&self.results).add(value);
-            } else if let Some(dns) = &mut stream.dns {
-                self.records(dns.close(&stream.identity,self.cache.as_ref(),if lost {"DNS capture queue overflow"}else{"DNS capture ended before response"}));
-            } else if let Some(parser) = &mut stream.analyzer {
-                self.output(parser.close());
-                if lost { self.diagnostic(&stream.identity, "analysis queue overflow; reconstruction stopped for this connection"); }
-            } else {
-                if stream.detect { self.opaque(&mut stream); }
-                if let Some(cache) = &stream.cache {
-                    cache.finish_stream(stream.counts, stream.ended.iter().all(|v| *v) && !lost);
-                }
-                self.publish(&mut stream, true);
-            }
-            if stream.identity.transport != "udp" && !stream.decrypted {
-                lock(&self.results).add(json!({"type":"connection","connection":stream.identity,"protocol":"tcp","status":if stopped {"Stopped"}else{"Closed"}}));
-            }
-            self.active.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-    fn run(mut self, receiver: Receiver<Event>) {
-        let mut progress = Instant::now();
-        loop {
-            match receiver.recv_timeout(Duration::from_millis(100)) {
-                Ok(Event::Open(id, identity, alpn, decrypted, ticket)) => {
-                    let h3=alpn.as_ref().filter(|a|a.starts_with(b"h3:")).and_then(|a|std::str::from_utf8(&a[3..]).ok()).and_then(|s|s.parse::<u64>().ok())
-                        .map(|stream_id|proxylane_protocol::http3::Capture::new(stream_id,self.cache.as_ref()));
-                    let protocol = match alpn.as_deref() {
-                        Some(b"h2") => Some(Protocol::H2),
-                        Some(b"http/1.1") => Some(Protocol::Http1),
-                        _ => None,
-                    };
-                    let udp = identity.transport == "udp";
-                    let dns = if identity.server_port==53 {Some(crate::dns::Dns::default())}else{None};
-                    let is_dns=dns.is_some();
-                    let analyzer = protocol.map(|p| self.parser(identity.clone(), p));
-                    let mut stream = Stream { h3, identity, ticket, analyzer, sniff: Vec::new(), dns, quic:Default::default(),
-                        detect: alpn.is_none() && !udp && !is_dns, decrypted, encrypted: false, cache: None,
-                        counts: [0;2], datagrams: [Vec::new(), Vec::new()], packet_counts: [0;2], ended: [false;2], dirty: false,
-                        published: Instant::now() - Duration::from_secs(1), opened: Instant::now() };
-                    if stream.h3.is_none() && !is_dns && (udp || (protocol.is_none() && alpn.is_some())) { self.opaque(&mut stream); }
-                    if !udp && !decrypted {
-                        lock(&self.results).add(json!({"type":"connection","connection":stream.identity,"protocol":"tcp","status":"Connecting"}));
-                    }
-                    self.connections.insert(id, stream);
-                }
-                Ok(Event::Data(id, side, offset, bytes, ticket)) => {
-                    if let Some(mut stream) = self.connections.remove(&id) {
+    fn data(&self,stream:&mut Stream,side:usize,offset:u64,bytes:&[u8]) {
                         if let Some(dns)=&mut stream.dns {
                             self.records(dns.tcp(&stream.identity,self.cache.as_ref(),side,&bytes));
                         } else if stream.detect {
                             if side != 0 {
-                                self.opaque(&mut stream);
-                                self.opaque_data(&mut stream, side, &bytes);
+                                self.opaque(stream);
+                                self.opaque_data(stream, side, &bytes);
                             } else {
                                 stream.sniff.extend_from_slice(&bytes);
                                 const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -585,15 +669,240 @@ impl Worker {
                                 };
                                 if let Some(protocol) = protocol {
                                     let mut parser = self.parser(stream.identity.clone(), protocol);
-                                    self.output(parser.push(Direction::Client, 0, &stream.sniff));
-                                    stream.analyzer = Some(parser);
+                                    let sniff=std::mem::take(&mut stream.sniff);
+                                    if let Some(reason)=self.output(parser.push(Direction::Client, 0, &sniff)) {
+                                        self.fallback(stream,&reason);self.fallback_data(stream,0,0,&sniff);
+                                    } else {stream.analyzer = Some(parser);}
                                     stream.detect = false;
                                     stream.sniff = Vec::new();
-                                } else if opaque { self.opaque(&mut stream); }
+                                } else if opaque { self.opaque(stream); }
                             }
                         } else if let Some(parser) = &mut stream.analyzer {
-                            self.output(parser.push(direction(side), offset, &bytes));
-                        } else { self.opaque_data(&mut stream, side, &bytes); }
+                            if let Some(reason)=self.output(parser.push(direction(side), offset, &bytes)) {
+                                self.fallback(stream,&reason);self.fallback_data(stream,side,offset,&bytes);
+                            }
+                        } else if stream.fallback {self.fallback_data(stream,side,offset,&bytes);}
+                        else { self.opaque_data(stream, side, &bytes); }
+    }
+    fn datagram(&self,stream:&mut Stream,side:usize,bytes:&[u8]) {
+                        // Only probe DNS off-port at the beginning of a flow.
+                        if !stream.decrypted && !stream.fallback && stream.dns.is_none() && stream.packet_counts==[0,0] && proxylane_protocol::dns::decode(&bytes).is_ok() {
+                            stream.dns=Some(crate::dns::Dns::default());
+                            if let Some(c)=stream.cache.take(){c.finish_stream([0,0],true);}
+                        }
+                        if let Some(dns)=&mut stream.dns {
+                            self.records(dns.feed(&stream.identity,self.cache.as_ref(),side,&bytes));
+                        } else {
+                            if !stream.decrypted && !stream.fallback {stream.quic.feed(side,&bytes);}
+                            if stream.datagrams[side].len() < self.options.udp_packets { stream.datagrams[side].push((stream.counts[side], bytes.len())); }
+                            stream.packet_counts[side] += 1;
+                            let offset=stream.counts[side];
+                            if let Some(c)=&stream.cache {c.record(json!({"type":"datagram","side":side,"offset":offset,"length":bytes.len(),"packet_number":stream.packet_counts[side]}));}
+                            self.opaque_data(stream, side, &bytes);
+                        }
+    }
+    fn defer(&self,stream:&mut Stream,kind:u8,side:usize,bytes:&[u8]) {
+        let cache=stream.deferred.as_ref().unwrap();
+        let mut frame=Vec::with_capacity(bytes.len()+14);
+        frame.extend_from_slice(&proxylane_protocol::recording::observed_ms().to_le_bytes());
+        frame.extend_from_slice(&[kind,side as u8]);frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        frame.extend_from_slice(bytes);cache.append_stream(Direction::Client,&frame);
+        stream.deferred_bytes+=frame.len() as u64;
+    }
+    fn replay(&self,stream:&mut Stream)->Result<(),String> {
+        use std::io::Read;
+        let spool=stream.deferred.take().unwrap();
+        let cache=self.cache.as_ref().ok_or("missing backlog cache")?;
+        spool.finish_stream([stream.deferred_bytes,0],true);cache.stats()?;
+        if cache.recording_failed() {return Ok(());}
+        let protocol=match stream.deferred_alpn.as_deref() {Some(b"h2")=>Some(Protocol::H2),Some(b"http/1.1")=>Some(Protocol::Http1),_=>None};
+        let udp=stream.identity.transport=="udp";
+        stream.dns=if stream.identity.server_port==53 {Some(crate::dns::Dns::default())}else{None};
+        stream.analyzer=if stream.dns.is_none() {protocol.map(|p|self.parser(stream.identity.clone(),p))}else{None};
+        stream.detect=stream.deferred_alpn.is_none() && !udp && stream.dns.is_none();
+        if stream.dns.is_none() && (udp || (protocol.is_none() && !stream.detect)) {self.opaque(stream);}
+        let mut offsets=[0u64;2];
+        if stream.deferred_bytes!=0 {
+            let mut file=std::fs::File::open(cache.directory().join(proxylane_protocol::recording::payload_relative(spool.id(),0))).map_err(|e|e.to_string())?;
+            let mut left=stream.deferred_bytes;
+            while left>0 {
+                let mut time=[0u8;8];file.read_exact(&mut time).map_err(|e|e.to_string())?;
+                let _time=proxylane_protocol::recording::observation_time(u64::from_le_bytes(time));
+                let mut header=[0u8;6];file.read_exact(&mut header).map_err(|e|e.to_string())?;
+                let n=u32::from_le_bytes(header[2..6].try_into().unwrap()) as usize;
+                if header[1]>1 || n>65535 || left<14+n as u64 {return Err("invalid analysis backlog frame".into());}
+                let side=header[1] as usize;let mut bytes=vec![0;n];file.read_exact(&mut bytes).map_err(|e|e.to_string())?;
+                match header[0] {
+                    1=>{self.data(stream,side,offsets[side],&bytes);offsets[side]+=n as u64;}
+                    2=>{if let Some(p)=&mut stream.analyzer {self.output(p.eof(direction(side),bytes==[1]));}}
+                    3=>self.datagram(stream,side,&bytes),
+                    _=>return Err("unknown analysis backlog event".into()),
+                }
+                left-=14+n as u64;
+            }
+        }
+        cache.record(json!({"type":"analysis_resumed","connection":stream.identity,"cache_id":spool.id()}));
+        Ok(())
+    }
+    fn diagnostic(&self, identity: &Connection, detail: &str) {
+        lock(&self.results)
+            .add(json!({"type":"analysis_diagnostic", "connection":identity, "detail":detail}));
+    }
+    fn parser(&self, identity: Connection, protocol: Protocol) -> Analyzer {
+        let limits = Limits {
+            encoded_body: 65536,
+            decoded_body: 65536,
+            pending: self.options.pending_requests,
+            ..Limits::default()
+        };
+        if let Some(cache) = &self.cache {
+            Analyzer::with_cache(identity, protocol, limits, cache.clone())
+        } else {
+            Analyzer::new(identity, protocol, limits)
+        }
+        .expect("constant valid limits")
+    }
+    fn opaque(&self, stream: &mut Stream) {
+        stream.detect = false;
+        stream.cache = self.cache.as_ref().map(|c|c.scoped(json!({"connection":stream.identity,"protocol":if stream.identity.quic_datagrams {"quic_datagram"} else if stream.identity.quic_stream_id.is_some() {"quic_stream"} else if stream.identity.transport=="udp" {"udp"}else{"tcp"}})).stream());
+        if !stream.sniff.is_empty() {
+            let bytes = std::mem::take(&mut stream.sniff);
+            self.opaque_data(stream, 0, &bytes);
+        }
+        stream.dirty = true;
+    }
+    fn opaque_data(&self, stream: &mut Stream, side: usize, bytes: &[u8]) {
+        stream.counts[side] += bytes.len() as u64;
+        if let Some(cache) = &stream.cache { cache.append_stream(direction(side), bytes); }
+        stream.dirty = true;
+    }
+    fn publish(&self, stream: &mut Stream, finished: bool) {
+        if stream.dns.is_some() { stream.dirty=false; return; }
+        if stream.counts == [0,0] && stream.packet_counts == [0,0] && stream.identity.quic_stream_id.is_none() { return; }
+        let lost = stream.ticket.lost.load(Ordering::Acquire);
+        lock(&self.results).add(json!({"type":"stream", "connection":stream.identity,
+            "protocol":if stream.identity.quic_datagrams {"quic_datagram"} else if stream.identity.quic_stream_id.is_some() {"quic_stream"} else if stream.quic.version.is_some() {"quic"} else if stream.identity.transport == "udp" {"udp"} else if stream.decrypted {"tls_stream"} else if stream.encrypted {"tls_encrypted"} else {"tcp"},
+            "quic":stream.quic.summary(),
+            "stream":{"sent_bytes":stream.counts[0], "received_bytes":stream.counts[1],
+                "finished":finished, "complete":stream.ended.iter().all(|v| *v) && !lost,
+                "problem":if lost {Some("analysis queue overflow; only a contiguous prefix was captured")} else {stream.analysis_note.as_deref()},
+                "cache":stream.cache, "datagrams":stream.datagrams, "packet_counts":stream.packet_counts}}));
+        stream.dirty = false;
+        stream.published = Instant::now();
+    }
+    fn progress(&mut self) {
+        let ids: Vec<_> = self.connections.keys().copied().collect();
+        for id in ids {
+            let mut stream = self.connections.remove(&id).unwrap();
+            if stream.deferred.is_some() && self.parsers.fetch_update(Ordering::AcqRel,Ordering::Acquire,
+                |n|(n<self.options.connections).then_some(n+1)).is_ok() {
+                stream.ticket.parser_slot.store(true,Ordering::Release);
+                if let Err(e)=self.replay(&mut stream) {if let Some(c)=&self.cache {c.fail_recording(&format!("analysis replay failed: {e}"));}}
+            }
+            if let Some(dns)=&mut stream.dns {self.records(dns.expire(&stream.identity,None));}
+            // Bound detection latency for small/idle ASCII protocols as well as memory.
+            if stream.detect && !stream.sniff.is_empty() && stream.opened.elapsed() >= Duration::from_secs(2) {
+                self.opaque(&mut stream);
+            }
+            if stream.h3.is_some() && stream.dirty && stream.published.elapsed()>=Duration::from_millis(500) {
+                lock(&self.results).add(json!({"type":"exchange","connection":stream.identity,"protocol":"h3","exchange":stream.h3.as_ref().unwrap().snapshot()}));
+                stream.dirty=false;stream.published=Instant::now();
+            }
+            if stream.h3.is_none() && stream.analyzer.is_none() && !stream.detect && stream.dirty
+                && stream.published.elapsed() >= Duration::from_millis(500) {
+                self.publish(&mut stream, false);
+            }
+            self.connections.insert(id, stream);
+        }
+    }
+    fn reap(&mut self, all: bool, stopped: bool) {
+        let ids: Vec<_> = self.connections.iter().filter_map(|(id, stream)| {
+            (all || (stream.ticket.pending.load(Ordering::Acquire) == 0 &&
+                (stream.ticket.closed.load(Ordering::Acquire) || stream.ticket.lost.load(Ordering::Acquire))))
+                .then_some(*id)
+        }).collect();
+        for id in ids {
+            let mut stream = self.connections.remove(&id).unwrap();
+            let lost = stream.ticket.lost.load(Ordering::Acquire);
+            let (ended_at,reason)=if stopped {(proxylane_protocol::recording::observed_ms(),"monitoring stopped".to_owned())}
+                else {lock(&stream.ticket.close_reason).clone().unwrap_or_else(||(proxylane_protocol::recording::observed_ms(),"capture worker shutdown".into()))};
+            let _time=proxylane_protocol::recording::observation_time(ended_at);
+            let reason=if lost {"capture queue overflow".to_owned()} else {reason};
+            if let Some(c)=&self.cache {c.record(json!({"type":"capture_end","connection":stream.identity,
+                "http3_stream_id":stream.ticket.http3_stream_id,"reason":reason,"directions_ended":stream.ended}));}
+            if stream.deferred.is_some() {if let Err(e)=self.replay(&mut stream) {if let Some(c)=&self.cache {c.fail_recording(&format!("analysis replay failed: {e}"));}}}
+            if let Some(h3) = stream.h3.take() {
+                let exchange=h3.finish(&reason);
+                let mut value=json!({"type":"exchange","connection":stream.identity,"protocol":"h3","exchange":exchange});
+                crate::doh::annotate(&mut value);lock(&self.results).add(value);
+            } else if let Some(dns) = &mut stream.dns {
+                self.records(dns.close(&stream.identity,self.cache.as_ref(),&format!("DNS response not observed: {reason}")));
+            } else if let Some(parser) = &mut stream.analyzer {
+                self.output(parser.close_with_reason(&reason));
+                if lost { self.diagnostic(&stream.identity, "analysis queue overflow; reconstruction stopped for this connection"); }
+            } else {
+                if stream.detect { self.opaque(&mut stream); }
+                if let Some(cache) = &stream.cache {
+                    cache.finish_stream(stream.counts, stream.ended.iter().all(|v| *v) && !lost);
+                }
+                self.publish(&mut stream, true);
+            }
+            if stream.identity.transport != "udp" && !stream.decrypted {
+                lock(&self.results).add(json!({"type":"connection","connection":stream.identity,"protocol":"tcp","status":if stopped {"Stopped"}else{"Closed"}}));
+            }
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            if stream.ticket.parser_slot.load(Ordering::Acquire) {self.parsers.fetch_sub(1,Ordering::AcqRel);}
+        }
+    }
+    #[cfg(test)]
+    fn run(self,receiver:Receiver<Event>) {self.run_notifying(receiver,Arc::new(tokio::sync::Notify::new()));}
+    fn run_notifying(mut self, receiver: Receiver<Event>,space:Arc<tokio::sync::Notify>) {
+        let mut progress = Instant::now();
+        loop {
+            let event=receiver.recv_timeout(Duration::from_millis(100));
+            let (event,time)=match event {Ok(Event::Timed(time,event))=>(Ok(*event),time),other=>(other,proxylane_protocol::recording::now_ms())};
+            let _time=proxylane_protocol::recording::observation_time(time);
+            space.notify_waiters();
+            match event {
+                Ok(Event::Timed(..))=>unreachable!("nested capture timestamp"),
+                #[cfg(test)]
+                Ok(Event::Pause(wait,entered))=>{let _=entered.send(());let _=wait.recv();},
+                Ok(Event::Open(id, identity, alpn, decrypted, ticket)) => {
+                    let h3=alpn.as_ref().filter(|a|a.starts_with(b"h3:")).and_then(|a|std::str::from_utf8(&a[3..]).ok()).and_then(|s|s.parse::<u64>().ok())
+                        .map(|stream_id|proxylane_protocol::http3::Capture::new(stream_id,self.cache.as_ref().map(|c|c.scoped(json!({"connection":identity,"protocol":"h3"}))).as_ref()));
+                    let protocol = match alpn.as_deref() {
+                        Some(b"h2") => Some(Protocol::H2),
+                        Some(b"http/1.1") => Some(Protocol::Http1),
+                        _ => None,
+                    };
+                    let udp = identity.transport == "udp";
+                    let raw_quic=identity.quic_stream_id.is_some() || identity.quic_datagrams;
+                    let limited=!ticket.parser_slot.load(Ordering::Acquire) && h3.is_none() && !raw_quic;
+                    let dns = if !raw_quic && !limited && identity.server_port==53 {Some(crate::dns::Dns::default())}else{None};
+                    let is_dns=dns.is_some();
+                    let analyzer = if limited {None}else{protocol.map(|p| self.parser(identity.clone(), p))};
+                    let mut stream = Stream { deferred:None, deferred_alpn:alpn.clone(), deferred_bytes:0, fallback:false, analysis_note:None, h3, identity, ticket, analyzer, sniff: Vec::new(), dns, quic:Default::default(),
+                        detect: alpn.is_none() && !udp && !is_dns, decrypted, encrypted: false, cache: None,
+                        counts: [0;2], datagrams: [Vec::new(), Vec::new()], packet_counts: [0;2], ended: [false;2], dirty: false,
+                        published: Instant::now() - Duration::from_secs(1), opened: Instant::now() };
+                    if !limited && stream.h3.is_none() && !is_dns && (udp || (protocol.is_none() && alpn.is_some())) { self.opaque(&mut stream); }
+                    if limited {
+                        stream.detect=false;
+                        stream.deferred=self.cache.as_ref().map(|c|c.scoped(json!({"connection":stream.identity,
+                            "kind":"analysis_backlog","format":"PLAB2: observed_ms:u64le kind:u8 side:u8 length:u32le payload"})).stream());
+                        if let Some(c)=&self.cache {c.record(json!({"type":"analysis_queued","backlog_format":"PLAB2","connection":stream.identity,
+                            "cache_id":stream.deferred.as_ref().map(CacheRef::id)}));}
+                    }
+                    if !udp && !decrypted {
+                        lock(&self.results).add(json!({"type":"connection","connection":stream.identity,"protocol":"tcp","status":"Connecting"}));
+                    }
+                    if raw_quic {self.publish(&mut stream,false);}
+                    self.connections.insert(id, stream);
+                }
+                Ok(Event::Data(id, side, offset, bytes, ticket)) => {
+                    if let Some(mut stream) = self.connections.remove(&id) {
+                        if stream.deferred.is_some() {self.defer(&mut stream,1,side,&bytes);}
+                        else {self.data(&mut stream,side,offset,&bytes);}
                         self.connections.insert(id, stream);
                     }
                     ticket.pending.fetch_sub(1, Ordering::AcqRel);
@@ -611,19 +920,8 @@ impl Worker {
                 }
                 Ok(Event::Datagram(id, side, bytes, ticket)) => {
                     if let Some(mut stream) = self.connections.remove(&id) {
-                        // Only probe DNS off-port at the beginning of a flow.
-                        if stream.dns.is_none() && stream.packet_counts==[0,0] && proxylane_protocol::dns::decode(&bytes).is_ok() {
-                            stream.dns=Some(crate::dns::Dns::default());
-                            if let Some(c)=stream.cache.take(){c.finish_stream([0,0],true);}
-                        }
-                        if let Some(dns)=&mut stream.dns {
-                            self.records(dns.feed(&stream.identity,self.cache.as_ref(),side,&bytes));
-                        } else {
-                            stream.quic.feed(side,&bytes);
-                            if stream.datagrams[side].len() < self.options.udp_packets { stream.datagrams[side].push((stream.counts[side], bytes.len())); }
-                            stream.packet_counts[side] += 1;
-                            self.opaque_data(&mut stream, side, &bytes);
-                        }
+                        if stream.deferred.is_some() {self.defer(&mut stream,3,side,&bytes);}
+                        else {self.datagram(&mut stream,side,&bytes);}
                         self.connections.insert(id, stream);
                     }
                     ticket.pending.fetch_sub(1, Ordering::AcqRel);
@@ -631,11 +929,22 @@ impl Worker {
                 Ok(Event::Eof(id, side, clean, ticket)) => {
                     if let Some(mut stream) = self.connections.remove(&id) {
                         stream.ended[side] = clean;
-                        if let Some(parser) = &mut stream.analyzer { self.output(parser.eof(direction(side), clean)); }
+                        if let Some(c)=&self.cache {c.record(json!({"type":"transport_eof","connection":stream.identity,"side":side,"clean":clean}));}
+                        if stream.deferred.is_some() {self.defer(&mut stream,2,side,&[u8::from(clean)]);}
+                        if let Some(parser) = &mut stream.analyzer {
+                            if let Some(reason)=self.output(parser.eof(direction(side), clean)) {self.fallback(&mut stream,&reason);}
+                        }
                         else { stream.dirty = true; }
                         self.connections.insert(id, stream);
                     }
                     ticket.pending.fetch_sub(1, Ordering::AcqRel);
+                }
+                Ok(Event::Note(id,note,ticket)) => {
+                    if let Some(stream)=self.connections.get_mut(&id) {
+                        if let Some(c)=&stream.cache {c.record(json!({"type":"transport_note","message":note}));}
+                        stream.analysis_note=Some(note);stream.dirty=true;
+                    }
+                    ticket.pending.fetch_sub(1,Ordering::AcqRel);
                 }
                 Ok(Event::State(id, error, ticket)) => {
                     if let Some(stream) = self.connections.get(&id) {
@@ -702,7 +1011,7 @@ fn process_name(pid: u32, process_start: u64) -> String {
             let mut length = path.len() as u32;
             if QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut length) != 0 {
                 let path = String::from_utf16_lossy(&path[..length as usize]);
-                name = path.rsplit('\\').next().unwrap_or("").to_owned();
+                name = path;
             }
         }
         CloseHandle(handle);
@@ -721,11 +1030,13 @@ pub fn identity(metadata: &Value, host: &str) -> Result<Connection, String> {
         .ok_or("missing destination")?;
     let pid = u32::try_from(number("pid")?).map_err(|e| e.to_string())?;
     let process_start = number("process_create_time")?;
+    let process_path=process_name(pid,process_start);
     Ok(Connection {
         id: number("connection_id")?.to_string(),
         pid,
         process_start,
-        process_name: process_name(pid, process_start),
+        process_name: process_path.rsplit('\\').next().unwrap_or("").to_owned(),
+        process_path,
         socket: number("socket")?,
         generation: number("socket_generation")?,
         destination: format!("{host} [{destination}]:{}", number("port")?),
@@ -734,6 +1045,7 @@ pub fn identity(metadata: &Value, host: &str) -> Result<Connection, String> {
         transport: metadata["transport"].as_str().unwrap_or("tcp").to_owned(),
         server_name: host.to_owned(),
         server_port: u16::try_from(number("port")?).map_err(|e| e.to_string())?,
+        ..Default::default()
     })
 }
 
@@ -917,10 +1229,13 @@ mod tests {
         assert!(!directory.exists());
     }
     #[test]
-    fn overload_never_bridges_missing_bytes_or_loses_terminal_marker() {
+    fn recording_overload_waits_without_gaps() {
         // Deliberately hold the worker until both queue slots are occupied.
         let (sender, receiver) = mpsc::sync_channel(2);
+        let cache=PayloadCache::new(CacheConfig {root:std::env::temp_dir().join("proxylane-analysis-overload-test"),
+            recording:Some(proxylane_protocol::recording::RecordingConfig {total_bytes:1024*1024,min_free_bytes:0}),..Default::default()}).unwrap();
         let r = Arc::new(Runtime {
+            space:Arc::new(tokio::sync::Notify::new()),
             options:Default::default(),
             sender,
             worker: Mutex::new(None),
@@ -928,32 +1243,37 @@ mod tests {
             capture_epoch: Mutex::new(1),
             next: AtomicU64::new(1),
             active: Arc::new(AtomicUsize::new(0)),
+            parsers: Arc::new(AtomicUsize::new(0)),
             rejected: AtomicU64::new(0),
             results: Arc::new(Mutex::new(Results::default())),
-            cache: None,
+            cache: Some(cache.clone()),
             cache_error: None,
             run_id: "test".into(),
         });
-        let mut tap = r.tap(identity(1), Some(b"http/1.1".to_vec())).unwrap();
-        tap.data(0, b"GET /partial HTTP/1.1\r\nHost: test\r\n\r\n");
-        tap.data(1, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
-        assert!(tap.ticket.lost.load(Ordering::Acquire));
-        tap.data(0, b"GET /must-not-appear HTTP/1.1\r\nHost: test\r\n\r\n");
-        drop(tap);
+        let producer_runtime=r.clone();let (done,completed)=mpsc::channel();
+        let producer=thread::spawn(move|| {
+            let mut tap=producer_runtime.tap(identity(1),Some(b"http/1.1".to_vec())).unwrap();
+            tap.data(0,b"GET /complete HTTP/1.1\r\nHost: test\r\n\r\n");
+            tap.data(1,b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+            drop(tap);done.send(()).unwrap();
+        });
+        assert!(completed.recv_timeout(Duration::from_millis(100)).is_err());
         let worker = Worker {
             options:Default::default(),
             connections: BTreeMap::new(),
-            cache: None,
+            cache: Some(cache.clone()),
             results: r.results.clone(),
             active: r.active.clone(),
+            parsers: r.parsers.clone(),
         };
         let handle = thread::spawn(move || worker.run(receiver));
-        let result = poll(&r);
-        let text = result.to_string();
-        assert!(text.contains("analysis queue overflow"));
-        assert!(text.contains("capture ended before exchange completed"));
-        assert!(!text.contains("must-not-appear"));
-        assert_eq!(r.active.load(Ordering::Acquire), 0);
+        completed.recv_timeout(Duration::from_secs(5)).unwrap();producer.join().unwrap();
+        let result=poll(&r);assert!(result.to_string().contains("/complete"));
+        assert_eq!(r.active.load(Ordering::Acquire),0);
+        assert!(!r.recording_failed());assert_eq!(r.recording_status()["quality"]["gap_count"],0);
+        cache.finish_recording().unwrap();
+        let lines=std::fs::read_to_string(cache.directory().join("events-000001.jsonl")).unwrap();
+        assert!(!lines.contains("recording_gap"));assert!(lines.contains("exchange_end"));
         r.sender.send(Event::Shutdown).unwrap();
         handle.join().unwrap();
     }
@@ -1045,6 +1365,27 @@ mod tests {
         r.shutdown().unwrap();
     }
 
+    #[test]
+    fn decrypted_quic_datagrams_keep_identity_and_never_sniff_dns_or_quic() {
+        let r=runtime();
+        let mut connection=identity(72);connection.transport="udp".into();
+        connection.quic_datagrams=true;connection.quic_alpn=Some("anything/1".into());
+        connection.server_port=53;
+        let mut tap=r.tap_transport(connection,Some(Vec::new()),true).unwrap();
+        let dns=b"\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x01a\x00\x00\x01\x00\x01";
+        tap.datagram(0,dns);tap.datagram(0,b"");tap.datagram(1,b"reply");
+        tap.note("QUIC DATAGRAM forwarding dropped: test".into());
+        tap.eof(0,true);tap.eof(1,true);drop(tap);
+        let reply=poll(&r);let last=reply["records"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["protocol"],"quic_datagram");
+        assert_eq!(last["connection"]["quic_datagrams"],true);
+        assert_eq!(last["connection"]["decrypted"],true);
+        assert!(last["connection"].get("quic_stream_id").is_none());
+        assert_eq!(last["stream"]["datagrams"][0],json!([[0,dns.len()],[dns.len(),0]]));
+        assert_eq!(last["stream"]["packet_counts"],json!([2,1]));
+        assert_eq!(r.query(&json!({"type":"stats"})).unwrap()["active_parsers"],0);
+        r.shutdown().unwrap();
+    }
     #[test]
     fn udp_retains_datagram_boundaries_zero_length_and_transport_identity() {
         use base64::Engine;
@@ -1142,5 +1483,175 @@ mod stop_tests {
         r.stop_capture().unwrap();
         assert!(r.query(&json!({"type":"stats"})).unwrap()["cache"]["used_bytes"].as_u64().unwrap()>snapshot["cache"]["used_bytes"].as_u64().unwrap());
         drop(fresh);r.shutdown().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod recording_tests {
+    use super::*;
+    use std::{fs,path::PathBuf};
+    fn runtime()->Arc<Runtime> {
+        Runtime::with_options(CacheConfig {root:std::env::temp_dir().join("proxylane-runtime-recordings"),queue_chunks:1024,
+            recording:Some(proxylane_protocol::recording::RecordingConfig {total_bytes:32*1024*1024,min_free_bytes:0}),..Default::default()},
+            crate::options::Options {udp_packets:16,..Default::default()}).unwrap()
+    }
+    fn events(path:&std::path::Path)->Vec<Value> {
+        let mut files:Vec<_>=fs::read_dir(path).unwrap().map(|e|e.unwrap().path()).filter(|p|p.extension().is_some_and(|x|x=="jsonl")).collect();files.sort();
+        files.into_iter().flat_map(|p|fs::read_to_string(p).unwrap().lines().map(|l|serde_json::from_str(l).unwrap()).collect::<Vec<Value>>()).collect()
+    }
+    #[test]
+    fn cancelled_async_sender_retains_its_already_read_fragment() {
+        let r=Runtime::test_small_queue(CacheConfig {
+            root:std::env::temp_dir().join("proxylane-cancel-queued"),
+            recording:Some(proxylane_protocol::recording::RecordingConfig{total_bytes:8*1024*1024,min_free_bytes:0}),
+            ..Default::default()
+        });
+        let tap=Arc::new(r.tap(Connection{id:"cancel".into(),..Default::default()},Some(b"h3:0".to_vec())).unwrap());
+        let release=r.pause_worker();
+        let mut head=proxylane_protocol::Message::default();head.method=Some("POST".into());
+        tap.http3(0,H3Part::Head(head));tap.http3(0,H3Part::Data(b"before".to_vec()));
+        let executor=tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        executor.block_on(async {
+            let t=tap.clone();let (started,ready)=tokio::sync::oneshot::channel();
+            let task=tokio::spawn(async move {
+                let _=started.send(());t.http3_async(0,H3Part::Data(b"-cancelled".to_vec())).await;
+            });
+            ready.await.unwrap();tokio::time::sleep(Duration::from_millis(20)).await;
+            task.abort();release.send(()).unwrap();let _=task.await;
+        });
+        drop(tap);r.stop_capture().unwrap();
+        let path=PathBuf::from(r.recording_status()["directory"].as_str().unwrap());
+        let lines=events(&path);
+        let id=lines.iter().find(|e|e["type"]=="message_head").unwrap()["cache_id"].as_u64().unwrap();
+        assert_eq!(fs::read(path.join(proxylane_protocol::recording::payload_relative(id,0))).unwrap(),b"before-cancelled");
+        assert_eq!(r.recording_status()["quality"]["gap_count"],0);r.shutdown().unwrap();
+    }
+    #[test]
+    fn recording_h2_pending_limit_spills_instead_of_falling_back() {
+        let r=runtime();let path=PathBuf::from(r.recording_status()["directory"].as_str().unwrap());
+        let mut idle=r.tap(Connection{id:"unused-h2".into(),..Default::default()},Some(b"h2".to_vec())).unwrap();
+        idle.eof(0,false);drop(idle);
+        let mut busy=r.tap(Connection{id:"busy-h2".into(),..Default::default()},Some(b"h2".to_vec())).unwrap();
+        busy.data(0,b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        for id in (1u32..=17).step_by(2) {
+            let mut bytes=vec![0,0,3,1,5];bytes.extend(id.to_be_bytes());bytes.extend([0x82,0x87,0x84]);
+            busy.data(0,&bytes);
+        }
+        for id in (1u32..=17).step_by(2) {
+            let mut bytes=vec![0,0,1,1,5];bytes.extend(id.to_be_bytes());bytes.push(0x88);
+            busy.data(1,&bytes);
+        }
+        r.query(&json!({"type":"stats"})).unwrap();
+        assert!(!r.recording_failed());r.stop_capture().unwrap();let lines=events(&path);
+        assert_eq!(lines.iter().filter(|v|v["type"]=="exchange_end" && v["response"]["status"]==200).count(),9);
+        let manifest:Value=serde_json::from_slice(&fs::read(path.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["quality"]["analysis_fallback_count"],0);
+        assert_eq!(manifest["quality"]["capture_incomplete"],false);assert_eq!(manifest["status"],"completed");
+        drop(busy);r.shutdown().unwrap();
+    }
+    #[test]
+    fn parser_saturation_keeps_raw_and_http3_beyond_32_without_stopping() {
+        let r=runtime();let path=PathBuf::from(r.recording_status()["directory"].as_str().unwrap());
+        let mut held=Vec::new();
+        for i in 0..128 {held.push(r.tap(Connection{id:format!("idle-{i}"),..Default::default()},Some(b"h2".to_vec())).unwrap());}
+        let mut raw=r.tap(Connection{id:"overflow-tcp".into(),..Default::default()},Some(b"http/1.1".to_vec())).unwrap();
+        let request=b"GET /raw HTTP/1.1\r\nHost: test\r\n\r\n";
+        {let _time=proxylane_protocol::recording::observation_time(10000);raw.data(0,request);}
+        {let _time=proxylane_protocol::recording::observation_time(20000);raw.data(1,b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");}
+        let mut requests=Vec::new();
+        for id in 0..96 {
+            let tap=r.tap(Connection{id:"one-quic-connection".into(),transport:"udp".into(),..Default::default()},Some(format!("h3:{}",id*4).into_bytes())).unwrap();
+            let mut head=proxylane_protocol::Message::default();head.method=Some("GET".into());head.target=Some(format!("/{id}"));
+            tap.http3(0,H3Part::Head(head));tap.http3(0,H3Part::End(vec![]));requests.push(tap);
+            if id%8==7 {r.query(&json!({"type":"stats"})).unwrap();r.cache.as_ref().unwrap().stats().unwrap();}
+        }
+        let stats=r.query(&json!({"type":"stats"})).unwrap();
+        assert_eq!(stats["active_connections"],225);assert_eq!(stats["active_parsers"],128);
+        for (id,tap) in requests.into_iter().enumerate() {
+            let mut head=proxylane_protocol::Message::default();head.status=Some(200);
+            tap.http3(1,H3Part::Head(head));tap.http3(1,H3Part::Data(format!("body-{id}").into_bytes()));tap.http3(1,H3Part::End(vec![]));
+            drop(tap);if id%8==7 {r.query(&json!({"type":"stats"})).unwrap();r.cache.as_ref().unwrap().stats().unwrap();}
+        }
+        raw.eof(0,true);raw.eof(1,true);drop(raw);drop(held);
+        r.stop_capture().unwrap();assert!(!r.recording_failed());
+        assert_eq!(r.recording_status()["quality"]["gap_count"],0);
+        assert_eq!(r.recording_status()["quality"]["analysis_deferred_count"],0);
+        let lines=events(&path);
+        let h3:Vec<_>=lines.iter().filter(|e|e["type"]=="message_head" && e["side"]==1 && e["context"]["protocol"]=="h3").collect();
+        assert_eq!(h3.len(),96);
+        for e in h3 {
+            let id=e["exchange_id"].as_u64().unwrap()/4;
+            let body=proxylane_protocol::recording::payload_relative(e["cache_id"].as_u64().unwrap(),1);
+            assert_eq!(fs::read(path.join(body)).unwrap(),format!("body-{id}").as_bytes());
+        }
+        assert!(lines.iter().any(|e|e["type"]=="analysis_queued"));
+        assert!(lines.iter().any(|e|e["type"]=="analysis_resumed"));
+        assert!(lines.iter().any(|e|e["type"]=="message_head" && e["message"]["target"]=="/raw" && e["observed_unix_ms"]==10000));
+        assert!(lines.iter().any(|e|e["type"]=="exchange_end" && e["request"]["target"]=="/raw" && e["request"]["observed_start_unix_ms"]==10000));
+        assert!(lines.iter().any(|e|e["type"]=="exchange_end" && e["request"]["target"]=="/raw" && e["response"]["complete"]==true));
+        r.shutdown().unwrap();
+    }
+    #[test]
+    fn recording_more_than_old_capture_limit_has_no_gaps() {
+        let r=runtime();let path=PathBuf::from(r.recording_status()["directory"].as_str().unwrap());let mut taps=Vec::new();
+        for id in 0..1050 {
+            taps.push(r.tap(Connection{id:format!("h3-{id}"),..Default::default()},Some(b"h3:0".to_vec())).unwrap());
+            if id%8==7 {r.query(&json!({"type":"stats"})).unwrap();r.cache.as_ref().unwrap().stats().unwrap();}
+        }
+        drop(r.tap(Connection{id:"also-admitted".into(),..Default::default()},Some(b"h3:4".to_vec())).unwrap());
+        assert!(!r.recording_failed());assert_eq!(r.recording_status()["quality"]["gap_count"],0);
+        // Release and reuse gradually, avoiding testing queue overflow here.
+        while !taps.is_empty() {for _ in 0..8 {taps.pop();}r.query(&json!({"type":"stats"})).unwrap();r.cache.as_ref().unwrap().stats().unwrap();}
+        assert_eq!(r.active.load(Ordering::Acquire),0);
+        let next=r.tap(Connection{id:"next".into(),..Default::default()},Some(b"h3:8".to_vec())).unwrap();drop(next);
+        r.stop_capture().unwrap();let lines=events(&path);
+        assert!(!lines.iter().any(|e|e["type"]=="recording_gap"));
+        assert!(!r.recording_failed());r.shutdown().unwrap();
+    }
+    #[test]
+    fn recording_keeps_all_udp_boundaries_beyond_ui_limits_and_http3_headers() {
+        let r=runtime();let path=PathBuf::from(r.recording_status()["directory"].as_str().unwrap());
+        let mut udp=r.tap_transport(Connection {id:"udp1".into(),pid:77,process_start:123,transport:"udp".into(),..Default::default()},None,false).unwrap();
+        for n in 0..400 {udp.datagram(0,format!("packet-{n:04}").as_bytes());if n%20==0 {r.query(&json!({"type":"stats"})).unwrap();}}
+        let h3=r.tap(Connection {id:"quic1".into(),pid:77,..Default::default()},Some(b"h3:4".to_vec())).unwrap();
+        let mut head=proxylane_protocol::Message::default();head.method=Some("POST".into());head.target=Some("/live-h3".into());
+        h3.http3(0,H3Part::Head(head));h3.http3(0,H3Part::Data(b"partial upload".to_vec()));
+        r.query(&json!({"type":"stats"})).unwrap();
+        let lines=events(&path);
+        assert_eq!(lines.iter().filter(|e|e["type"]=="datagram").count(),400);
+        assert!(lines.iter().any(|e|e["type"]=="message_head" && e["message"]["target"]=="/live-h3"));
+        let packets:Vec<_>=lines.iter().filter(|e|e["type"]=="datagram").collect();
+        assert_eq!(packets[399]["offset"],399*11);assert_eq!(packets[399]["packet_number"],400);
+        r.stop_capture().unwrap();let before=fs::metadata(path.join("events-000001.jsonl")).unwrap().len();
+        udp.datagram(1,b"after stop");h3.http3(0,H3Part::Data(b"after stop".to_vec()));
+        r.query(&json!({"type":"stats"})).unwrap();
+        assert_eq!(fs::metadata(path.join("events-000001.jsonl")).unwrap().len(),before);
+        drop(udp);drop(h3);r.shutdown().unwrap();assert!(path.join("manifest.json").exists());
+    }
+    #[test]
+    fn malformed_connection_keeps_raw_bytes_and_does_not_stop_other_recordings() {
+        let r=runtime();let path=PathBuf::from(r.recording_status()["directory"].as_str().unwrap());
+        let mut broken=r.tap(Connection{id:"bad-h2".into(),..Default::default()},Some(b"h2".to_vec())).unwrap();
+        broken.data(0,b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+        // Unmatched ACK really is an invalid capture; do not remove this validation.
+        let bad=[0,0,0,4,1,0,0,0,0];broken.data(0,&bad);broken.data(1,b"later raw bytes");
+        let mut good=r.tap(Connection{id:"good-http".into(),..Default::default()},Some(b"http/1.1".to_vec())).unwrap();
+        good.data(0,b"GET /healthy HTTP/1.1\r\nHost: test\r\n\r\n");
+        good.data(1,b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        r.query(&json!({"type":"stats"})).unwrap();assert!(!r.recording_failed());r.stop_capture().unwrap();
+        let lines=events(&path);
+        assert!(lines.iter().any(|v|v["type"]=="observation" && v["record"]["detail"]=="SETTINGS ACK without captured SETTINGS"));
+        assert!(lines.iter().any(|v|v["type"]=="exchange_end" && v["request"]["target"]=="/healthy" && v["response"]["complete"]==true));
+        let raw=lines.iter().find(|v|v["type"]=="payload_registered" && v["context"]["kind"]=="analysis_fallback").unwrap();
+        assert_eq!(fs::read(path.join(raw["files"][0].as_str().unwrap())).unwrap(),bad);
+        assert_eq!(fs::read(path.join(raw["files"][1].as_str().unwrap())).unwrap(),b"later raw bytes");
+        assert!(lines.iter().any(|v|v["type"]=="analysis_fallback_chunk" && v["source_offset"]==24));
+        let manifest:Value=serde_json::from_slice(&fs::read(path.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["quality"]["capture_incomplete"],false);
+        assert_eq!(manifest["quality"]["analysis_incomplete"],true);
+        assert_eq!(manifest["quality"]["analysis_fallback_count"],1);
+        assert_eq!(manifest["quality"]["analysis_fallback_reasons"]["SETTINGS ACK without captured SETTINGS"],1);
+        assert_eq!(lines.iter().filter(|v|v["type"]=="analysis_fallback").count(),1);
+        drop(broken);drop(good);r.shutdown().unwrap();
     }
 }

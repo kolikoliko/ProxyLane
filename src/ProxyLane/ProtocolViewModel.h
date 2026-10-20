@@ -13,7 +13,7 @@ constexpr size_t RowLimit = 512;
 constexpr size_t MetadataLimit = 8 * 1024 * 1024;
 constexpr size_t BodyPreviewLimit = 64 * 1024;
 struct Row {
-    std::string run, key, process, protocol, destination, method, target, status;
+    std::string run, key, process, processPath, protocol, destination, method, target, status;
     uint64_t number = 0;
     int64_t firstSeenSeconds = 0; // First appearance; stable across row updates.
     size_t datagram[2] = {0, 0};
@@ -21,6 +21,7 @@ struct Row {
     unsigned pid = 0;
     Json record;
     size_t bytes = 0;
+    bool websocket = false;
     bool stream = false, udp = false, dns = false, quic = false, connectionRow = false, doh = false;
     std::string endpoint;
     bool hex = false; // View preference belongs to this request, not the page.

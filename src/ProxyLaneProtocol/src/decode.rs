@@ -123,3 +123,45 @@ pub(crate) fn body(headers: &Headers, input: &[u8], limit: usize) -> Result<Vec<
     }
     Ok(data)
 }
+
+/// A view may expose a useful prefix of an unfinished gzip stream, but must
+/// never present it as integrity-verified. CRC/format errors remain failures.
+pub(crate) fn preview(headers:&Headers,input:&[u8],limit:usize)->Result<(Vec<u8>,Option<String>)> {
+    match body(headers,input,limit) {
+        Ok(data)=>Ok((data,None)),
+        Err(error)=>{
+            let enc=tokens(headers,"content-encoding");
+            if input.len()>limit || !(enc==["gzip"] || enc==["x-gzip"]) {return Err(error);}
+            let mut reader=flate2::read::MultiGzDecoder::new(input);
+            let mut out=Vec::new();let mut buf=[0;8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0)=>return Err(error),
+                    Ok(n)=>{if out.len()+n>limit{return Err("decoded body limit".into());}out.extend_from_slice(&buf[..n]);}
+                    Err(e) if e.kind()==std::io::ErrorKind::UnexpectedEof && !out.is_empty()=>return Ok((out,Some(
+                        "Gzip stream did not finish; showing decoded data with unverified completeness and integrity.".into()))),
+                    Err(_)=>return Err(error),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use std::io::Write;
+    #[test]
+    fn unfinished_gzip_is_only_a_warned_preview() {
+        let h=vec![("content-encoding".into(),"gzip".into())];
+        let mut gz=flate2::write::GzEncoder::new(Vec::new(),flate2::Compression::default());
+        gz.write_all(br#"{"message":"complete JSON, unfinished gzip"}"#).unwrap();gz.flush().unwrap();
+        let partial=gz.get_ref().clone();
+        assert!(body(&h,&partial,4096).is_err());
+        let(data,note)=preview(&h,&partial,4096).unwrap();
+        assert!(note.is_some());assert!(serde_json::from_slice::<serde_json::Value>(&data).is_ok());
+        let mut good=gz.finish().unwrap();assert!(preview(&h,&good,4096).unwrap().1.is_none());
+        let n=good.len();good[n-8]^=1;assert!(preview(&h,&good,4096).is_err(),"CRC corruption must not be accepted");
+        assert!(preview(&h,&partial,8).is_err(),"preview limits remain enforced");
+    }
+}

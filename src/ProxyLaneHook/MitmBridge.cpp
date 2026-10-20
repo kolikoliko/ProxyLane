@@ -14,6 +14,8 @@
 #include <atomic>
 #include <mutex>
 #include <algorithm>
+#include <thread>
+#include <chrono>
 #include "../../third_party/nlohmann/json.hpp"
 
 namespace {
@@ -21,6 +23,7 @@ namespace {
     std::atomic<int> enabledMode(-1);
     std::atomic<bool> streamMonitoring(false);
     std::atomic<bool> quicEnabled(false);
+    std::atomic<unsigned long long> monitorGeneration(0);
     std::atomic<ULONGLONG> connectionSequence(0);
     std::atomic<PLM_PROTOCOL_FN> protocolQuery(NULL);
     // Kept loaded for process lifetime: the Rust context owns the CRL listener.
@@ -123,6 +126,7 @@ int CMitmControl::QueryProtocol(const char* request, char* output, size_t capaci
     if (start || stop) {
         std::lock_guard<std::mutex> control(monitorControlLock);
         if (stop) {
+            ++monitorGeneration;
             // Existing bridges keep their TLS state; only new connections stop MITM.
             enabledMode.store(0);
             streamMonitoring.store(false);
@@ -151,14 +155,47 @@ int CMitmControl::QueryProtocol(const char* request, char* output, size_t capaci
             }
         }
         PLM_PROTOCOL_FN query = protocolQuery.load();
-        if (query && (stop || !streamMonitoring.load())) {
+        // Always reconcile with the runtime on an explicit start. Proxy shutdown
+        // can discard the runtime while the host's monitoring flag is still set.
+        if (query) {
             char response[1024] = {};
             if (query(start ? "{\"type\":\"analysis_start\"}" : "{\"type\":\"analysis_stop\"}", response, sizeof(response)) < 0) {
+                ++monitorGeneration;enabledMode.store(0);streamMonitoring.store(false);quicEnabled.store(false);
                 if (output && capacity) _snprintf_s(output, capacity, _TRUNCATE, "%s", response);
                 return -1;
             }
         }
-        if (start) { enabledMode.store(decrypt ? 1 : 0); quicEnabled.store(command.value("quic",false));streamMonitoring.store(true); }
+        if (start) {
+            char status[8192]={};
+            const int length=query ? query("{\"type\":\"recording_status\"}",status,sizeof(status)) : -1;
+            auto recording=nlohmann::json::parse(status,nullptr,false);
+            const auto generation=++monitorGeneration;
+            if(length>0 && length<=sizeof(status) && recording.is_object() && recording.value("enabled",false)) {
+                try {
+                    std::thread([query,generation]() {
+                        for(;;) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            if(monitorGeneration.load()!=generation || !streamMonitoring.load())return;
+                            char result[8192]={};int n=query("{\"type\":\"recording_status\"}",result,sizeof(result));
+                            auto state=nlohmann::json::parse(result,nullptr,false);
+                            if(n<=0 || n>sizeof(result) || !state.is_object() || !state.value("stopped",false))continue;
+                            std::lock_guard<std::mutex> guard(monitorControlLock);
+                            if(monitorGeneration.load()!=generation || !streamMonitoring.load())return;
+                            // Disable new interception first. No existing task/socket is cancelled.
+                            enabledMode.store(0);quicEnabled.store(false);streamMonitoring.store(false);
+                            ++monitorGeneration;
+                            query("{\"type\":\"analysis_stop\"}",result,sizeof(result));
+                            return;
+                        }
+                    }).detach();
+                } catch (...) {
+                    query("{\"type\":\"analysis_stop\"}",status,sizeof(status));
+                    if(output&&capacity)_snprintf_s(output,capacity,_TRUNCATE,"Cannot start recording capacity monitor.");
+                    return -1;
+                }
+            }
+            enabledMode.store(decrypt ? 1 : 0); quicEnabled.store(command.value("quic",false));streamMonitoring.store(true);
+        }
         const char reply[] = "{\"type\":\"monitor\"}";
         if (output && capacity >= sizeof(reply)) memcpy(output, reply, sizeof(reply));
         return sizeof(reply);
@@ -187,8 +224,16 @@ void __cdecl CMitmBridge::Observe(uintptr_t user, uint32_t kind, const uint8_t* 
 }
 
 CMitmBridge::CMitmBridge(CTcpProxyTask* task)
-    : m_connection(++connectionSequence), m_task(task), m_session(NULL), m_io(NULL), m_error(NULL), m_free(NULL), m_failed(false), m_paused(false) {}
-CMitmBridge::~CMitmBridge() { if (m_session && m_free) m_free(m_session); }
+    : m_connection(++connectionSequence), m_task(task), m_session(NULL), m_io(NULL), m_error(NULL), m_free(NULL), m_failed(false) {}
+CMitmBridge::~CMitmBridge() {
+    if (m_window) { KillTimer(m_window,1); DestroyWindow(m_window); }
+    if (m_session && m_free) m_free(m_session);
+}
+LRESULT CALLBACK CMitmBridge::WindowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    auto self = reinterpret_cast<CMitmBridge*>(GetWindowLongPtr(window,GWLP_USERDATA));
+    if (message == WM_TIMER && self) { self->OnWritable(); return 0; }
+    return DefWindowProc(window,message,wp,lp);
+}
 
 bool CMitmBridge::Enabled()
 {
@@ -244,8 +289,14 @@ void CMitmBridge::Fail(int error)
     m_failed = true;
     char text[1024] = {0};
     if (m_session) m_error(m_session, text, sizeof(text));
-    PrintText(_T("MITM pid=%lu socket=%I64u failed: %hs (socket error %d).\r\n"),
-        m_task->m_PRCClient.dwPid, m_task->m_PRCClient.s, text, error);
+    // Silence routine application closes only; retain handshake/upstream errors.
+    const char quietPrefix[] = "TLS truncated: application TCP EOF without close_notify (";
+    const bool quietClose = error == 0
+        && strncmp(text, quietPrefix, sizeof(quietPrefix) - 1) == 0
+        && (strstr(text, "(during transfer)") || strstr(text, "(opposite peer already sent close_notify)"));
+    if (!quietClose)
+        PrintText(_T("MITM pid=%lu socket=%I64u failed: %hs (socket error %d).\r\n"),
+            m_task->m_PRCClient.dwPid, m_task->m_PRCClient.s, text, error ? error : WSAECONNABORTED);
     m_task->m_pServer->OnClose(error ? error : WSAECONNABORTED);
 }
 
@@ -277,8 +328,26 @@ bool CMitmBridge::Pump()
     }
     int status = m_io(m_session, PLM_STATUS, 0, NULL, 0);
     if (status < 0) { Fail(); return false; }
-    bool paused = !(status & PLM_CAN_READ);
+    // Poll asynchronous verification or recording backpressure. No worker
+    // callback retains a task/window pointer after a connection is destroyed.
+    const bool pending = (status & (PLM_HANDSHAKE_PENDING | PLM_RECORDING_PENDING)) != 0;
+    if (pending && !m_pollHandshake) {
+        if (!m_window) {
+            static std::once_flag registered;
+            std::call_once(registered,[] {
+                WNDCLASS wc={}; wc.lpfnWndProc=WindowProc; wc.hInstance=GetModuleHandle(NULL);
+                wc.lpszClassName=L"ProxyLane.TlsHandshake"; RegisterClass(&wc);
+            });
+            m_window=CreateWindowEx(0,L"ProxyLane.TlsHandshake",L"",0,0,0,0,0,HWND_MESSAGE,NULL,GetModuleHandle(NULL),NULL);
+            if (m_window) SetWindowLongPtr(m_window,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(this));
+        }
+        if (m_window) m_pollHandshake=SetTimer(m_window,1,25,NULL)!=0;
+        // The existing per-task timer remains a fallback if allocation fails.
+    } else if (!pending && m_pollHandshake) {
+        KillTimer(m_window,1); m_pollHandshake=false;
+    }
     for (unsigned side = 0; side != 2; ++side) {
+        bool paused = !(status & (side ? PLM_CAN_READ_SERVER : PLM_CAN_READ_CLIENT));
         if (status & (side ? PLM_SERVER_EOF : PLM_CLIENT_EOF)) peers[side]->m_bReadClosed = TRUE;
         if ((status & (side ? PLM_SHUTDOWN_SERVER : PLM_SHUTDOWN_CLIENT)) && !peers[side]->m_bWriteShutdown) {
             peers[side]->ShutDown(SD_SEND);
@@ -292,9 +361,9 @@ bool CMitmBridge::Pump()
         if (peers[side]->m_lEvent != events && !peers[side]->AsyncSelect(events)) {
             Fail(WSAGetLastError()); return false;
         }
-        if (m_paused && !paused && !peers[side]->m_bReadClosed) peers[side]->TriggerEvent(FD_READ);
+        if (m_paused[side] && !paused && !peers[side]->m_bReadClosed) peers[side]->TriggerEvent(FD_READ);
+        m_paused[side] = paused;
     }
-    m_paused = paused;
     if (peers[0]->m_bReadClosed && peers[1]->m_bReadClosed && peers[0]->m_bWriteShutdown && peers[1]->m_bWriteShutdown) {
         peers[0]->AsyncSelect(0); peers[1]->AsyncSelect(0);
         peers[0]->Close(); peers[1]->Close();
@@ -313,7 +382,7 @@ void CMitmBridge::OnRead(CPRCTcpPeer* peer, int error)
     while (budget > 0) {
         int status = m_io(m_session, PLM_STATUS, 0, NULL, 0);
         if (status < 0) { Fail(); return; }
-        if (!(status & PLM_CAN_READ)) break;
+        if (!(status & (side ? PLM_CAN_READ_SERVER : PLM_CAN_READ_CLIENT))) break;
         int n = peer->Receive(buffer, sizeof(buffer));
         if (n == SOCKET_ERROR) {
             int code = WSAGetLastError();
@@ -336,7 +405,7 @@ void CMitmBridge::OnRead(CPRCTcpPeer* peer, int error)
         if (!Pump() || peer->m_bReadClosed || peer->GetSocketHandle() == INVALID_SOCKET) return;
     }
     if (!Pump()) return;
-    if (budget <= 0 && !m_paused && !peer->m_bReadClosed) peer->TriggerEvent(FD_READ);
+    if (budget <= 0 && !m_paused[side] && !peer->m_bReadClosed) peer->TriggerEvent(FD_READ);
 }
 
 void CMitmBridge::OnWritable() { Pump(); }
@@ -367,3 +436,6 @@ void CProtocolTap::Data(unsigned side, const void* bytes, size_t length) {
     if (m_handle) m_io(m_handle, m_udp ? 3 : 0, side, (const uint8_t*)bytes, length);
 }
 void CProtocolTap::Eof(unsigned side) { if (m_handle) m_io(m_handle, 1, side, NULL, 0); }
+void CProtocolTap::CloseReason(const char* reason) {
+    if(m_handle && reason) m_io(m_handle,5,0,(const uint8_t*)reason,strlen(reason));
+}

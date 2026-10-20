@@ -92,19 +92,17 @@ After changing translations, validate the catalogs and embedded resources with:
 powershell -ExecutionPolicy Bypass -File .\scripts\check-locales.ps1
 ```
 
-## HTTPS Inspection and Data Monitoring (Experimental)
+## Traffic Monitoring and Decryption
 
-ProxyLane lets you inspect HTTPS requests and responses from selected processes for development and debugging. Applications do not need to use the system proxy, and TLS connections on ports other than 443 are supported. Data Monitor lists sessions with their process identity: view HTTP/1.1 and HTTP/2 headers and decompressed bodies, bidirectional byte streams for ordinary TCP and non-HTTP TLS, or individual UDP datagrams. DNS queries and responses are reconstructed, and QUIC v1/v2 handshake details are available (HTTP/3 payload decryption is not yet supported). Filter by process, PID or address and switch between Raw and HexView. Ordinary TCP/UDP only requires Start monitoring; no CA installation is needed. Enable UDP in the proxy profile to capture it.
+The 64-bit host shows captured sessions by process without requiring applications to use the system proxy. Inspect HTTP/1.1 and HTTP/2 requests, responses and decompressed bodies, DNS queries and responses, and ordinary TCP/UDP traffic in Raw or HexView. HTTPS decryption is not restricted to port 443. QUIC v1 decryption is also independent of application name and port.
 
-To monitor traffic without an external proxy, select `NOPROXY`; no host or port is required. Enable **Intercept TCP / Intercept UDP**, disable **Block UDP**, start ProxyLane's proxy service, then attach the target application and start monitoring.
+Under **Traffic Monitor → Decryption options**, enable HTTPS or QUIC decryption as needed (both default off), install the current-user CA when prompted, save, then start monitoring. Target applications need new connections. Stopping monitoring stops new interception and capture while existing connections keep forwarding. The QUIC option also attempts to relax compatible Chromium applications' extra restrictions on trusted local/enterprise CAs while retaining normal certificate validation. Restart target applications after changing this option; the compatibility change remains until they exit. Compatibility varies by browser version.
 
-1. Open **Data Monitor** and enable **Decrypt HTTPS**.
-2. On first use, choose **Trust for this user** in **CA management**, then close the dialog to enable decryption.
-3. Start the proxy, select the target process, and have the application establish new connections to view decrypted traffic.
+For monitoring without an external proxy, select `NOPROXY`, enable TCP/UDP interception as needed and disable **Block UDP**. Ordinary monitoring does not need a CA. Applications with private trust stores, certificate pinning or unsupported QUIC application protocols may not support decryption.
 
-Request payloads use a size-limited temporary cache, with truncation and eviction notices; the cache is cleaned up on exit. You can pause or clear the list and remove certificate trust through CA management.
+Enable QUIC decryption to automatically identify the negotiated application protocol; no ALPN entry is required. HTTP/3 keeps its request/response view, while other protocols expose decrypted bytes by Stream ID. QUIC DATAGRAMs appear separately with packet boundaries. Both support Raw/HexView and recording. QUIC v1 is supported; 0-RTT forwarding, migration, and HTTP/3 extensions such as WebTransport and CONNECT-UDP are not supported.
 
-This is a simple session viewer. Some applications with their own certificate checks may reject decryption. HTTP/3 payload decryption is not supported yet.
+For long captures or analysis by an AI agent, enable **Keep recording files** under **Traffic Monitor → Recording options**, choose a location, capacity and disk reserve, then start monitoring. The recording checkbox resets when ProxyLane restarts; the location and limits are remembered. Metadata is continuously saved as JSONL with separate payload files and retained after exit. Reaching the recording capacity or disk reserve stops capture without deleting old payloads or interrupting existing connections. Busy parsers can fall back to raw capture; resource-related gaps are explicitly reported and recorded while other captures continue. **Open last recording** opens the directory, which includes a format guide.
 
 ## Packaging a Release
 
@@ -114,7 +112,9 @@ Build the Win32 and x64 Release configurations, then run the following command f
 powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 ```
 
-The script reads version information from the application and Hook binaries, verifies that they have the same version, and creates `dist/ProxyLane-version-Windows.zip`. The archive contains the Win32 and x64 applications, matching Hook DLLs, the 64-bit secure-transport and MITM DLLs, the sample configuration, licenses, and both README files. Test executables and command-line helpers are excluded.
+The script reads version information from the application and Hook binaries, verifies that they have the same version, and creates `dist/ProxyLane-version-Windows.zip`. The archive contains the Win32 and x64 applications, matching Hook DLLs, the 64-bit secure-transport and MITM DLLs, the sample configuration, a combined license file, and both README files. Test executables and command-line helpers are excluded.
+
+The archive contains a single `LICENSE`: ProxyLane's own license appears first, followed by third-party licenses and notices under `Third-Party Software Licenses`.
 
 The sample configuration is stored at `examples/ProxyLane.ini` and is copied to the package root as `ProxyLane.ini`.
 

@@ -21,7 +21,7 @@ class Host:
     def __init__(self,work,name='host',proxy='NOPROXY',port=0):
         self.log=open(work/(name+'.log'),'wb')
         env=dict(os.environ,PROXYLANE_MITM='0',PROXYLANE_PROTOCOL_CACHE_ROOT=str(work/(name+'-cache')))
-        self.p=subprocess.Popen([str(RUNTIME/'host.exe'),proxy,str(port)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=self.log,text=True,env=env,creationflags=subprocess.CREATE_NO_WINDOW)
+        self.p=subprocess.Popen([str(RUNTIME/'host.exe'),proxy,str(port)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=self.log,text=True,encoding='utf-8',env=env,creationflags=subprocess.CREATE_NO_WINDOW)
     def call(self,**q):
         self.p.stdin.write(json.dumps(q)+'\n');self.p.stdin.flush()
         line=self.p.stdout.readline()

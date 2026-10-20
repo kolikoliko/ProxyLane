@@ -20,7 +20,7 @@ public:
 
 
 	VOID EndTask();
-	VOID CloseTask();
+	VOID CloseTask(const char* reason = "UDP route closed; cause unavailable");
 	BOOL IsClosed();
 	BOOL SetTaskInfo(LPPRCClient lpPRCClient, LPProxyInfo lpProxyInfo);
 	BOOL AddRoute(LPPRCClient lpPRCClient);
@@ -66,6 +66,7 @@ private:
 		BOOL firstDatagramLogged;
 		std::shared_ptr<CProtocolTap> capture;
         std::shared_ptr<CQuicBridge> quic;
+        bool quicRetired = false;
         CPRCUdpPeer::_CSAddrInfo quicTarget;
 	};
 	typedef std::list<UdpRoute> UdpRouteList;

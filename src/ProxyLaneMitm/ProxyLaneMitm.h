@@ -5,7 +5,7 @@
 // Dynamically loaded; all sessions belong to the caller's PRC event thread.
 // side 0 = application, side 1 = original destination (after proxy negotiation).
 // Caller must preserve unsent output: peek, Send, consume only Send's byte count.
-#define PLM_ABI_VERSION 8u
+#define PLM_ABI_VERSION 9u
 #define PLM_CONNECTED 5u
 #define PLM_FEED 0u
 #define PLM_PEEK 1u
@@ -18,6 +18,10 @@
 #define PLM_CLIENT_EOF 8
 #define PLM_SERVER_EOF 16
 #define PLM_READY 32
+#define PLM_CAN_READ_CLIENT 64
+#define PLM_CAN_READ_SERVER 128
+#define PLM_HANDSHAKE_PENDING 256
+#define PLM_RECORDING_PENDING 512
 typedef uint32_t (__cdecl *PLM_VERSION_FN)();
 typedef int (__cdecl *PLM_CREATE_FN)(const char*, const char*, void**, char*, size_t);
 typedef int (__cdecl *PLM_IO_FN)(void*, uint32_t, uint32_t, uint8_t*, size_t);

@@ -20,14 +20,17 @@ private:
     static void __cdecl Observe(uintptr_t user, uint32_t kind, const uint8_t* data, size_t length);
     ULONGLONG m_connection;
     bool Pump();
-    void Fail(int error = WSAECONNABORTED);
+    void Fail(int error = 0);
+    static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wp, LPARAM lp);
+    HWND m_window = NULL;
+    bool m_pollHandshake = false;
     CTcpProxyTask* m_task;
     void* m_session;
     PLM_IO_FN m_io;
     PLM_ERROR_FN m_error;
     PLM_FREE_FN m_free;
     bool m_failed;
-    bool m_paused;
+    bool m_paused[2] = {false, false};
 };
 
 // Optional observation of the existing TCP forwarding path. Never owns sockets.
@@ -38,6 +41,7 @@ public:
     ~CProtocolTap();
     void Data(unsigned side, const void* bytes, size_t length);
     void Eof(unsigned side);
+    void CloseReason(const char* reason);
     void Connected(int error);
     static bool Enabled();
     bool IsActive() const { return m_active.load(); }

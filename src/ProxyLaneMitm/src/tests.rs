@@ -8,6 +8,83 @@ use std::{
     sync::Arc,
 };
 
+#[test]
+fn recording_tls_full_queue_resumes_and_stop_releases_pending_transport() {
+    use std::time::{Duration,Instant};
+    for (stop,size) in [(false,512),(false,1024*1024),(true,1024*1024)] {
+        let f=Fixture::new();
+        let runtime=protocol::Runtime::test_small_queue(proxylane_protocol::cache::CacheConfig {
+            root:f.path.join("recording-pressure"),
+            recording:Some(proxylane_protocol::recording::RecordingConfig {total_bytes:16*1024*1024,min_free_bytes:0}),
+            queue_chunks:2,..Default::default()
+        });
+        let mut m=f.session();
+        m.enable_protocol(runtime.clone(),proxylane_protocol::Connection{id:"pressure".into(),..Default::default()});
+        let (mut app,mut origin)=f.endpoints(false,true);
+        for _ in 0..30 {exchange(&mut m,&mut app,&mut origin,4096).unwrap();}
+        app.writer().write_all(b"GET /pressure HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        for _ in 0..4 {exchange(&mut m,&mut app,&mut origin,4096).unwrap();}
+        let _=origin.reader().read_to_end(&mut Vec::new());
+        let release=runtime.pause_worker();
+        if size==512 {runtime.fill_paused_queue();}
+        let body:Vec<u8>=(0..size).map(|n|(n%251) as u8).collect();
+        let mut expected=format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",body.len()).into_bytes();
+        expected.extend(&body);
+        origin.set_buffer_limit(None);origin.writer().write_all(&expected).unwrap();
+        origin.send_close_notify();
+        let mut wire=Vec::new();while origin.wants_write() {origin.write_tls(&mut wire).unwrap();}
+        let mut at=0;
+        let start=Instant::now();
+        while !m.recording_pending() {
+            let end=(at+4096).min(wire.len());
+            assert!(end>at);m.feed(1,&wire[at..end]).unwrap();at=end;
+        }
+        assert!(start.elapsed()<Duration::from_secs(1),"TLS PRC producer must not block on a full recording queue");
+        assert!(!m.can_read_side(1));
+        let stopper=if stop {
+            let r=runtime.clone();Some(std::thread::spawn(move||r.stop_capture().unwrap()))
+        }else{None};
+        if stop {
+            let deadline=Instant::now()+Duration::from_secs(2);
+            while runtime.capture_epoch()%2!=0 {assert!(Instant::now()<deadline);std::thread::yield_now();}
+        }
+        release.send(()).unwrap();
+        if let Some(job)=stopper {job.join().unwrap();}
+        let mut received=Vec::new();
+        let deadline=Instant::now()+Duration::from_secs(15);
+        while received.len()<expected.len() {
+            assert!(Instant::now()<deadline,"recording backpressure failed to resume");
+            m.pump().unwrap();
+            if at<wire.len() && m.can_read_side(1) {
+                let end=(at+4096).min(wire.len());m.feed(1,&wire[at..end]).unwrap();at=end;
+            }
+            let mut bytes=[0u8;16384];let n=m.peek(0,&mut bytes).unwrap();
+            if n!=0 {
+                let mut input=Cursor::new(&bytes[..n]);
+                while input.position()<n as u64 {
+                    assert!(app.read_tls(&mut input).unwrap()>0);app.process_new_packets().unwrap();
+                    let _=app.reader().read_to_end(&mut received);
+                }
+                m.consume(0,n).unwrap();
+            }
+            let _=app.reader().read_to_end(&mut received);
+            if n==0 {std::thread::yield_now();}
+        }
+        assert_eq!(received,expected);
+        if !stop {runtime.stop_capture().unwrap();}
+        let status=runtime.recording_status();
+        assert_eq!(status["quality"]["gap_count"],0);assert_eq!(status["stopped"],false);
+        let root=std::path::PathBuf::from(status["directory"].as_str().unwrap());
+        let events=std::fs::read_to_string(root.join("events-000001.jsonl")).unwrap();
+        let id=events.lines().map(|s|serde_json::from_str::<serde_json::Value>(s).unwrap())
+            .find(|v|v["type"]=="message_head" && v["side"]==1).unwrap()["cache_id"].as_u64().unwrap();
+        let saved=std::fs::read(root.join(proxylane_protocol::recording::payload_relative(id,1))).unwrap();
+        if stop {assert!(saved.len()<body.len());assert_eq!(saved,body[..saved.len()]);}
+        else {assert_eq!(saved,body);}
+        drop(m);runtime.shutdown().unwrap();
+    }
+}
+
 struct Fixture {
     path: std::path::PathBuf,
     context: Arc<Context>,
@@ -23,12 +100,17 @@ impl Fixture {
         let ca = Arc::new(pki::Authority::load(&path, true).unwrap());
         let mut roots = RootCertStore::empty();
         roots.add(ca.der.clone()).unwrap();
+        let roots = Arc::new(roots);
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            roots.clone(), Arc::new(rustls::crypto::ring::default_provider())).build().unwrap();
         Self {
             path,
             context: Arc::new(Context {
                 crl: ca.serve_crl().unwrap(),
                 ca,
-                roots: Arc::new(roots),
+                roots,
+                verifier,
+                async_handshake: false,
             }),
         }
     }
@@ -114,9 +196,11 @@ fn exchange(
             origin.write_tls(&mut bytes).unwrap();
         }
         for chunk in bytes.chunks(fragment) {
-            assert!(m.can_read());
+            wait_handshake(m)?;
+            assert!(m.can_read_side(side));
             m.feed(side, chunk)?;
         }
+        wait_handshake(m)?;
         let mut bytes = [0u8; 4096];
         loop {
             let n = m.peek(side, &mut bytes)?;
@@ -141,6 +225,81 @@ fn exchange(
         }
     }
     Ok(())
+}
+
+fn wait_handshake(m: &mut Session) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while m.handshake_pending() {
+        m.pump()?;
+        assert!(std::time::Instant::now() < deadline, "handshake worker stalled");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Ok(())
+}
+
+#[test]
+fn asynchronous_upstream_handshake_transfers_and_cancels_without_blocking() {
+    use rustls::client::danger::{ServerCertVerifier, ServerCertVerified, HandshakeSignatureValid};
+    use rustls::pki_types::{CertificateDer, UnixTime};
+    use std::time::{Instant, Duration};
+    #[derive(Debug)]
+    struct Slow(Arc<dyn ServerCertVerifier>, Arc<std::sync::atomic::AtomicBool>);
+    impl ServerCertVerifier for Slow {
+        fn verify_server_cert(&self, c: &CertificateDer<'_>, chain: &[CertificateDer<'_>],
+            n: &ServerName<'_>, o: &[u8], t: UnixTime) -> Result<ServerCertVerified,rustls::Error> {
+            self.1.store(true,std::sync::atomic::Ordering::Release);
+            std::thread::sleep(Duration::from_millis(500));
+            self.0.verify_server_cert(c,chain,n,o,t)
+        }
+        fn verify_tls12_signature(&self,m:&[u8],c:&CertificateDer<'_>,s:&rustls::DigitallySignedStruct)
+            -> Result<HandshakeSignatureValid,rustls::Error> {self.0.verify_tls12_signature(m,c,s)}
+        fn verify_tls13_signature(&self,m:&[u8],c:&CertificateDer<'_>,s:&rustls::DigitallySignedStruct)
+            -> Result<HandshakeSignatureValid,rustls::Error> {self.0.verify_tls13_signature(m,c,s)}
+        fn supported_verify_schemes(&self)->Vec<rustls::SignatureScheme> {self.0.supported_verify_schemes()}
+    }
+    let mut f = Fixture::new();
+    Arc::get_mut(&mut f.context).unwrap().async_handshake = true;
+    let mut normal = f.session();
+    let (mut app,mut origin) = f.endpoints(false,true);
+    for _ in 0..30 { exchange(&mut normal,&mut app,&mut origin,4096).unwrap(); }
+    assert!(normal.ready());
+    let body=vec![0x5a;2*1024*1024];
+    let mut received=Vec::new();
+    for chunk in body.chunks(8192) {
+        origin.writer().write_all(chunk).unwrap();
+        exchange(&mut normal,&mut app,&mut origin,4096).unwrap();
+        let mut buf=[0;16384];
+        while let Ok(n)=app.reader().read(&mut buf) {if n==0{break;}received.extend_from_slice(&buf[..n]);}
+    }
+    exchange(&mut normal,&mut app,&mut origin,4096).unwrap();
+    let mut tail=[0;16384];
+    while let Ok(n)=app.reader().read(&mut tail) {if n==0{break;}received.extend_from_slice(&tail[..n]);}
+    assert_eq!(received.len(),body.len());
+    assert!(received==body);
+
+    let entered=Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let slow_context=Arc::new(Context {ca:f.context.ca.clone(),crl:f.context.ca.serve_crl().unwrap(),
+        roots:f.context.roots.clone(),verifier:Arc::new(Slow(f.context.verifier.clone(),entered.clone())),
+        async_handshake:true});
+    let mut slow=Session::new(slow_context,"localhost".into(),json!({}),false).unwrap();
+    let (mut client,mut server)=f.endpoints(false,true);
+    let mut hello=Vec::new();client.write_tls(&mut hello).unwrap();slow.feed(0,&hello).unwrap();
+    let mut buf=[0;16384];let n=slow.peek(1,&mut buf).unwrap();
+    server.read_tls(&mut Cursor::new(&buf[..n])).unwrap();server.process_new_packets().unwrap();slow.consume(1,n).unwrap();
+    let mut flight=Vec::new();server.write_tls(&mut flight).unwrap();
+    let start=Instant::now();slow.feed(1,&flight).unwrap();
+    assert!(start.elapsed()<Duration::from_millis(100));
+    let deadline=Instant::now()+Duration::from_secs(2);
+    while !entered.load(std::sync::atomic::Ordering::Acquire) {
+        slow.pump().unwrap();assert!(Instant::now()<deadline);std::thread::sleep(Duration::from_millis(1));
+    }
+    // A different connection continues forwarding while one verifier sleeps.
+    origin.writer().write_all(b"unrelated connection remains live").unwrap();
+    let start=Instant::now();
+    for _ in 0..2 {exchange(&mut normal,&mut app,&mut origin,4096).unwrap();}
+    let n=app.reader().read(&mut buf).unwrap();assert_eq!(&buf[..n],b"unrelated connection remains live");
+    assert!(start.elapsed()<Duration::from_millis(100));
+    let start=Instant::now();drop(slow);assert!(start.elapsed()<Duration::from_millis(100));
 }
 
 extern "C" fn observe(user: usize, kind: u32, data: *const u8, length: usize) {
@@ -177,7 +336,7 @@ fn tls_large_response_drains_plaintext_between_record_reads() {
         let mut saw_backpressure = false;
         let mut clean_eof = false;
         for step in 0..200_000 {
-            if position < wire.len() && m.can_read() {
+            if position < wire.len() && m.can_read_side(1) {
                 // PRC recv and maximum FFI input sizes, unaligned to TLS records.
                 let end = (position + fragment).min(wire.len());
                 m.feed(1, &wire[position..end]).unwrap();
@@ -213,6 +372,63 @@ fn tls_large_response_drains_plaintext_between_record_reads() {
         assert_eq!(received.len(), payload.len());
         assert_eq!(received, payload);
         assert!(m.shutdown_output(0));
+    }
+}
+
+#[test]
+fn tls_backpressure_is_directional_and_unclean_eof_drains_authenticated_bytes() {
+    for tls12 in [true, false] {
+        let f = Fixture::new();
+        let mut m = f.session();
+        let (mut app, mut origin) = f.endpoints(tls12, true);
+        for _ in 0..30 { exchange(&mut m, &mut app, &mut origin, 4096).unwrap(); }
+        let mut uploaded = 0;
+        while m.can_read_side(0) {
+            app.writer().write_all(&[b'x'; 1024]).unwrap();
+            let mut wire = Vec::new(); app.write_tls(&mut wire).unwrap();
+            for chunk in wire.chunks(4096) { m.feed(0, chunk).unwrap(); }
+            uploaded += 1024;
+            assert!(uploaded < 2 * session::HIGH_WATER);
+        }
+        assert!(m.can_read_side(1), "a blocked upload must not block its early response");
+        let response = b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
+        origin.writer().write_all(response).unwrap();
+        let mut wire = Vec::new(); origin.write_tls(&mut wire).unwrap();
+        for chunk in wire.chunks(4096) { m.feed(1, chunk).unwrap(); }
+        let mut bytes = [0u8; 4096];
+        loop {
+            let n = m.peek(0, &mut bytes).unwrap(); if n == 0 { break; }
+            app.read_tls(&mut Cursor::new(&bytes[..n])).unwrap();
+            app.process_new_packets().unwrap(); m.consume(0, n).unwrap();
+        }
+        let mut received = Vec::new(); let _ = app.reader().read_to_end(&mut received);
+        assert_eq!(received, response);
+
+        // Model a slow receiving socket: withhold output until TCP EOF arrives.
+        let mut m = f.session();
+        let (mut app, mut origin) = f.endpoints(tls12, true);
+        for _ in 0..30 { exchange(&mut m, &mut app, &mut origin, 4096).unwrap(); }
+        let body: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+        origin.set_buffer_limit(None); origin.writer().write_all(&body).unwrap();
+        let mut wire = Vec::new(); origin.write_tls(&mut wire).unwrap();
+        for chunk in wire.chunks(4096) { m.feed(1, chunk).unwrap(); }
+        m.input_eof(1).unwrap();
+        assert!(!m.can_read_side(0) && !m.can_read_side(1));
+        let mut received = Vec::new();
+        loop {
+            let n = m.peek(0, &mut bytes).unwrap(); if n == 0 { break; }
+            let mut input = Cursor::new(&bytes[..n]);
+            while input.position() < n as u64 {
+                assert!(app.read_tls(&mut input).unwrap() > 0);
+                let state = app.process_new_packets().unwrap();
+                assert!(!state.peer_has_closed(), "do not fabricate close_notify");
+                let _ = app.reader().read_to_end(&mut received);
+            }
+            m.consume(0, n).unwrap();
+        }
+        assert_eq!(received, body);
+        assert!(!m.shutdown_output(0));
+        assert!(m.tick().unwrap_err().contains("upstream TCP EOF without close_notify"));
     }
 }
 
@@ -508,7 +724,7 @@ fn realtime_tls_protocol_without_monitor_observer_and_authenticated_eof() {
             exchange(&mut m, &mut app, &mut origin, 7).unwrap();
         }
         if !clean {
-            assert!(m.input_eof(1).is_err());
+            m.input_eof(1).unwrap();
         }
         drop(m);
         let result = runtime.query(&json!({"type":"poll"})).unwrap();
@@ -589,12 +805,47 @@ fn realtime_h2_alpn_hpack_interleaved_streams_and_cached_decode() {
 }
 
 #[test]
-fn abrupt_tls_eof_reports_direction_once_and_never_fakes_clean_close() {
+fn h2_settings_in_the_tls_handshake_flight_are_captured_before_ack() {
+    fn frame(kind:u8,flags:u8,id:u32,payload:&[u8])->Vec<u8> {
+        let mut bytes=(payload.len() as u32).to_be_bytes()[1..].to_vec();
+        bytes.extend([kind,flags]);bytes.extend(id.to_be_bytes());bytes.extend(payload);bytes
+    }
+    for tls12 in [false,true] {
+        let f=Fixture::new();
+        let runtime=crate::protocol::Runtime::new(proxylane_protocol::cache::CacheConfig {
+            root:f.path.join("recording"),recording:Some(proxylane_protocol::recording::RecordingConfig{total_bytes:8*1024*1024,min_free_bytes:0}),..Default::default()
+        }).unwrap();
+        let mut m=f.session();m.enable_protocol(runtime.clone(),proxylane_protocol::Connection{id:"early-h2".into(),..Default::default()});
+        let (mut app,mut origin)=f.endpoints_alpn(tls12,true,b"h2");
+        // The server sends its SETTINGS immediately, bundled with the final handshake flight.
+        let settings=frame(4,0,0,&[0,1,0,0,0,0]);origin.writer().write_all(&settings).unwrap();
+        for _ in 0..30 {exchange(&mut m,&mut app,&mut origin,65536).unwrap();}
+        let mut received=Vec::new();let _=app.reader().read_to_end(&mut received);assert_eq!(received,settings);
+        let mut request=b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();request.extend(frame(4,0,0,&[]));
+        request.extend(frame(4,1,0,&[]));request.extend(frame(1,5,1,&[0x82,0x87,0x84]));app.writer().write_all(&request).unwrap();
+        for _ in 0..4 {exchange(&mut m,&mut app,&mut origin,65536).unwrap();}
+        let mut response=frame(4,1,0,&[]);response.extend(frame(1,4,1,&[0x88]));response.extend(frame(0,1,1,b"hello"));origin.writer().write_all(&response).unwrap();
+        for _ in 0..4 {exchange(&mut m,&mut app,&mut origin,65536).unwrap();}
+        let result=runtime.query(&json!({"type":"poll"})).unwrap();
+        assert!(!runtime.recording_failed(),"{result}");
+        assert!(result["records"].as_array().unwrap().iter().any(|r|r["type"]=="exchange" && r["exchange"]["response"]["body_bytes"]==5),"{result}");
+        runtime.stop_capture().unwrap();runtime.shutdown().unwrap();
+    }
+}
+
+#[test]
+fn abrupt_tls_eof_silences_application_close_but_never_fakes_clean_close() {
     for tls12 in [true, false] {
         for side in 0..2 {
             let f = Fixture::new();
+            let runtime = crate::protocol::Runtime::new(proxylane_protocol::cache::CacheConfig {
+                root: f.path.join("close-status"), ..Default::default()
+            }).unwrap();
             let mut records: Vec<(u32, Vec<u8>)> = Vec::new();
             let mut m = f.session();
+            m.enable_protocol(runtime.clone(), proxylane_protocol::Connection {
+                id: "abrupt-close".into(), ..Default::default()
+            });
             m.observer = Some((observe, &mut records as *mut _ as usize));
             let (mut app, mut origin) = f.endpoints(tls12, true);
             for _ in 0..30 {
@@ -606,7 +857,16 @@ fn abrupt_tls_eof_reports_direction_once_and_never_fakes_clean_close() {
             assert!(m.ready());
             origin.writer().write_all(b"partial response").unwrap();
             exchange(&mut m, &mut app, &mut origin, 17).unwrap();
-            let error = m.input_eof(side).unwrap_err();
+            m.input_eof(side).unwrap();
+            let mut pending = [0u8; 16384];
+            for output in 0..2 {
+                loop {
+                    let n = m.peek(output, &mut pending).unwrap();
+                    if n == 0 { break; }
+                    m.consume(output, n).unwrap();
+                }
+            }
+            let error = m.tick().unwrap_err();
             assert!(error.contains(if side == 0 {
                 "application TCP EOF"
             } else {
@@ -620,9 +880,45 @@ fn abrupt_tls_eof_reports_direction_once_and_never_fakes_clean_close() {
             m.fail(error.clone());
             drop(m);
             let errors: Vec<_> = records.iter().filter(|r| r.0 == 0).collect();
-            assert_eq!(errors.len(), 1);
-            assert_eq!(errors[0].1, error.as_bytes());
+            if side == 0 {
+                assert!(errors.is_empty(), "routine application close must not report an error");
+            } else {
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].1, error.as_bytes());
+            }
+            let result = runtime.query(&json!({"type":"poll"})).unwrap();
+            let statuses = result["records"].as_array().unwrap();
+            if side == 0 {
+                assert!(statuses.iter().any(|r| r["status"] == "Closed"), "{result}");
+                assert!(!statuses.iter().any(|r| r["status"] == "Failed"), "{result}");
+            } else {
+                assert!(statuses.iter().any(|r| r["status"] == "Failed"), "{result}");
+            }
+            runtime.shutdown().unwrap();
         }
+    }
+}
+
+#[test]
+fn application_tls_record_errors_are_still_reported() {
+    for tls12 in [true, false] {
+        let f = Fixture::new();
+        let mut records: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut m = f.session();
+        m.observer = Some((observe, &mut records as *mut _ as usize));
+        let (mut app, mut origin) = f.endpoints(tls12, true);
+        for _ in 0..30 { exchange(&mut m, &mut app, &mut origin, 65536).unwrap(); }
+        assert!(m.ready());
+        app.writer().write_all(b"damaged application record").unwrap();
+        let mut wire = Vec::new();
+        while app.wants_write() { app.write_tls(&mut wire).unwrap(); }
+        *wire.last_mut().unwrap() ^= 1;
+        let error = m.feed(0, &wire).unwrap_err();
+        m.fail(error.clone());
+        drop(m);
+        let errors: Vec<_> = records.iter().filter(|r| r.0 == 0).collect();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].1, error.as_bytes());
     }
 }
 
@@ -697,10 +993,16 @@ fn ip_san_without_sni_and_untrusted_issuer() {
     assert!(m.ready());
     assert!(!app.is_handshaking());
 
+    let unrelated = rcgen::generate_simple_self_signed(vec!["unrelated.invalid".into()]).unwrap();
+    let mut unrelated_roots = RootCertStore::empty();
+    unrelated_roots.add(unrelated.cert.der().clone()).unwrap();
     let untrusted = Arc::new(Context {
         crl: f.context.ca.serve_crl().unwrap(),
         ca: f.context.ca.clone(),
         roots: Arc::new(RootCertStore::empty()),
+        verifier: rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(unrelated_roots), Arc::new(rustls::crypto::ring::default_provider())).build().unwrap(),
+        async_handshake: false,
     });
     let mut m = Session::new(untrusted, "localhost".into(), json!({}), false).unwrap();
     let (mut app, mut origin) = f.endpoints(false, true);

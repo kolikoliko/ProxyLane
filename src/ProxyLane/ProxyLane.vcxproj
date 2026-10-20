@@ -296,10 +296,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)..\scripts\bu
     <ClInclude Include="Page2.h" />
     <ClInclude Include="Page3.h" />
     <ClInclude Include="MitmSettings.h" />
+    <ClInclude Include="RecordingSettings.h" />
+    <ClInclude Include="RecordingDialog.h" />
     <ClInclude Include="ByteHexView.h" />
     <ClInclude Include="ProtocolRawView.h" />
     <ClInclude Include="Page4.h" />
     <ClInclude Include="ProtocolViewModel.h" />
+      <ClInclude Include="ProcessIconCache.h" />
     <ClInclude Include="MonitorLogFormat.h" />
     <ClInclude Include="Page5.h" />
 	<ClInclude Include="ProfileCommandBroker.h" />

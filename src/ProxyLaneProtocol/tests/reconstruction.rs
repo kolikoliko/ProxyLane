@@ -53,6 +53,63 @@ fn h2_start(a: &mut Analyzer) -> u64 {
 }
 
 #[test]
+fn h2_cancelled_response_updates_hpack_without_losing_other_requests() {
+    let mut a=analyzer(Protocol::H2,Limits::default());
+    let mut client=h2_start(&mut a);
+    for id in [1,3] {
+        let b=h2_request(id);assert!(a.push(Direction::Client,client,&b).is_empty());client+=b.len() as u64;
+    }
+    let reset=frame(3,0,1,&8u32.to_be_bytes());
+    let cancelled=exchanges(a.push(Direction::Client,client,&reset));
+    assert_eq!(cancelled.len(),1);assert_eq!(cancelled[0].id,1);
+    assert_eq!(cancelled[0].problem.as_deref(),Some("RST_STREAM 8 from application"));
+    // A late response inserts x-late: yes in HPACK's dynamic table, fragmented
+    // across HEADERS/CONTINUATION and across input chunks.
+    let block=b"\x88\x40\x06x-late\x03yes";
+    let mut response=frame(1,0,1,&block[..5]);
+    response.extend(frame(9,4,1,&block[5..]));
+    response.extend(frame(0,1,1,b"cancelled body"));
+    response.extend(frame(1,5,3,&[0x88,0xbe])); // reference the discarded header
+    let mut out=Vec::new();
+    for (offset,b) in response.iter().enumerate() {out.extend(a.push(Direction::Server,offset as u64,&[*b]));}
+    let out=exchanges(out);assert_eq!(out.len(),1);assert_eq!(out[0].id,3);
+    let message=out[0].response.as_ref().unwrap();assert!(message.complete);
+    assert!(message.headers.contains(&("x-late".into(),"yes".into())));
+    assert!(a.close().is_empty());
+}
+
+#[test]
+fn h2_server_reset_allows_inflight_upload_but_not_unknown_response() {
+    let mut a=analyzer(Protocol::H2,Limits::default());
+    let mut offset=h2_start(&mut a);
+    let request=frame(1,4,1,&[0x82,0x87,0x84]);
+    assert!(a.push(Direction::Client,offset,&request).is_empty());offset+=request.len() as u64;
+    assert_eq!(exchanges(a.push(Direction::Server,0,&frame(3,0,1,&8u32.to_be_bytes()))).len(),1);
+    let upload=frame(0,1,1,b"already in flight");
+    assert!(a.push(Direction::Client,offset,&upload).is_empty());offset+=upload.len() as u64;
+    assert!(a.push(Direction::Client,offset,&h2_request(3)).is_empty());
+    assert_eq!(exchanges(a.push(Direction::Server,13,&frame(1,5,3,&[0x88]))).len(),1);
+    // An unrelated, never-requested stream must still fail validation.
+    diagnostic(&a.push(Direction::Server,23,&frame(1,5,99,&[0x88])),"response without captured request");
+}
+
+#[test]
+fn h2_unused_preconnection_is_quiet_but_partial_preface_is_not() {
+    for clean in [false,true] {
+        for server_settings in [false,true] {
+            let mut a=analyzer(Protocol::H2,Limits::default());
+            if server_settings {assert!(a.push(Direction::Server,0,&frame(4,0,0,&[])).is_empty());}
+            assert!(a.eof(Direction::Client,clean).is_empty());
+            assert!(a.eof(Direction::Server,clean).is_empty());
+            assert!(a.close().is_empty());
+        }
+        let mut a=analyzer(Protocol::H2,Limits::default());
+        assert!(a.push(Direction::Client,0,b"PRI * HTTP/2").is_empty());
+        diagnostic(&a.eof(Direction::Client,clean),"incomplete");
+    }
+}
+
+#[test]
 fn http1_pipeline_informational_head_and_trailers() {
     let mut a = analyzer(Protocol::Http1, Limits::default());
     a.push(Direction::Client, 0, b"HEAD /one HTTP/1.1\r\nHost: example.test\r\n\r\nGET /two HTTP/1.1\r\nHost: example.test\r\n\r\n");

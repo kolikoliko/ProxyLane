@@ -3,6 +3,7 @@
 #include "Page4.h"
 #include "Localization.h"
 #include "MitmSettings.h"
+#include "RecordingDialog.h"
 #include "../../third_party/nlohmann/json.hpp"
 #include <thread>
 #include <atomic>
@@ -31,7 +32,7 @@ static std::shared_ptr<MitmJob> StartMitmJob(IProxyTlsControl* tls, unsigned act
 static std::shared_ptr<MitmJob> StartMonitorJob(IProxyTlsControl* tls, bool decrypt)
 {
     auto job = std::make_shared<MitmJob>();
-    const auto settings=MitmSettings::Load();
+    const auto settings=MitmSettings::Json(MitmSettings::Load()); // Snapshot ALL options on the UI thread.
     const bool quic=MitmSettings::DecryptQUIC();
     const bool skip=GetPrivateProfileInt(L"options",L"MitmSkipUpstreamVerify",0,Localization::SettingsPath())==1;
     try {
@@ -42,13 +43,26 @@ static std::shared_ptr<MitmJob> StartMonitorJob(IProxyTlsControl* tls, bool decr
                     if(job->result>=0) job->needsCA=(job->result&2)==0;
                     if(job->result<0 || job->needsCA) {job->done.store(true);return;}
                 }
-                auto options=nlohmann::json{{"type","mitm_options"},{"settings",MitmSettings::Json(settings)},{"skip_upstream_verify",skip}}.dump();
+                auto options=nlohmann::json{{"type","mitm_options"},{"settings",settings},{"skip_upstream_verify",skip}}.dump();
                 job->result=tls->QueryProtocol(options.c_str(),job->text,sizeof(job->text));
                 if(job->result>=0) {
+                    auto applied=nlohmann::json::parse(job->text,nullptr,false);
+                    if(job->result>sizeof(job->text) || !applied.is_object() || applied["settings"]["recording"]!=settings["recording"])
+                        throw std::runtime_error("Recording options were not accepted by the monitoring module.");
                     auto request=nlohmann::json{{"type","monitor_start"},{"decrypt",decrypt},{"quic",quic}}.dump();
                     job->result=tls->QueryProtocol(request.c_str(),job->text,sizeof(job->text));
+                    if(job->result>=0 && settings["recording"].value("enabled",false)) {
+                        char status[8192]={};int n=tls->QueryProtocol("{\"type\":\"recording_status\"}",status,sizeof(status));
+                        auto value=nlohmann::json::parse(status,nullptr,false);
+                        if(n<=0 || n>sizeof(status) || !value.is_object() || !value.value("enabled",false) ||
+                            value.value("ended",false) || value.value("stopped",false) || value.value("directory",std::string()).empty()) {
+                            tls->QueryProtocol("{\"type\":\"monitor_stop\"}",status,sizeof(status));
+                            throw std::runtime_error("Recording was requested but did not start. Monitoring has been stopped; check the recording directory and settings.");
+                        }
+                    }
                 }
-            } catch (...) { job->result=-1;strcpy_s(job->text,"Unable to prepare monitoring."); }
+            } catch (const std::exception& e) {job->result=-1;strncpy_s(job->text,e.what(),_TRUNCATE);}
+              catch (...) { job->result=-1;strcpy_s(job->text,"Unable to prepare monitoring."); }
             job->done.store(true);
         }).detach();
     } catch (...) {strcpy_s(job->text,"Unable to start monitor worker.");job->done.store(true);}
@@ -172,6 +186,7 @@ class CMitmCaDialog : public CModernDialog {
         CheckDlgButton(IDC_MITM_ENABLE,BST_UNCHECKED);m_quic.SetCheck(BST_UNCHECKED);
         m_defaultsPending=true;
         m_effective.SetWindowText(Localization::Get(L"mitm.defaults_pending"));
+        LayoutOptions();
     }
     void UpdateEnableHint() {
         // Opening options is not a mode change. Only a new unchecked->checked
@@ -307,7 +322,7 @@ public:
             m_pendingEnableId=id;
             if(m_job) return TRUE;
             m_enableHintRequested=IsDlgButtonChecked(id)==BST_CHECKED;
-            UpdateEnableHint();
+            UpdateEnableHint();LayoutOptions();
             if(IsDlgButtonChecked(id)==BST_CHECKED) {
                 m_enablePending=true;m_saveAfterTrust=false;
                 Start(IProxyTlsControl::QueryCA);
@@ -391,6 +406,8 @@ BOOL CPage4::OnInitDialog()
     // protocol/TLS settings before starting capture; ordinary proxy startup
     // must not load the optional module just because the INI was customized.
     SetDlgItemText(IDC_MITM_CA, Localization::Get(_T("mitm.ca")));
+    m_recordOptions.Create(Localization::Get(L"recording.options"),WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,CRect(),this,IDC_RECORDING_OPTIONS);
+    m_recordOptions.SetFont(&m_uiFont);
     UiTheme::CreateUiFont(m_font, m_hWnd, 9, FW_NORMAL, _T("Consolas"));
     InitProtocolView(); ApplyMonitorSettings();
     m_tls->QueryProtocol(nlohmann::json{{"type","quic_injection_policy"},{"enabled",MitmSettings::DecryptQUIC()}}.dump().c_str(),nullptr,0);
@@ -418,6 +435,7 @@ BEGIN_MESSAGE_MAP(CPage4, CModernDialog)
     ON_WM_CAPTURECHANGED()
     ON_BN_CLICKED(IDC_BTN_CLEAR, &CPage4::OnClear)
     ON_BN_CLICKED(IDC_MITM_CA, &CPage4::OnCA)
+    ON_BN_CLICKED(IDC_RECORDING_OPTIONS, &CPage4::OnRecordingOptions)
     ON_NOTIFY(LVN_ITEMCHANGED, IDC_PROTOCOL_REQUESTS, &CPage4::OnRequestSelected)
     ON_NOTIFY(LVN_GETINFOTIP, IDC_PROTOCOL_REQUESTS, &CPage4::OnRequestInfoTip)
     ON_NOTIFY(TCN_SELCHANGE, IDC_PROTOCOL_DETAIL_TABS, &CPage4::OnDetailTab)
@@ -451,15 +469,17 @@ void CPage4::LayoutControls(int cx, int cy)
     int monitorWidth = labelWidth(m_monitor, 20);
     int caWidth = labelWidth(m_ca, 16);
     int clearWidth = max(s(48), labelWidth(m_clear, 16));
-    if (monitorWidth + caWidth + clearWidth + s(8) > width) {
+    int recordWidth=m_recordOptions.GetSafeHwnd()?labelWidth(m_recordOptions,16):0;
+    if (monitorWidth + caWidth + clearWidth + recordWidth + s(12) > width) {
         monitorWidth = labelWidth(m_monitor, 16);
         caWidth = labelWidth(m_ca, 8);
         clearWidth = max(s(40), labelWidth(m_clear, 8));
     }
-    int gap = max(1, min(s(12), (width - monitorWidth - caWidth - clearWidth) / 2));
+    int gap = max(1, min(s(12), (width - monitorWidth - caWidth - clearWidth-recordWidth) / 3));
     m_monitor.MoveWindow(s(8), top, monitorWidth, h);
     m_clear.MoveWindow(cx - s(8) - clearWidth, top, clearWidth, h);
     m_ca.MoveWindow(cx - s(8) - clearWidth - gap - caWidth, top, caWidth, h);
+    if(m_recordOptions.GetSafeHwnd())m_recordOptions.MoveWindow(cx-s(8)-clearWidth-gap-caWidth-gap-recordWidth,top,recordWidth,h);
     GetDlgItem(IDC_STATIC_TASKCOUNT)->MoveWindow(max(s(160), cx - s(220)), s(10), min(s(212), max(0, cx - s(168))), s(20));
     top += s(36);
     LayoutProtocolView(s(8), top, width, max(0, cy - top - s(8)));
@@ -467,6 +487,11 @@ void CPage4::LayoutControls(int cx, int cy)
 void CPage4::SetMonitorControls(bool busy)
 {
     m_ca.EnableWindow(m_mitmSupported && !busy);m_monitor.EnableWindow(m_mitmSupported && !busy);
+    if(m_recordOptions.GetSafeHwnd())m_recordOptions.EnableWindow(m_mitmSupported && !busy);
+    if(!m_recording && m_recordOptions.GetSafeHwnd()) {
+        m_keepRecordingRequested=RecordingSettings::Load().enabled;
+        m_recordOptions.SetWindowText(Localization::Get(m_keepRecordingRequested?L"recording.enabled":L"recording.disabled"));
+    }
     // While running, describe this run; edited preferences apply to the next start.
     const bool decrypt=m_recording ? m_tls->IsEnabled()!=FALSE : MitmSettings::DecryptHTTPS();
     bool quic=MitmSettings::DecryptQUIC();
@@ -476,6 +501,17 @@ void CPage4::SetMonitorControls(bool busy)
     CRect client;GetClientRect(client);LayoutControls(client.Width(),client.Height());
 }
 void CPage4::OnCA() { OpenCA(false); }
+void CPage4::OnRecordingOptions() {
+    if(!m_mitmSupported || m_job || m_stopJob)return;
+    bool active=false;char reply[8192]={};
+    if(m_recording && m_tls->QueryProtocol("{\"type\":\"recording_status\"}",reply,sizeof(reply))>0) {
+        auto state=nlohmann::json::parse(reply,nullptr,false);
+        active=state.is_object() && state.value("enabled",false) && !state.value("ended",false) && !state.value("stopped",false);
+    }
+    CRecordingDialog dialog(this,m_recording,active);dialog.DoModal();
+    m_keepRecordingRequested=RecordingSettings::Load().enabled;
+    SetMonitorControls(false);
+}
 void CPage4::OpenCA(bool resumeStart)
 {
     if (!m_mitmSupported || m_stopJob) return;
@@ -515,6 +551,7 @@ void CPage4::CompleteReconnect(bool commit)
 void CPage4::StartMonitoring()
 {
     if (!m_mitmSupported || m_job || m_stopJob) return;
+    m_keepRecordingRequested=RecordingSettings::Load().enabled;
     m_job = StartMonitorJob(m_tls,MitmSettings::DecryptHTTPS());
     SetMonitorControls(true);
 }
@@ -562,12 +599,50 @@ void CPage4::OnTimer(UINT_PTR id)
         if(job->needsCA) {m_monitor.SetCheck(BST_UNCHECKED);OpenCA(true);}
         else if(job->result<0) {
             m_monitor.SetCheck(BST_UNCHECKED);m_recording=false;CompleteReconnect(false);
-            MessageBox(Localization::Get(L"monitor.start_failed")+L"\r\n\r\n"+Utf8(job->text),Localization::Get(L"mitm.ca"),MB_ICONERROR);
+            MessageBox(Localization::Get(L"monitor.start_failed")+L"\r\n\r\n"+Utf8(job->text),Localization::Get(L"page4.monitor"),MB_ICONERROR);
         } else {
-            m_recording=true;m_monitor.SetCheck(BST_CHECKED);CompleteReconnect(true);
+            m_recording=true;m_recordingGapNotified=false;m_monitor.SetCheck(BST_CHECKED);CompleteReconnect(true);
+            char reply[8192]={};int n=m_tls->QueryProtocol("{\"type\":\"recording_status\"}",reply,sizeof(reply));
+            if(n>0 && n<=sizeof(reply)) {auto value=nlohmann::json::parse(reply,nullptr,false);
+                if(value.is_object() && value.value("enabled",false)) {
+                    CString directory=Utf8(value.value("directory",std::string()).c_str());
+                    WritePrivateProfileStringW(L"recording",L"LastDirectory",directory,Localization::SettingsPath());
+                    m_recordOptions.SetWindowText(Localization::Get(L"recording.active"));
+                }
+            }
             SetMonitorControls(false);
             if(GetParent()) GetParent()->Invalidate(FALSE);
         }
+    }
+    if(m_recording && !m_job && !m_stopJob) {
+        char reply[8192]={};int n=m_tls->QueryProtocol("{\"type\":\"recording_status\"}",reply,sizeof(reply));
+        if(n>0 && n<=sizeof(reply)) {auto value=nlohmann::json::parse(reply,nullptr,false);
+            if(value.is_object()) {
+                bool active=value.value("enabled",false) && !value.value("ended",false) && !value.value("stopped",false);
+                auto quality=value.value("quality",nlohmann::json::object());
+                bool incomplete=quality.value("capture_incomplete",false);
+                bool deferred=quality.value("analysis_deferred_count",uint64_t(0))!=0;
+                CString caption=Localization::Get(active?(incomplete?L"recording.active_incomplete":deferred?L"recording.active_deferred":L"recording.active"):m_keepRecordingRequested?L"recording.pending":L"recording.disabled");
+                CString current;m_recordOptions.GetWindowText(current);
+                if(current!=caption) {m_recordOptions.SetWindowText(caption);CRect client;GetClientRect(client);LayoutControls(client.Width(),client.Height());}
+                if(active && incomplete && !m_recordingGapNotified) {
+                    m_recordingGapNotified=true;
+                    MessageBox(Localization::Get(L"recording.gap_warning"),Localization::Get(L"recording.options"),MB_ICONWARNING);
+                }
+            }
+            if(value.is_object() && value.value("stopped",false)) {
+                // The host watchdog already stops interception without touching active sockets.
+                m_monitor.SetCheck(BST_UNCHECKED);UpdateMonitorStatus();
+                CString reason=Utf8(value.value("reason",std::string("Recording stopped")).c_str());
+                CString directory=Utf8(value.value("directory",std::string()).c_str());
+                MessageBox(Localization::Get(L"recording.stopped")+L"\r\n\r\n"+reason+L"\r\n\r\n"+directory,
+                    Localization::Get(L"recording.options"),MB_ICONWARNING);
+            }
+        }
+    }
+    if(!m_recording && m_recordOptions.GetSafeHwnd()) {
+        CString current;m_recordOptions.GetWindowText(current);CString caption=Localization::Get(m_keepRecordingRequested?L"recording.enabled":L"recording.disabled");
+        if(current!=caption) {m_recordOptions.SetWindowText(caption);CRect client;GetClientRect(client);LayoutControls(client.Width(),client.Height());}
     }
     DWORD tcp = 0, udp = 0;
     if (g_GlobalProxy) {

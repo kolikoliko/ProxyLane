@@ -5,6 +5,7 @@ use std::sync::Mutex;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
+    pub recording: RecordingOptions,
     pub entry_mib: u64,
     pub total_mib: u64,
     pub history_rows: usize,
@@ -15,14 +16,32 @@ pub struct Options {
     pub udp_packets: usize,
     pub handshake_seconds: u64,
 }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RecordingOptions {
+    pub enabled: bool,
+    pub directory: String,
+    pub capacity_mib: u64,
+    pub reserve_mib: u64,
+}
+impl Default for RecordingOptions {
+    fn default()->Self {Self {enabled:false,directory:String::new(),capacity_mib:8192,reserve_mib:512}}
+}
 impl Default for Options {
     fn default() -> Self {
-        Self { entry_mib:32, total_mib:512, history_rows:512, preview_kib:64,
-            decode_mib:4, connections:32, pending_requests:8, udp_packets:256, handshake_seconds:15 }
+        Self { recording:RecordingOptions::default(), entry_mib:32, total_mib:512, history_rows:512, preview_kib:64,
+            decode_mib:4, connections:128, pending_requests:8, udp_packets:256, handshake_seconds:15 }
     }
 }
 impl Options {
     pub fn validate(&self) -> Result<(), String> {
+        let r=&self.recording;
+        if !(16..=1_048_576).contains(&r.capacity_mib) || !(16..=1_048_576).contains(&r.reserve_mib) {
+            return Err("recording capacity/reserve must be between 16 and 1048576 MiB".into());
+        }
+        if r.enabled && (r.directory.is_empty() || r.directory.len()>2048 || !std::path::Path::new(&r.directory).is_absolute()) {
+            return Err("recording directory must be an absolute path (at most 2048 UTF-8 bytes)".into());
+        }
         for (name, value, min, max) in [
             ("entry_mib",self.entry_mib,1,1024), ("total_mib",self.total_mib,16,8192),
             ("history_rows",self.history_rows as u64,128,10000), ("preview_kib",self.preview_kib as u64,16,1024),

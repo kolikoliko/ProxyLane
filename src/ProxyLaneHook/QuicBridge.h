@@ -15,7 +15,8 @@ public:
     int Peek(unsigned side,char*,int);
     void Consume(unsigned side);
     bool Passthrough() const { return m_rejected; }
-    bool Drained() const { return m_rejected && m_initial.empty(); }
+    bool Drained();
+    bool WasMitm() const { return m_handle != NULL; }
 private:
     typedef void (__cdecl *NotifyFn)(uintptr_t);
     typedef int (__cdecl *OpenFn)(const char*,const char*,const uint8_t*,size_t,void*,NotifyFn,uintptr_t,void**,char*,size_t);

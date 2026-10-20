@@ -20,16 +20,57 @@ struct Transaction {
     cache: Option<CacheRef>,
     bytes: [u64; 2],
     started: Instant,
+    started_ms:u64,
     retries: u32,
 }
 #[derive(Default)]
 pub struct Dns {
+    spill:Option<(PayloadCache,String)>,
     pending: VecDeque<Transaction>,
     recent: VecDeque<String>,
     next: u64,
     buffers: [Vec<u8>; 2],
 }
 impl Dns {
+    fn spill_name(dir:&str,key:&str)->String {
+        use sha2::Digest;
+        format!("{dir}/{:x}.json",sha2::Sha256::digest(key.as_bytes()))
+    }
+    fn spill_oldest(&mut self)->Result<(),String> {
+        let (cache,dir)=self.spill.as_ref().unwrap();
+        if let Some(t)=self.pending.pop_front() {
+            let value=json!({"id":t.id,"key":t.key,"name":t.name,"kind":t.kind,"wire_id":t.wire_id,
+                "cache_id":t.cache.as_ref().map(CacheRef::id),"bytes":t.bytes,"retries":t.retries,
+                "started_ms":t.started_ms});
+            cache.working_write(Self::spill_name(dir,&t.key),serde_json::to_vec(&value).unwrap())?;
+        }
+        Ok(())
+    }
+    fn restore_query(&mut self,key:&str)->Result<(),String> {
+        if self.pending.iter().any(|t|t.key==key) {return Ok(());}
+        let Some((cache,dir))=self.spill.clone() else {return Ok(());};
+        let name=Self::spill_name(&dir,key);let path=cache.directory().join(&name);
+        if !std::fs::metadata(&path).is_ok_and(|m|m.len()>4) {return Ok(());}
+        let value:Value=serde_json::from_slice(&std::fs::read(path).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        if self.pending.len()>=PENDING {self.spill_oldest()?;}
+        let age=proxylane_protocol::recording::now_ms().saturating_sub(value["started_ms"].as_u64().unwrap());
+        let t=Transaction {id:value["id"].as_u64().unwrap(),key:key.into(),name:value["name"].as_str().unwrap().into(),
+            kind:value["kind"].as_str().unwrap().into(),wire_id:value["wire_id"].as_u64().unwrap() as u16,
+            cache:value["cache_id"].as_u64().map(|id|cache.reference(id)).transpose()?,
+            bytes:serde_json::from_value(value["bytes"].clone()).map_err(|e|e.to_string())?,
+            started_ms:value["started_ms"].as_u64().unwrap(),
+            started:Instant::now().checked_sub(Duration::from_millis(age)).unwrap_or_else(Instant::now),
+            retries:value["retries"].as_u64().unwrap() as u32};
+        cache.working_write(name,b"null".to_vec())?;self.pending.push_back(t);Ok(())
+    }
+    fn duplicate(cache:Option<&PayloadCache>, identity:&Connection, side:usize, bytes:&[u8]) {
+        if let Some(c)=cache.filter(|c|c.is_recording()) {
+            let payload=c.scoped(json!({"connection":identity,"protocol":"dns","kind":"duplicate_datagram"})).stream();
+            payload.record(json!({"type":"dns_duplicate","side":side,"length":bytes.len()}));
+            payload.append_stream(if side==0 {Direction::Client}else{Direction::Server},bytes);
+            let mut lengths=[0,0];lengths[side]=bytes.len() as u64;payload.finish_stream(lengths,true);
+        }
+    }
     fn record(
         t: &Transaction,
         identity: &Connection,
@@ -40,7 +81,7 @@ impl Dns {
         json!({"type":"dns","protocol":"dns","connection":identity,
             "exchange":{"id":t.id,"wire_id":t.wire_id,"name":t.name,"kind":t.kind,
                 "status":status,"problem":problem,"retries":t.retries,
-                "elapsed_ms":t.started.elapsed().as_millis() as u64,"finished":finished,
+                "started_unix_ms":t.started_ms,"elapsed_ms":proxylane_protocol::recording::observed_ms().saturating_sub(t.started_ms),"finished":finished,
                 "sent_bytes":t.bytes[0],"received_bytes":t.bytes[1],"cache":t.cache}})
     }
     fn finish(t: &Transaction) {
@@ -50,6 +91,33 @@ impl Dns {
     }
     pub fn expire(&mut self, identity: &Connection, closing: Option<&str>) -> Vec<Value> {
         let mut out = Vec::new();
+        // Recording backlog may be slow; wall-clock analysis delay must not
+        // expire otherwise matchable queries. Spill instead until reply/stop.
+        if self.spill.is_some() && closing.is_none() {return out;}
+        if closing.is_some() {
+            if let Some((cache,dir))=self.spill.clone() {
+                if let Ok(files)=std::fs::read_dir(cache.directory().join(&dir)) {
+                    for file in files.flatten() {
+                        if file.path().extension().and_then(|s|s.to_str())!=Some("json") {continue;}
+                        let result=(||->Result<(),String>{
+                            let data=std::fs::read(file.path()).map_err(|e|e.to_string())?;
+                            if data==b"null" {return Ok(());}
+                            let v:Value=serde_json::from_slice(&data).map_err(|e|e.to_string())?;
+                            // Flush resident queries to make room without creating
+                            // more files while enumerating this directory.
+                            while let Some(t)=self.pending.pop_front() {
+                                Self::finish(&t);let record=Self::record(&t,identity,"Incomplete",closing,true);
+                                cache.record(json!({"type":"observation","record":record}));
+                                if out.len()>=PENDING {out.remove(0);}out.push(record);
+                            }
+                            self.restore_query(v["key"].as_str().ok_or("invalid DNS state")?)?;
+                            Ok(())
+                        })();
+                        if let Err(e)=result {cache.fail_recording(&format!("DNS analysis state: {e}"));break;}
+                    }
+                }
+            }
+        }
         while self
             .pending
             .front()
@@ -78,12 +146,21 @@ impl Dns {
         side: usize,
         bytes: &[u8],
     ) -> Vec<Value> {
+        if self.spill.is_none() {
+            if let Some(c)=cache.filter(|c|c.is_recording()) {
+                self.spill=Some((c.clone(),format!("analysis/dns-{}",c.working_id())));
+            }
+        }
         let mut out = self.expire(identity, None);
         let packet = dns::decode(bytes);
         let valid = packet.as_ref().ok();
         if let Some(p) = valid {
+            if let Err(e)=self.restore_query(&p.key) {
+                if let Some(c)=cache {c.fail_recording(&format!("DNS analysis state: {e}"));}
+            }
             if !p.response && side == 0 {
                 if let Some(t) = self.pending.iter_mut().find(|t| t.key == p.key) {
+                    Self::duplicate(cache,identity,side,bytes);
                     t.retries = t.retries.saturating_add(1);
                     out.push(Self::record(t, identity, "Pending", None, false));
                     return out;
@@ -104,6 +181,7 @@ impl Dns {
                     return out;
                 }
                 if self.recent.contains(&p.key) {
+                    Self::duplicate(cache,identity,side,bytes);
                     return out;
                 }
             }
@@ -115,9 +193,10 @@ impl Dns {
             name: valid.map(|p| p.name.clone()).unwrap_or_default(),
             kind: valid.map(|p| p.kind.clone()).unwrap_or_default(),
             wire_id: valid.map(|p| p.id).unwrap_or(0),
-            cache: cache.map(PayloadCache::stream),
+            cache: cache.map(|c|c.scoped(json!({"connection":identity,"protocol":"dns"})).stream()),
             bytes: [0; 2],
             started: Instant::now(),
+            started_ms:proxylane_protocol::recording::observed_ms(),
             retries: 0,
         };
         t.bytes[side] = bytes.len() as u64;
@@ -135,6 +214,9 @@ impl Dns {
             Ok(p) if !p.response && side == 0 => {
                 self.recent.retain(|key| key != &t.key);
                 if self.pending.len() >= PENDING {
+                    if self.spill.is_some() {
+                        if let Err(e)=self.spill_oldest() {if let Some(c)=cache {c.fail_recording(&e);}}
+                    } else {
                     let old = self.pending.pop_front().unwrap();
                     Self::finish(&old);
                     out.push(Self::record(
@@ -144,6 +226,7 @@ impl Dns {
                         Some("DNS pending query limit reached"),
                         true,
                     ));
+                    }
                 }
                 out.push(Self::record(&t, identity, "Pending", None, false));
                 self.pending.push_back(t);
@@ -221,6 +304,27 @@ mod tests {
         b[2] = 0x81;
         b[3] = 0x83;
         b
+    }
+    #[test]
+    fn retained_dns_overflow_matches_all_queries_without_expiring_on_analysis_delay() {
+        let cache=PayloadCache::new(proxylane_protocol::cache::CacheConfig {
+            root:std::env::temp_dir().join("proxylane-dns-recording-pressure"),
+            recording:Some(proxylane_protocol::recording::RecordingConfig{total_bytes:16*1024*1024,min_free_bytes:0}),
+            queue_chunks:2,max_entries:2,..Default::default()
+        }).unwrap();
+        let c=Connection::default();let mut d=Dns::default();
+        for id in 0..200 {let out=d.feed(&c,Some(&cache),0,&query(id,b'a'));assert_eq!(out.last().unwrap()["exchange"]["status"],"Pending");}
+        assert_eq!(d.pending.len(),PENDING);
+        d.pending.front_mut().unwrap().started=Instant::now()-TIMEOUT*2;
+        assert!(d.expire(&c,None).is_empty());
+        for id in 0..200 {
+            let out=d.feed(&c,Some(&cache),1,&response(&query(id,b'a')));
+            assert_eq!(out.last().unwrap()["exchange"]["status"],"NXDOMAIN");
+            assert!(out.last().unwrap()["exchange"]["problem"].is_null());
+        }
+        assert!(d.close(&c,Some(&cache),"stopped").is_empty());
+        cache.finish_recording().unwrap();assert!(!cache.recording_failed());
+        assert_eq!(cache.recording_status()["quality"]["gap_count"],0);cache.shutdown().unwrap();
     }
     #[test]
     fn matching_retransmit_reordering_id_reuse_timeout_and_limits() {

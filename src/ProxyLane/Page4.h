@@ -40,6 +40,7 @@ protected:
     afx_msg void OnCaptureChanged(CWnd*);
     afx_msg void OnClear();
     afx_msg void OnCA();
+    afx_msg void OnRecordingOptions();
     afx_msg void OnRequestSelected(NMHDR*, LRESULT*);
     afx_msg void OnRequestInfoTip(NMHDR*, LRESULT*);
     afx_msg void OnDetailTab(NMHDR*, LRESULT*);
@@ -72,16 +73,19 @@ private:
     bool m_dragging = false;
     CRect m_splitRect, m_protocolRect;
     CListCtrl m_requests;
+    CImageList m_processIcons;
     CProtocolRawView m_detail;
     CStatic m_detailStatus;
     CToolTipCtrl m_detailTooltip;
     CString m_detailStatusText;
     std::shared_ptr<ProtocolPageData> m_protocol;
     CButton m_monitor;
-    CModernButton m_clear, m_ca;
+    CModernButton m_clear, m_ca, m_recordOptions;
     CFont m_font;
     IProxyTlsControl* m_tls;
     bool m_recording;
+    bool m_keepRecordingRequested=false;
+    bool m_recordingGapNotified=false;
     bool m_mitmSupported = ProxySupportsOptionalModules();
     std::shared_ptr<MitmJob> m_job, m_stopJob;
 };

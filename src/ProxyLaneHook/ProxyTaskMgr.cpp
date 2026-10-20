@@ -490,7 +490,7 @@ INT  CProxyUDPTaskMgr::KillTasks(LPPRCClient lpPRCClient)
 			pObj->m_PRCClient.s == lpPRCClient->s)
 		{
 			ClearTaskPortStates(pObj);
-			pObj->CloseTask();
+			pObj->CloseTask("application socket closed");
 			nCount ++;
 		}
 	}
@@ -505,6 +505,7 @@ VOID CProxyUDPTaskMgr::RemoveAllTasks()
 	{
 		CUdpProxyTask *pObj = m_tasklist.front();
 		m_tasklist.pop_front();
+		pObj->CloseTask("proxy stopped");
 		RemoveTask(pObj);
 	}
 	KillTimer(TIMER_TCPPERTASK);
@@ -585,6 +586,7 @@ VOID CProxyUDPTaskMgr::OnTimer(UINT_PTR nIDEvent)
 				if (!TestTaskByPid(pObj->m_PRCClient.dwPid,
 					pObj->m_PRCClient.processCreateTime))
 				{
+					pObj->CloseTask("application process exited");
 					it = m_tasklist.erase(it);
 					RemoveTask(pObj);
 				}else if (pObj->IsClosed())

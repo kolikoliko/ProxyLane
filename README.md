@@ -85,13 +85,17 @@ src\build-secure-transport.bat
 powershell -ExecutionPolicy Bypass -File .\scripts\build-secure-transport.ps1
 ```
 
-### 流量监视与解密（试验功能）
+### 流量监视与解密
 
-64 位 ProxyLane 可以按进程查看已接管应用的网络会话，不需要应用使用系统代理。支持 HTTP/1.1、HTTP/2 的请求响应、正文解压，DNS 查询响应，以及普通 TCP/UDP 的 Raw、HexView 查看。HTTPS 解密不限定 443 端口；QUIC 解密提供实验性的 QUIC v1 / HTTP/3 支持，也不限定应用名称或端口。
+64 位 ProxyLane 可以按进程查看已接管应用的网络会话，不需要应用使用系统代理。支持 HTTP/1.1、HTTP/2 的请求响应、正文解压，DNS 查询响应，以及普通 TCP/UDP 的 Raw、HexView 查看。HTTPS 解密不限定 443 端口；QUIC v1 解密也不限定应用名称或端口。
 
 进入 **流量监视 → 解密选项**，按需启用 **解密 HTTPS** 或 **解密 QUIC**（两项默认关闭），首次使用按提示安装当前用户 CA，保存后再开始监视。目标应用需要重新建立连接；停止监视后停止新增解密和采集，已接管连接继续转发。QUIC 选项还会尝试放宽兼容的 Chromium 应用对可信本地/企业 CA 的额外限制，保留常规证书校验。修改 QUIC 选项后，请完全退出并重新运行目标应用；浏览器兼容修改持续到目标进程退出，停止监视不会撤回。浏览器兼容性仍需随版本验证。
 
 只想监视、不使用外部代理时，选择 `NOPROXY`，无需填写地址和端口。启用需要的 TCP/UDP 接管，取消“禁止 UDP”，再接入目标应用。普通监视不需要 CA。使用独立信任库、证书固定或尚不支持的 QUIC 应用协议时，解密可能不可用；当前不保证覆盖所有 QUIC 应用及收发方式。
+
+开启 QUIC 解密后，自动识别协商的应用协议，无需填写 ALPN。HTTP/3 按请求响应还原，其他协议按 Stream ID 查看原始明文；QUIC DATAGRAM 独立按报文展示，均支持 Raw／HexView 和录制。当前支持 QUIC v1，不支持 0-RTT 转发、连接迁移及 HTTP/3 扩展中的 WebTransport、CONNECT-UDP。
+
+需要长时间留存、交给智能体分析时，在 **流量监视 → 录制选项** 中启用 **保留录制文件**，设置保存位置、每次录制容量和磁盘预留空间，再开始监视。保留录制的勾选仅在本次运行有效，重启软件后需重新勾选；保存位置和容量设置会记住。请求信息以 JSONL 持续保存，载荷单独存放，退出后保留；达到录制容量上限或磁盘空间不足时会停止监视录制，不删除旧载荷，也不影响已有连接转发。解析繁忙时可保留原始流；若资源不足造成数据缺失，会明确提示并记录缺失信息，其他会话继续录制。可用“打开上次录制目录”找到数据，每次录制目录内都有格式说明。
 
 ## 界面语言
 
@@ -117,6 +121,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 脚本会从程序文件属性读取版本号，检查主程序与 Hook DLL 的版本是否一致，并生成 `dist/ProxyLane-版本-Windows.zip`。压缩包包含 Win32/x64 主程序、对应的 Hook DLL、64 位加密传输和 MITM DLL、样例配置、许可证以及中英文 README。测试和命令行辅助工具不进入发行包。
 
 样例配置保存在 `examples/ProxyLane.ini`，打包后会以 `ProxyLane.ini` 放在压缩包根目录。
+
+发行包只包含一个 `LICENSE`：首先是 ProxyLane 自身许可证，随后在 `Third-Party Software Licenses` 标题下汇总第三方许可证和相关声明。
 
 “测试当前设置”使用 `[options]` 下的 `IPv6TestAddress` 作为 IPv6 出口探测地址；该值必须是 IPv6 字面地址，默认使用 `2001:4860:4860::8888`，探测端口为 TCP 53。
 

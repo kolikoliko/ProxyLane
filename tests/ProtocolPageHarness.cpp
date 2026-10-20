@@ -14,15 +14,23 @@ class FakeTls : public IProxyTlsControl {
 public:
     std::atomic<bool> evicted{false};
     bool caOk=false, skipVerify=false, enabled=false, moduleOk=true, prepareOk=true;
+    bool activeRecording=false,missingRecording=false;
+    unsigned stops=0;
     int caFlags=3;
     std::atomic<unsigned> starts{0}, caQueries{0};
     bool lastDecrypt=false, injectionQuic=false;
     nlohmann::json settings;
+    nlohmann::json recordingQuality=nlohmann::json::object();
     std::atomic<unsigned> count{2};
     std::atomic<unsigned> delay{0};
     std::atomic<bool> packetPayload{false};
     std::atomic<unsigned> queries{0};
     std::atomic<unsigned> polls{0};
+    std::string processPath;
+    FakeTls() {
+        wchar_t path[MAX_PATH]={};GetModuleFileNameW(nullptr,path,_countof(path));
+        processPath=CW2A(path,CP_UTF8);
+    }
     int ManageCA(CaAction, char* output, size_t capacity) override {
         ++caQueries;
         if(caOk) {if(output&&capacity) strcpy_s(output,capacity,"Test CA status");return caFlags;}
@@ -34,15 +42,17 @@ public:
     int QueryProtocol(const char* request, char* output, size_t capacity) override {
         ++queries;
         using J = ProtocolView::Json;
-        if (delay.load()) Sleep(delay.load());
         auto command = J::parse(request); J reply;
         std::string type = command.at("type");
-        if(type=="quic_injection_policy") {injectionQuic=command.value("enabled",injectionQuic);reply={{"enabled",injectionQuic}};}
+        // recording_status is an atomic snapshot; unlike cache reads it never waits for disk.
+        if (delay.load() && type!="recording_status") Sleep(delay.load());
+        if(type=="recording_status") reply={{"enabled",activeRecording},{"ended",false},{"stopped",false},{"directory",activeRecording?"D:/test-recording":""},{"quality",recordingQuality}};
+        else if(type=="quic_injection_policy") {injectionQuic=command.value("enabled",injectionQuic);reply={{"enabled",injectionQuic}};}
         else if (type == "monitor_start") {
             ++starts;lastDecrypt=command.value("decrypt",false);
             if(!moduleOk || (lastDecrypt && !prepareOk)) {strcpy_s(output,capacity,"Injected dependency failure");return -1;}
-            enabled=lastDecrypt;reply={{"type","monitor"}};
-        } else if(type=="monitor_stop") {enabled=false;reply={{"type","monitor"}};}
+            enabled=lastDecrypt;activeRecording=!missingRecording && settings["recording"].value("enabled",false);reply={{"type","monitor"}};
+        } else if(type=="monitor_stop") {++stops;activeRecording=false;enabled=false;reply={{"type","monitor"}};}
         else if (type == "mitm_options") {
             if(command.contains("settings") && !command.value("validate_only",false)) settings=command["settings"];
             if(command.contains("skip_upstream_verify") && !command.value("validate_only",false)) skipVerify=command["skip_upstream_verify"].get<bool>();
@@ -60,7 +70,7 @@ public:
                 records.push_back({{"type", "exchange"}, {"sequence", id}, {"protocol", id % 2 ? "http1" : "h2"},
                     {"connection", {{"id", std::to_string(id)}, {"pid", id % 2 ? 1234 : 5678}, {"process_start", id % 2 + 1},
                         {"socket", id + 99}, {"generation", 1}, {"destination", "ifconfig.test [127.255.0.1]:443"},
-                        {"process_name", "curl.exe"}, {"server_name", "ifconfig.test"}, {"server_port", 443}}},
+                        {"process_name", "curl.exe"}, {"process_path",processPath}, {"server_name", "ifconfig.test"}, {"server_port", 443}}},
                     {"exchange", {{"id", id}, {"cache", {{"id", id}}}, {"problem", nullptr}, {"request", request},
                         {"response", response}, {"informational", J::array()}}}});
                 next = id;
@@ -78,6 +88,17 @@ public:
     }
 };
 static void Require(bool good, const char* message) { if (!good) throw std::runtime_error(message); }
+static void CheckFreshRecordingProcess() {
+    wchar_t exe[32768]={};Require(GetModuleFileNameW(nullptr,exe,_countof(exe))!=0,"test executable path");
+    std::wstring command=L"\""+std::wstring(exe)+L"\" --recording-fresh";
+    STARTUPINFOW startup={sizeof(startup)};PROCESS_INFORMATION child={};
+    Require(CreateProcessW(exe,&command[0],nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,nullptr,&startup,&child)!=FALSE,"fresh recording process");
+    DWORD waited=WaitForSingleObject(child.hProcess,30000),code=1;
+    if(waited!=WAIT_OBJECT_0) {TerminateProcess(child.hProcess,1);WaitForSingleObject(child.hProcess,5000);}
+    else GetExitCodeProcess(child.hProcess,&code);
+    CloseHandle(child.hThread);CloseHandle(child.hProcess);
+    Require(waited==WAIT_OBJECT_0 && code==0,"new instance defaults to no recording and retains directory/limits, even with legacy Enabled=1");
+}
 class ProtocolPageHarness {
 public:
     static void DragThumb(CByteHexView& hex, int bar) {
@@ -169,14 +190,60 @@ public:
         Require(start->result>=0 && !fake.enabled && !fake.lastDecrypt && fake.caQueries==caBefore,"plain monitoring needs no CA");
         fake.moduleOk=false;start=waitJob(StartMonitorJob(&fake,false));
         Require(start->result<0,"missing analysis module also blocks plain monitoring");fake.moduleOk=true;
+        {
+            const CString path=Localization::SettingsPath();wchar_t original[32768]={};
+            const bool originalEnabled=RecordingSettings::Load().enabled;
+            GetPrivateProfileSectionW(L"recording",original,_countof(original),path);WritePrivateProfileSectionW(L"recording",nullptr,path);
+            auto values=RecordingSettings::Load();Require(values.capacityMiB==8192,"new default recording capacity is 8 GiB");
+            values.enabled=true;Require(RecordingSettings::Save(values),"enable recording before first start");
+            const auto idleQueries=fake.queries.load();CString idleCaption;
+            page.SetMonitorControls(false);page.OnTimer(1);page.m_recordOptions.GetWindowText(idleCaption);
+            Require(idleCaption==Localization::Get(L"recording.enabled") && fake.queries==idleQueries,"session recording opt-in is visible before monitoring without loading the optional backend");
+            values.enabled=false;Require(RecordingSettings::Save(values),"disable idle recording");
+            page.SetMonitorControls(false);page.OnTimer(1);page.m_recordOptions.GetWindowText(idleCaption);
+            Require(idleCaption==Localization::Get(L"recording.disabled") && fake.queries==idleQueries,"idle recording disabled state stays visible across refresh");
+            values.enabled=true;Require(RecordingSettings::Save(values),"restore enabled recording for start");
+            page.SetMonitorControls(false);
+            start=waitJob(StartMonitorJob(&fake,false));Require(start->result>=0 && fake.activeRecording,"first start includes the saved recording settings");
+            fake.missingRecording=true;const auto stops=fake.stops;
+            start=waitJob(StartMonitorJob(&fake,false));Require(start->result<0 && fake.stops==stops+1,"requested recording may never silently fall back to ordinary monitoring");
+            fake.missingRecording=false;fake.activeRecording=false;
+            WritePrivateProfileSectionW(L"recording",original[0]?original:nullptr,path);
+            RecordingSettings::SessionEnabled().store(originalEnabled);
+            page.SetMonitorControls(false);
+        }
 
         page.MoveWindow(0, 0, 960, 660); page.ShowWindow(SW_SHOW);
         parent.ShowWindow(SW_SHOWNOACTIVATE);
         page.m_recording = true;
+        {
+            Require(MitmSettings::Defaults()[5]==128,"default concurrent analysis limit is 128");
+            fake.activeRecording=true;fake.recordingQuality={{"analysis_deferred_count",1}};
+            page.OnTimer(1);CString caption;page.m_recordOptions.GetWindowText(caption);
+            Require(caption==Localization::Get(L"recording.active_deferred"),"raw fallback is visible without stopping recording");
+            fake.recordingQuality={{"capture_incomplete",true},{"gap_count",1}};page.m_recordingGapNotified=true;
+            page.OnTimer(1);page.m_recordOptions.GetWindowText(caption);
+            Require(caption==Localization::Get(L"recording.active_incomplete") && page.m_recording,"recording gap has a persistent warning caption and keeps monitoring");
+            fake.activeRecording=false;fake.recordingQuality=nlohmann::json::object();page.m_recordingGapNotified=false;
+        }
         Pump(page, [&] { return page.m_requests.GetItemCount() == 2; });
         Require(page.m_follow.GetCheck() == BST_CHECKED, "follow latest enabled initially");
         Require(page.m_requests.GetGroupCount() == 0, "process groups");
         Require(page.m_requests.GetItemText(0, 1).Find(L"curl.exe") >= 0, "saved process name");
+        auto itemImage=[&](int row,int col) {
+            LVITEM item={};item.mask=LVIF_IMAGE;item.iItem=row;item.iSubItem=col;
+            Require(page.m_requests.GetItem(&item)!=FALSE,"read process subitem icon");return item.iImage;
+        };
+        Pump(page,[&]{return itemImage(0,1)>0;});
+        Require(itemImage(0,0)==I_IMAGENONE,"no application icon in sequence column");
+        Require(itemImage(0,1)==itemImage(1,1) && page.m_processIcons.GetImageCount()==2,"same executable shares one cached icon across PIDs");
+        Require(page.m_protocol->icons.Size()==1,"process executable queried only once");
+        const auto iconCount=page.m_processIcons.GetImageCount();
+        const auto cachedCount=page.m_protocol->icons.Size();
+        for(int n=0;n<20;++n) page.RebuildRequests();
+        Require(page.m_processIcons.GetImageCount()==iconCount && page.m_protocol->icons.Size()==cachedCount,"refresh does not allocate or enqueue duplicate icons");
+        Require(ProcessIconCache::Key(L"\\\\server\\share\\app.exe").empty(),"remote executable uses fallback without extraction");
+        Require(ProcessIconCache::Key(L"\\\\?\\C:\\Tools\\APP.EXE")==ProcessIconCache::Key(L"c:\\tools\\app.exe"),"path spellings share the icon cache");
         Require(page.m_requests.GetItemText(0, 5) == L"ifconfig.test:443 /ip", "domain without mapped IP");
         Require(!page.GetDlgItem(IDC_PROTOCOL_TABS) && !page.GetDlgItem(IDC_EDIT1), "raw log controls removed");
         Require(!page.m_viewTabs.IsWindowEnabled(), "HEX disabled without selection");
@@ -264,7 +331,12 @@ public:
         fake.count = 700;
         Pump(page, [&] { return page.m_protocol->next == 700; }, 20000);
         Require(page.m_requests.GetItemCount() == 512 && page.m_protocol->history.discarded == 188, "bounded visible history");
-        Require(page.CanFollowLatest() && page.m_requests.GetTopIndex()>450, "follow stays at latest through history eviction");
+        if(!page.CanFollowLatest() || page.m_requests.GetTopIndex()<=450) {
+            SCROLLINFO si={sizeof(si),SIF_ALL};page.m_requests.GetScrollInfo(SB_VERT,&si);
+            std::cerr<<"follow diagnostic: top="<<page.m_requests.GetTopIndex()<<" pos="<<si.nPos<<" page="<<si.nPage
+                <<" max="<<si.nMax<<" checked="<<page.m_follow.GetCheck()<<'\n';
+            Require(false,"follow stays at latest through history eviction");
+        }
         page.m_requests.SendMessage(WM_VSCROLL, SB_PAGEUP);
         page.TickProtocolView();
         Require(page.m_follow.GetCheck()==BST_UNCHECKED, "scrolling up pauses follow");
@@ -301,6 +373,7 @@ public:
         Require(text.Find(L"certificate verification skipped")==-1,"plain TCP must not show target TLS verification warning");
         const auto firstSeen = page.m_protocol->history.rows.front().firstSeenSeconds;
         Require(firstSeen > 0, "row records its first appearance time");
+        if(nativeScroll) {
         POINT savedCursor; GetCursorPos(&savedCursor);
         page.m_requests.SendMessage(WM_HSCROLL,SB_LEFT);page.m_requests.EnsureVisible(0,FALSE);
         CRect numberRect; page.m_requests.GetSubItemRect(0,0,LVIR_BOUNDS,numberRect);
@@ -316,6 +389,7 @@ public:
         tipText[0]=0;page.OnRequestInfoTip((NMHDR*)&tip,&ignored);
         Require(!tipText[0],"time tooltip is restricted to the number column");
         SetCursorPos(savedCursor.x,savedCursor.y);
+        }
         flow.sequence = 702; flow.responseBytes = 100; page.m_protocol->history.Add(flow); page.RebuildRequests();
         Require(page.m_protocol->history.rows.front().firstSeenSeconds==firstSeen,"row updates preserve the timestamp");
         Require(page.m_requests.GetItemCount() == 1 && page.m_requests.GetItemText(0,7) == L"0 / 100", "stream updates same row");
@@ -606,6 +680,8 @@ public:
             const auto original=MitmSettings::Load();
             wchar_t originalSkip[32]={};GetPrivateProfileString(L"options",L"MitmSkipUpstreamVerify",L"",originalSkip,32,path);
             wchar_t originalDecrypt[32]={};GetPrivateProfileString(L"options",L"DecryptHTTPS",L"",originalDecrypt,32,path);
+            wchar_t originalRaw[8192]={};GetPrivateProfileSectionW(L"quic_raw",originalRaw,_countof(originalRaw),path);
+            WritePrivateProfileStringW(L"quic_raw",L"Enabled",L"0",path); // Legacy preferences must not gate automatic QUIC.
             wchar_t originalQuic[32]={};GetPrivateProfileString(L"options",L"DecryptQUIC",L"",originalQuic,32,path);
             Require(MitmSettings::SaveDecryptQUIC(false),"start QUIC options test off");
             const bool hadIni=GetFileAttributes(path)!=INVALID_FILE_ATTRIBUTES;
@@ -660,8 +736,13 @@ public:
             options.SendMessage(WM_COMMAND,MAKEWPARAM(1303,BN_CLICKED));
             for(int n=0;n<40;++n){Sleep(10);options.OnTimer(1);}
             Require(!fake.injectionQuic && !MitmSettings::DecryptQUIC(),"QUIC draft does not change injection policy");
+            Require(!options.GetDlgItem(1304) && !options.GetDlgItem(1305),"no raw QUIC checkbox or ALPN input");
+            CRect rawRect;options.GetWindowRect(&rawRect);CImage rawImage;rawImage.Create(rawRect.Width(),rawRect.Height(),32);
+            HDC rawDc=rawImage.GetDC();options.PrintWindow(CDC::FromHandle(rawDc),0);rawImage.ReleaseDC();
+            Require(SUCCEEDED(rawImage.Save(L"build\\qa\\quic-raw-options.png")),"raw options screenshot");
             options.SendMessage(WM_COMMAND,MAKEWPARAM(1301,BN_CLICKED));
             Require(fake.injectionQuic && MitmSettings::DecryptQUIC(),"save publishes QUIC policy for future injections");
+            Require(!fake.settings.contains("quic_raw_enabled") && !fake.settings.contains("quic_raw_alpns"),"automatic QUIC has no manual ALPN settings");
             Require(!options.IsWindowVisible(),"successful save closes options");
             Require(MitmSettings::Load()==changed,"all nine settings persisted to ini");
             Require(MitmSettings::DecryptHTTPS() && !fake.enabled,"Save persists decryption preference without starting interception");
@@ -708,8 +789,42 @@ public:
             WritePrivateProfileString(L"options",L"MitmSkipUpstreamVerify",originalSkip[0] ? originalSkip : nullptr,path);
             WritePrivateProfileString(L"options",L"DecryptHTTPS",originalDecrypt[0] ? originalDecrypt : nullptr,path);
             WritePrivateProfileString(L"options",L"DecryptQUIC",originalQuic[0] ? originalQuic : nullptr,path);
+            WritePrivateProfileSectionW(L"quic_raw",originalRaw[0]?originalRaw:nullptr,path);
             if(!hadIni) Require(DeleteFile(path)!=FALSE,"remove owned harness ini");
             page.ApplyMonitorSettings();fake.caOk=false;
+        }
+        {
+            const CString path=Localization::SettingsPath();
+            wchar_t original[32768]={};GetPrivateProfileSectionW(L"recording",original,_countof(original),path);
+            const bool originalEnabled=RecordingSettings::Load().enabled;
+            auto values=RecordingSettings::Load();values.enabled=false;values.directory=L"D:\\capture-test";values.capacityMiB=128;values.reserveMiB=32;
+            Require(RecordingSettings::Save(values),"recording initial preferences");
+            CRecordingDialog running(&parent,true,false);Require(running.Create(IDD_RECORDING_OPTIONS,&parent),"running recording options create");
+            running.CheckDlgButton(IDC_RECORDING_ENABLE,BST_CHECKED);running.SendMessage(WM_COMMAND,MAKEWPARAM(IDC_RECORDING_ENABLE,BN_CLICKED));
+            CString hint;running.GetDlgItemText(IDC_RECORDING_HINT,hint);
+            Require(hint==Localization::Get(L"recording.restart_hint"),"enabling recording mid-monitor explains restart is required");
+            running.SendMessage(WM_COMMAND,IDCANCEL);running.DestroyWindow();
+            Require(!RecordingSettings::Load().enabled,"cancel discards mid-monitor recording draft");
+            CRecordingDialog dialog(&parent,false);Require(dialog.Create(IDD_RECORDING_OPTIONS,&parent),"recording options create");dialog.ShowWindow(SW_SHOW);
+            Require(dialog.IsDlgButtonChecked(IDC_RECORDING_ENABLE)==BST_UNCHECKED,"recording initially off");
+            CRect r;dialog.GetWindowRect(&r);CImage image;image.Create(r.Width(),r.Height(),32);
+            HDC dc=image.GetDC();dialog.PrintWindow(CDC::FromHandle(dc),0);image.ReleaseDC();
+            Require(SUCCEEDED(image.Save(L"build\\qa\\recording-options.png")),"recording options render");
+            dialog.CheckDlgButton(IDC_RECORDING_ENABLE,BST_CHECKED);dialog.SetDlgItemInt(IDC_RECORDING_CAPACITY,256);
+            dialog.SendMessage(WM_CLOSE);dialog.DestroyWindow();
+            Require(!RecordingSettings::Load().enabled && RecordingSettings::Load().capacityMiB==128,"X discards recording draft");
+            Require(dialog.Create(IDD_RECORDING_OPTIONS,&parent),"recording options reopen");
+            dialog.CheckDlgButton(IDC_RECORDING_ENABLE,BST_CHECKED);dialog.SetDlgItemInt(IDC_RECORDING_CAPACITY,256);
+            dialog.SendMessage(WM_COMMAND,IDOK);dialog.DestroyWindow();
+            auto saved=RecordingSettings::Load();Require(saved.enabled && saved.capacityMiB==256 && saved.reserveMiB==32 && saved.directory==values.directory,"recording save retains session opt-in and persists other values");
+            Require(MitmSettings::Json(MitmSettings::Load())["recording"]==RecordingSettings::Json(saved),"recording config reaches monitoring start");
+            Require(RecordingSettings::ReadPath(L"Enabled",L"missing")==L"missing","recording opt-in is not written to INI");
+            CheckFreshRecordingProcess();
+            Require(WritePrivateProfileStringW(L"recording",L"Enabled",L"1",path)!=FALSE,"simulate legacy enabled INI");
+            CheckFreshRecordingProcess();
+            Require(RecordingSettings::Load().enabled,"another instance does not reset this instance's opt-in");
+            WritePrivateProfileSectionW(L"recording",original[0]?original:nullptr,path);
+            RecordingSettings::SessionEnabled().store(originalEnabled);
         }
         fake.delay=300;page.m_recording=true;page.m_monitor.SetCheck(BST_UNCHECKED);
         const auto finalSequence=fake.count.load()+70;fake.count=finalSequence;
@@ -756,6 +871,14 @@ int main(int argc, char** argv) {
         Require(AfxWinInit(GetModuleHandle(nullptr), nullptr, GetCommandLine(), 0) != FALSE, "MFC init");
         INITCOMMONCONTROLSEX controls = {sizeof(controls), ICC_WIN95_CLASSES}; InitCommonControlsEx(&controls);
         Require(Localization::Initialize() != FALSE, "locale init");
+        if(argc>1 && std::string(argv[1])=="--recording-fresh") {
+            const auto v=RecordingSettings::Load();
+            Require(!v.enabled && v.capacityMiB==256 && v.reserveMiB==32 && v.directory==L"D:\\capture-test","fresh recording preferences");
+            FakeTls fake;fake.caOk=true;fake.caFlags=3;auto job=StartMonitorJob(&fake,false);
+            for(int i=0;i<200 && !job->done.load();++i)Sleep(10);
+            Require(job->done.load() && job->result>=0 && fake.starts==1 && !fake.activeRecording,"fresh monitor start never retains files without opt-in");
+            return 0;
+        }
         // Opt in only on an idle desktop: this check moves the real cursor.
         const bool nativeScroll=argc>1 && std::string(argv[1])=="--native-scroll";
         ProtocolPageHarness::Run(nativeScroll); return 0;

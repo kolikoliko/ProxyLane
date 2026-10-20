@@ -2,6 +2,7 @@
 #include "Localization.h"
 #include "../../third_party/nlohmann/json.hpp"
 #include <array>
+#include "RecordingSettings.h"
 
 namespace MitmSettings {
 struct Field { const char* key; const wchar_t* ini; const wchar_t* label; unsigned initial, minimum, maximum; };
@@ -12,7 +13,7 @@ inline const std::array<Field,9>& Fields() {
         {"history_rows",L"HistoryRows",L"mitm.rows",512,128,10000},
         {"preview_kib",L"PreviewKiB",L"mitm.preview",64,16,1024},
         {"decode_mib",L"DecodeMiB",L"mitm.decode",4,1,64},
-        {"connections",L"Connections",L"mitm.connections",32,1,256},
+        {"connections",L"Connections",L"mitm.connections",128,1,256},
         {"pending_requests",L"PendingRequests",L"mitm.pending",8,1,256},
         {"udp_packets",L"UdpPackets",L"mitm.packets",256,16,4096},
         {"handshake_seconds",L"HandshakeSeconds",L"mitm.timeout",15,5,120},
@@ -40,6 +41,7 @@ inline Values Load(const CString& path=Localization::SettingsPath()) {
 inline nlohmann::json Json(const Values& values) {
     nlohmann::json result=nlohmann::json::object();
     for(size_t i=0;i<values.size();++i) result[Fields()[i].key]=values[i];
+    result["recording"]=RecordingSettings::Json(RecordingSettings::Load());
     return result;
 }
 inline bool Save(const Values& values,const CString& path=Localization::SettingsPath()) {
