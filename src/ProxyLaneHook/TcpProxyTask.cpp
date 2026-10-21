@@ -127,6 +127,7 @@ VOID CTcpProxyTask::OnPeerClosed(CPRCTcpPeer *pPeer)
 
 VOID CTcpProxyTask::EndTask()
 {
+	if (m_pProtocol) m_pProtocol->CloseReason("TCP forwarding task released");
 	delete m_pProtocol;
 	m_pProtocol = NULL;
 	delete m_pMitm;

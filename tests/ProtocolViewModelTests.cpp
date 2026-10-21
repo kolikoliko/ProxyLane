@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
     f.record["connection"]["process_name"] = "curl.exe";
     f.record["connection"]["server_name"] = "ifconfig.io";
     f.record["connection"]["server_port"] = 443;
-    f.record["connection"]["destination"] = "ifconfig.io [127.255.0.1]:443";
+    f.record["connection"]["destination"] = "ifconfig.io:443";
     row = f.row();
     assert(row.process == "curl.exe" && row.destination == "ifconfig.io:443");
     f.record["connection"]["server_name"] = "::1";

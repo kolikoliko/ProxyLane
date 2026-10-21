@@ -312,6 +312,30 @@ fn h2_invalid_continuation_and_hpack_and_length() {
     }
 }
 #[test]
+fn h2_error_goaway_keeps_inflight_streams_and_is_not_a_parser_error() {
+    let mut a=analyzer(Protocol::H2,Limits::default());
+    let offset=h2_start(&mut a);
+    let first=h2_request(1);
+    assert!(a.push(Direction::Client,offset,&first).is_empty());
+    let goaway=frame(7,0,0,&[0,0,0,1,0,0,0,2]);
+    assert!(a.push(Direction::Server,0,&goaway).is_empty());
+    let response=frame(1,5,1,&[0x88]);
+    let done=exchanges(a.push(Direction::Server,goaway.len() as u64,&response));
+    assert_eq!(done.len(),1);assert!(done[0].response.as_ref().unwrap().complete);
+    // A client request raced the GOAWAY. Its entire body must still be captured.
+    let head=frame(1,4,3,&[0x83,0x87,0x84]);
+    assert!(a.push(Direction::Client,offset+first.len() as u64,&head).is_empty());
+    let body=frame(0,1,3,b"late request body");
+    let done=exchanges(a.push(Direction::Client,offset+(first.len()+head.len()) as u64,&body));
+    assert_eq!(done[0].request.as_ref().unwrap().body,b"late request body");
+    assert!(done[0].problem.as_ref().unwrap().contains("GOAWAY"));
+    assert!(a.eof(Direction::Server,true).is_empty());
+    assert!(a.eof(Direction::Client,true).is_empty());
+    let mut empty=analyzer(Protocol::H2,Limits::default());
+    assert!(empty.push(Direction::Server,0,&frame(7,0,0,&[0,0,0,0,0,0,0,2])).is_empty());
+    assert!(empty.eof(Direction::Server,true).is_empty());
+}
+#[test]
 fn h2_reset_goaway_and_partial_frame() {
     for kind in [3, 7] {
         let mut a = analyzer(Protocol::H2, Limits::default());

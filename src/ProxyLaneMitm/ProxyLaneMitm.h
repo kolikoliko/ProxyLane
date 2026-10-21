@@ -5,7 +5,8 @@
 // Dynamically loaded; all sessions belong to the caller's PRC event thread.
 // side 0 = application, side 1 = original destination (after proxy negotiation).
 // Caller must preserve unsent output: peek, Send, consume only Send's byte count.
-#define PLM_ABI_VERSION 9u
+#define PLM_ABI_VERSION 10u
+#define PLM_TRANSPORT_CLOSED 6u
 #define PLM_CONNECTED 5u
 #define PLM_FEED 0u
 #define PLM_PEEK 1u

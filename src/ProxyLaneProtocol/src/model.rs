@@ -7,6 +7,7 @@ pub(crate) type Result<T> = std::result::Result<T, String>;
 /// Identity is supplied by ProxyLane, never inferred from the HTTP payload.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Connection {
+    #[serde(serialize_with="serialize_connection_id")]
     pub id: String,
     pub pid: u32,
     pub process_start: u64,
@@ -35,6 +36,15 @@ pub struct Connection {
     /// Decrypted connection-level QUIC DATAGRAMs, not UDP wire packets or streams.
     #[serde(default, skip_serializing_if="std::ops::Not::not")]
     pub quic_datagrams: bool,
+}
+
+// The host reserves bit 63 for QUIC bridge IDs. Keep that internal identity,
+// but use one readable string consistently in events, snapshots and filenames.
+fn serialize_connection_id<S:serde::Serializer>(id:&str,serializer:S)->std::result::Result<S::Ok,S::Error> {
+    match id.parse::<u64>() {
+        Ok(n) if n & (1u64<<63)!=0 => serializer.serialize_str(&format!("quic-{}",n & !(1u64<<63))),
+        _ => serializer.serialize_str(id),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

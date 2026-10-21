@@ -54,13 +54,6 @@ Batch Poll(const Query& query, const std::string& run, uint64_t after, bool base
         if (!server.empty()) {
             if (server.find(':') != std::string::npos && server.front() != '[') server = "[" + server + "]";
             row.destination = server + ":" + std::to_string(connection.value("server_port", 0u));
-        } else {
-            // Compatibility with older captured results: hide the extra IP,
-            // retaining the hostname (or IP-only target) and the actual port.
-            auto ip = row.destination.find(" [");
-            auto port = row.destination.rfind("]:");
-            if (ip != std::string::npos && port != std::string::npos && port > ip)
-                row.destination = row.destination.substr(0, ip) + row.destination.substr(port + 1);
         }
         row.endpoint = row.destination;
         row.protocol = Str(record, "protocol") == "h3" ? "HTTP/3" : Str(record, "protocol") == "h2" ? "HTTP/2" :
@@ -115,7 +108,7 @@ Batch Poll(const Query& query, const std::string& run, uint64_t after, bool base
             // whereas a stream identifies the request throughout its lifetime.
             if (Str(record, "protocol") == "h3")
                 row.key = row.run + ":h3:" + Str(connection, "id") + ":" +
-                    std::to_string(exchange.at("id").get<uint64_t>());
+                    std::to_string(exchange["id"].is_number_integer()?exchange["id"].get<uint64_t>():0);
             StripPayload(exchange["request"]); StripPayload(exchange["response"]);
             for (auto& info : exchange["informational"]) StripPayload(info);
             const auto& req = Object(exchange, "request");
@@ -125,7 +118,7 @@ Batch Poll(const Query& query, const std::string& run, uint64_t after, bool base
             if (row.doh) row.protocol += " / DoH";
             if(req.value("observed_start_unix_ms",uint64_t(0))) row.firstSeenSeconds=req["observed_start_unix_ms"].get<uint64_t>()/1000;
             row.method = Str(req, "method"); row.target = Str(req, "target");
-            std::string authority;
+            std::string authority = Str(Object(Object(record,"summary"),"request"),"authority");
             auto headers = req.find("headers");
             if (headers != req.end()) for (const auto& pair : *headers) {
                 auto name = pair.at(0).get<std::string>();
@@ -154,6 +147,11 @@ Batch Poll(const Query& query, const std::string& run, uint64_t after, bool base
             }
         } else {
             row.status = "Diagnostic"; row.target = Str(record, "detail");
+        }
+        // Retained snapshots have a unique cache ID even before an exchange has
+        // its complete live-protocol identity (e.g. an interrupted header).
+        if(row.run.find("recording:")==0 && record.value("cache_id",uint64_t(0))) {
+            row.cacheId=record["cache_id"].get<uint64_t>();row.key=row.run+":cache:"+std::to_string(row.cacheId);
         }
         row.record = std::move(record);
         row.bytes = row.record.dump().size() + row.target.size() + row.destination.size() + row.processPath.size() + 512;

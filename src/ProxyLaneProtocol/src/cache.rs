@@ -4,6 +4,8 @@ use crate::{cache_directory::RunDirectory, Direction, Headers};
 use serde::{Serialize, Serializer, Deserialize};
 use serde_json::{Value, json};
 use crate::recording::{self, RecordingConfig, Journal, SavedEntry};
+#[path = "cache_preview.rs"]
+mod preview;
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::{self, File, OpenOptions},
@@ -86,6 +88,7 @@ pub(crate) struct BodyInfo {
     pub bodyless: bool,
 }
 struct Ticket {
+    observed_unix_ms: u64,
     context: Value,
     id: u64,
     state: Mutex<CacheSnapshot>,
@@ -225,6 +228,8 @@ enum Answer {
     Payload(CachedPayload),
 }
 enum Command {
+    #[cfg(test)]
+    Pause(mpsc::Sender<()>,mpsc::Receiver<()>),
     Event(Value),
     Finished(Arc<Ticket>),
     Register(Arc<Ticket>),
@@ -232,6 +237,7 @@ enum Command {
     Query(Query, mpsc::Sender<Result<Answer, String>>),
 }
 struct Inner {
+    preview: Arc<preview::Reader>,
     recording: Option<Arc<recording::State>>,
     sender: Mutex<Option<SyncSender<Command>>>,
     worker: Mutex<Option<JoinHandle<Result<(), String>>>>,
@@ -325,6 +331,10 @@ impl PayloadCache {
         }
         let context=json!({"event_type":value["type"],"connection":value["connection"],"cache_id":value["cache_id"]});
         if let Err(e)=self.inner.try_send(Command::Event(value)) {self.inner.resource_failure(e,context);}}}
+    pub(crate) fn connection_event(&self,mut event:Value) {
+        event["connection"]=self.context["connection"].clone();
+        event["protocol"]=self.context["protocol"].clone();self.record(event);
+    }
     pub fn finish_recording(&self)->Result<(),String> {if self.is_recording() {self.inner.query(Query::FinishRecording)?;}Ok(())}
     pub fn stream(&self) -> CacheRef { self.entry() }
     pub fn new(config: CacheConfig) -> Result<Self, String> {
@@ -338,15 +348,23 @@ impl PayloadCache {
         {
             return Err("invalid cache queue/entry count limit".into());
         }
-        let directory = if config.recording.is_some() {RunDirectory::recording(&config.root)} else {RunDirectory::create(&config.root)}.map_err(|e| e.to_string())?;
+        let directory = if config.recording.is_some() {
+            RunDirectory::recording(&config.root).map_err(|e|json!({
+                "error":"recording_directory_error","path":config.root.to_string_lossy(),"detail":e.to_string()
+            }).to_string())?
+        } else {RunDirectory::create(&config.root).map_err(|e|e.to_string())?};
         let path = directory.path.clone();
         let recording=config.recording.as_ref().map(|_|Arc::new(recording::State::default()));
-        let journal=config.recording.clone().map(|c|Journal::new(&path,c,recording.as_ref().unwrap().clone())).transpose()?;
+        let journal=config.recording.clone().map(|c|Journal::new(&path,c,recording.as_ref().unwrap().clone())
+            .map_err(|e|json!({"error":"recording_initialize_error","path":config.root.to_string_lossy(),"detail":e}).to_string())).transpose()?;
         let (sender, receiver) = mpsc::sync_channel(config.queue_chunks);
+        let preview = Arc::new(preview::Reader::new(path.clone(), config.max_entries));
+        let worker_preview = preview.clone();
         let worker = thread::Builder::new()
             .name("protocol-payload-cache".into())
             .spawn(move || {
                 let mut worker = Worker::new(config, directory);
+                worker.preview = Some(worker_preview);
                 worker.journal=journal;
                 let mut checkpoint=Instant::now();
                 loop {
@@ -355,6 +373,8 @@ impl PayloadCache {
                     };
                     if let Some(command)=command {
                     match command {
+                        #[cfg(test)]
+                        Command::Pause(entered,resume)=>{let _=entered.send(());let _=resume.recv();},
                         Command::Event(value)=>worker.event(value),
                         Command::Finished(ticket)=>worker.finished(&ticket),
                         Command::Register(ticket) => {
@@ -390,6 +410,7 @@ impl PayloadCache {
             .map_err(|e| e.to_string())?;
         Ok(Self {
             inner: Arc::new(Inner {
+                preview,
                 recording,
                 sender: Mutex::new(Some(sender)),
                 worker: Mutex::new(Some(worker)),
@@ -406,6 +427,7 @@ impl PayloadCache {
     pub(crate) fn entry(&self) -> CacheRef {
         let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
         let ticket = Arc::new(Ticket {
+            observed_unix_ms: recording::observed_ms(),
             context: self.context.clone(),
             id,
             state: Mutex::new(CacheSnapshot {
@@ -417,6 +439,9 @@ impl PayloadCache {
             pending: AtomicUsize::new(0),
             finished: AtomicU64::new(0),
         });
+        // A list observation can precede disk registration. Publish its empty,
+        // pending state so a click does not report a missing payload file.
+        if self.is_recording() {self.inner.preview.admit(&ticket);}
         if let Err(reason) = self.inner.try_send(Command::Register(ticket.clone())) {
             ticket.stop(reason);
             self.inner.resource_failure(reason,json!({"cache_id":id,"connection":self.context,"operation":"register",
@@ -439,6 +464,13 @@ impl PayloadCache {
             Answer::Status(status) => Ok(status),
             _ => unreachable!(),
         }
+    }
+    /// UI-only reads of published bytes. No analysis/write barrier and no writes.
+    pub fn preview_status(&self, id:u64) -> Result<Value,String> {
+        self.inner.preview.status(id)
+    }
+    pub fn preview_read(&self,id:u64,direction:Direction,offset:u64,length:usize,decode:bool) -> Result<CachedPayload,String> {
+        self.inner.preview.read(id,direction,offset,length,decode)
     }
     /// Read a retained encoded-body range (maximum 1 MiB per call).
     pub fn read(
@@ -503,6 +535,7 @@ struct Record {
     dirty: bool,
 }
 struct Worker {
+    preview: Option<Arc<preview::Reader>>,
     journal: Option<Journal>,
     config: CacheConfig,
     directory: RunDirectory,
@@ -532,7 +565,9 @@ impl Worker {
                 let info=locked(&ticket.info).clone();
                 let stored=self.records.get(&ticket.id).map(|r|r.stored).unwrap_or_default();
                 for side in 0..2 {
+                    let started=Instant::now();
                     crate::recording_decode::run(j,&self.directory.path,ticket.id,side,&info[side],stored[side]);
+                    j.measure(recording::Stage::Decode,started);
                 }
             }
         }
@@ -542,7 +577,9 @@ impl Worker {
         let Some(record)=self.records.get_mut(&id) else {return;};
         if !record.dirty {return;}
         let mut failure=None;
+        let started=Instant::now();
         for f in record.files.iter().flatten() {if let Err(e)=f.sync_data() {failure=Some(format!("recording payload sync failed: {e}"));}}
+        self.journal.as_mut().unwrap().measure(recording::Stage::PayloadSync,started);
         let value=json!({"type":"payload_checkpoint","cache_id":id,"context":record.ticket.context,
             "cache":record.ticket.snapshot(),"info":locked(&record.ticket.info).clone()});
         record.dirty=false;
@@ -566,7 +603,7 @@ impl Worker {
         // A read must not write metadata, consume recording quota, or change a stopped archive.
         if let Some(old)=self.restored.take() {self.records.remove(&old);}
         let stored=[saved.cache.request_bytes,saved.cache.response_bytes];
-        let ticket=Arc::new(Ticket {context:saved.context,state:Mutex::new(saved.cache),info:Mutex::new(saved.info),id,
+        let ticket=Arc::new(Ticket {observed_unix_ms:0,context:saved.context,state:Mutex::new(saved.cache),info:Mutex::new(saved.info),id,
             accepting:AtomicBool::new(false),pending:AtomicUsize::new(0),finished:AtomicU64::new(1)});
         self.records.insert(id,Record {ticket,files:[None,None],stored,stopped:true,dirty:false});
         self.restored=Some(id);
@@ -581,6 +618,7 @@ impl Worker {
         let snapshot=ticket.snapshot();
         self.records.insert(ticket.id,Record {ticket,files:[None,None],
             stored:[snapshot.request_bytes,snapshot.response_bytes],stopped:snapshot.reason.is_some(),dirty:true});
+        if let Some(reader)=&self.preview {reader.publish(self.records[&snapshot.id].ticket.clone());}
         Ok(())
     }
     fn new(config: CacheConfig, directory: RunDirectory) -> Self {
@@ -590,6 +628,7 @@ impl Worker {
             ..CacheStats::default()
         };
         Self {
+            preview: None,
             journal: None,
             config,
             directory,
@@ -626,7 +665,9 @@ impl Worker {
             let entry=SavedEntry {cache:record.ticket.snapshot(),info:locked(&record.ticket.info).clone(),context:record.ticket.context.clone()};
             self.journal.as_mut().unwrap().working_file(&recording::metadata_relative(id),
                 &serde_json::to_vec(&entry).map_err(|e|e.to_string())?)?;
-            self.records.remove(&id);return Ok(());
+            self.records.remove(&id);
+            if let Some(reader)=&self.preview {reader.retire(id);}
+            return Ok(());
         }
         let paths = [self.path(id, 0), self.path(id, 1)];
         let record = self.records.get_mut(&id).unwrap();
@@ -671,7 +712,8 @@ impl Worker {
                 return;
             }
         }
-        if self.journal.is_some() {self.event(json!({"type":"payload_registered","cache_id":ticket.id,"context":ticket.context,
+        if self.directory.retained {if let Some(reader)=&self.preview {reader.publish(ticket.clone());}}
+        if self.journal.is_some() {self.event(json!({"type":"payload_registered","cache_id":ticket.id,"context":ticket.context,"observed_unix_ms":ticket.observed_unix_ms,
             "files":[recording::payload_relative(ticket.id,0),recording::payload_relative(ticket.id,1)]}));}
         self.records.insert(
             ticket.id,
@@ -716,6 +758,7 @@ impl Worker {
         if keep != 0 {
             let path = self.path(ticket.id, side);
             let record = self.records.get_mut(&ticket.id).unwrap();
+            let started=Instant::now();
             let result = (|| -> std::io::Result<()> {
                 if record.files[side].is_none() {
                     if self.directory.retained {fs::create_dir_all(path.parent().unwrap())?;}
@@ -748,6 +791,10 @@ impl Worker {
                 state.response_bytes = record.stored[1];
                 result
             })();
+            if let Some(j)=&mut self.journal {
+                j.measure(recording::Stage::PayloadWrite,started);
+                j.payload_written(ticket.id,side,Some(record.stored[side]));
+            }
             if let Err(error) = result {
                 self.stop(ticket.id, &format!("cache write failed: {error}"));
                 return;
@@ -781,7 +828,7 @@ impl Worker {
             Query::Reference(id)=>{
                 if !self.records.contains_key(&id) || self.restored==Some(id) {
                     let saved:SavedEntry=serde_json::from_slice(&fs::read(self.directory.path.join(recording::metadata_relative(id))).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
-                    let ticket=Arc::new(Ticket {id,context:saved.context,state:Mutex::new(saved.cache.clone()),
+                    let ticket=Arc::new(Ticket {observed_unix_ms:0,id,context:saved.context,state:Mutex::new(saved.cache.clone()),
                         info:Mutex::new(saved.info),accepting:AtomicBool::new(saved.cache.reason.is_none()),
                         pending:AtomicUsize::new(0),finished:AtomicU64::new(u64::from(saved.cache.finished))});
                     self.restore_live(ticket)?;
@@ -823,19 +870,14 @@ impl Worker {
                 // Complete recorded decodes are already validated on disk. A small UI
                 // preview must not re-inflate the entire body or inherit its old size cap.
                 if decode && length!=0 && self.directory.retained {
-                    let metadata=self.directory.path.join(crate::recording_decode::metadata(id,side));
-                    if let Ok(bytes)=fs::read(metadata) {
-                        if let Ok(value)=serde_json::from_slice::<Value>(&bytes) {
-                            if value["state"]=="complete" {
-                                if let (Some(relative),Some(size))=(value["file"].as_str(),value["decoded_bytes"].as_u64()) {
-                                    // Never accept arbitrary paths from a mutable sidecar.
-                                    if relative==recording::payload_relative(id,side) || relative==crate::recording_decode::relative(id,side) {
-                                        let mut data=vec![0;size.min(length as u64) as usize];
-                                        if !data.is_empty() {File::open(self.directory.path.join(relative)).and_then(|mut f|f.read_exact(&mut data)).map_err(|e|e.to_string())?;}
-                                        return Ok(Answer::Payload(CachedPayload {cache:snapshot,direction:if side==0{Direction::Client}else{Direction::Server},
-                                            offset:0,data_base64:data,decoded:true,decoded_bytes:usize::try_from(size).map_err(|_|"decoded size overflow")?,warning:None}));
-                                    }
-                                }
+                    if let Some(value)=crate::recording_view::decode_metadata(&self.directory.path,id,side) {
+                        if value["state"]=="complete" {
+                            if let Some(size)=value["decoded_bytes"].as_u64() {
+                                let relative=if value["reused_source"]==true {recording::payload_relative(id,side)}else{crate::recording_decode::relative(id,side)};
+                                let mut data=vec![0;size.min(length as u64) as usize];
+                                if !data.is_empty() {File::open(self.directory.path.join(relative)).and_then(|mut f|f.read_exact(&mut data)).map_err(|e|e.to_string())?;}
+                                return Ok(Answer::Payload(CachedPayload {cache:snapshot,direction:if side==0{Direction::Client}else{Direction::Server},
+                                    offset:0,data_base64:data,decoded:true,decoded_bytes:usize::try_from(size).map_err(|_|"decoded size overflow")?,warning:None}));
                             }
                         }
                     }
@@ -899,6 +941,45 @@ impl Worker {
 mod tests {
     use super::*;
     #[test]
+    fn recording_previews_read_published_prefix_while_writer_is_paused() {
+        let cache=PayloadCache::new(CacheConfig {
+            root:std::env::temp_dir().join(format!("proxylane-preview-{}-{}",std::process::id(),recording::now_ms())),
+            recording:Some(RecordingConfig{total_bytes:32*1024*1024,min_free_bytes:0}),
+            queue_chunks:2,max_entries:2,..Default::default()
+        }).unwrap();
+        let stream=cache.stream();stream.append_stream(Direction::Server,b"written prefix");
+        cache.stats().unwrap();
+        let (entered,ready)=mpsc::channel();let (resume,wait)=mpsc::channel();
+        locked(&cache.inner.sender).as_ref().unwrap().send(Command::Pause(entered,wait)).unwrap();
+        ready.recv().unwrap();
+        stream.append_stream(Direction::Server,b" queued suffix");
+        let fresh=cache.stream();let fresh_id=fresh.id();
+        let reader=cache.clone();let id=stream.id();let (done,result)=mpsc::channel();
+        let task=thread::spawn(move|| {
+            let status=reader.preview_status(id).unwrap();
+            assert_eq!(status["response_bytes"],14);assert_eq!(status["pending_chunks"],1);
+            let pending=reader.preview_status(fresh_id).unwrap();
+            assert_eq!(pending["response_bytes"],0);assert_eq!(pending["finished"],false);
+            let bytes=reader.preview_read(id,Direction::Server,0,65536,false).unwrap();
+            assert_eq!(bytes.data_base64,b"written prefix");
+            assert!(reader.preview_read(id,Direction::Server,0,1024*1024+1,false).is_err());
+            done.send(()).unwrap();
+        });
+        let immediate=result.recv_timeout(Duration::from_secs(2));
+        resume.send(()).unwrap();task.join().unwrap();
+        assert!(immediate.is_ok(),"UI read queued behind paused recording writer");
+        stream.finish_stream([0,28],true);cache.stats().unwrap();
+        fresh.finish_stream([0,0],true);
+        assert_eq!(cache.preview_read(id,Direction::Server,0,65536,false).unwrap().data_base64,b"written prefix queued suffix");
+        // Retire metadata to disk, then read without restoring it into the writer.
+        for _ in 0..4 {let other=cache.stream();other.append_stream(Direction::Client,b"x");other.finish_stream([1,0],true);}
+        cache.stats().unwrap();
+        assert!(cache.inner.preview.ticket_count()<=2);
+        assert_eq!(cache.preview_read(id,Direction::Server,8,6,false).unwrap().data_base64,b"prefix");
+        cache.finish_recording().unwrap();
+        cache.shutdown().unwrap();
+    }
+    #[test]
     fn slow_disk_concurrent_large_recordings_keep_all_bytes_with_two_slots() {
         let cache=PayloadCache::new(CacheConfig {
             root:std::env::temp_dir().join(format!("proxylane-slow-recording-{}",recording::now_ms())),
@@ -930,6 +1011,7 @@ mod tests {
     fn recording_full_queue_waits_then_keeps_every_byte() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let cache = PayloadCache { context:Value::Null, inner: Arc::new(Inner {
+            preview:Arc::new(preview::Reader::new(PathBuf::new(),1)),
             recording:Some(Arc::new(recording::State::default())), sender:Mutex::new(Some(sender)),
             worker:Mutex::new(None),next:AtomicU64::new(1),completion:AtomicU64::new(1),directory:PathBuf::new(),
         })};

@@ -24,6 +24,22 @@ use std::{
     time::Duration,
 };
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+#[derive(Debug)]
+pub(crate) struct TransportEnd {side:&'static str,error:quinn::ConnectionError}
+impl std::fmt::Display for TransportEnd {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {write!(f,"QUIC {} connection ended: {}",self.side,self.error)}
+}
+impl std::error::Error for TransportEnd {}
+pub(crate) fn transport_end(side:&'static str,error:quinn::ConnectionError)->Box<dyn std::error::Error+Send+Sync> {
+    Box::new(TransportEnd {side,error})
+}
+fn terminal_status(established:bool,error:Option<&(dyn std::error::Error+Send+Sync+'static)>)->&'static str {
+    match error {
+        None=>"Closed",
+        Some(e) if established && e.downcast_ref::<TransportEnd>().is_some_and(|e|matches!(e.error,quinn::ConnectionError::TimedOut))=>"Closed",
+        _=>"Failed",
+    }
+}
 const QUEUE_BYTES: usize = 512 * 1024;
 pub type Notify = extern "C" fn(usize);
 #[derive(Default, Debug)]
@@ -137,6 +153,31 @@ pub struct Live {
     task: tokio::task::JoinHandle<()>,
     error: Arc<Mutex<String>>,
     finished: Arc<AtomicBool>,
+}
+// Owned by the forwarding future, including before its first poll. Aborting the
+// future must retire its visible connection just as a normal return does.
+struct ConnectionLifecycle {
+    runtime: Arc<Runtime>,
+    epoch: u64,
+    identity: Connection,
+    ended: bool,
+    established: bool,
+}
+impl ConnectionLifecycle {
+    fn finish(&mut self, status: &str, problem: &str) {
+        if self.ended { return; }
+        self.ended = true;
+        let protocol = match self.identity.quic_alpn.as_deref() {
+            None => "quic", Some("h3") => "h3", Some(_) => "quic_stream",
+        };
+        self.runtime.lifecycle(self.epoch, &self.identity, status, protocol, problem,
+            self.identity.upstream_verification_skipped);
+    }
+}
+impl Drop for ConnectionLifecycle {
+    fn drop(&mut self) {
+        self.finish("Closed", "QUIC forwarding cancelled: host released the connection before normal shutdown");
+    }
 }
 fn engine() -> Result<&'static tokio::runtime::Runtime> {
     static RT: std::sync::OnceLock<std::result::Result<tokio::runtime::Runtime, String>> =
@@ -257,6 +298,7 @@ impl Live {
             "",
             identity.upstream_verification_skipped,
         );
+        let mut lifecycle = ConnectionLifecycle { runtime: runtime.clone(), epoch, identity, ended: false, established:false };
         let task = engine()?.spawn(async move {
             let mut endpoints = Vec::new();
             let result = serve(
@@ -265,13 +307,14 @@ impl Live {
                 name,
                 runtime.clone(),
                 epoch,
-                &mut identity,
+                &mut lifecycle.identity,
+                &mut lifecycle.established,
                 &mut endpoints,
                 alpns,
             )
             .await;
-            let raw=identity.quic_alpn.as_deref()!=Some("h3");
-            let protocol=if identity.quic_alpn.is_none() {"quic"} else if raw {"quic_stream"} else {"h3"};
+            let raw=lifecycle.identity.quic_alpn.as_deref()!=Some("h3");
+            let status=terminal_status(lifecycle.established,result.as_ref().err().map(|e|e.as_ref()));
             let problem = result.err().map(|e| e.to_string()).unwrap_or_default();
             // Finish connection-close datagrams before publishing finished.
             // Afterwards no producer may append to queues the host is draining.
@@ -288,17 +331,9 @@ impl Live {
                 if let Some(w) = q.read.take() { w.wake(); }
                 if let Some(w) = q.write.take() { w.wake(); }
             }
-            runtime.lifecycle(
-                epoch,
-                &identity,
-                if problem.is_empty() {
-                    "Closed"
-                } else {
-                    "Failed"
-                },
-                protocol,
+            lifecycle.finish(
+                status,
                 &problem,
-                identity.upstream_verification_skipped,
             );
             *err.lock().unwrap() = problem;
             done.store(true, Ordering::Release);
@@ -425,6 +460,7 @@ async fn serve(
     runtime: Arc<Runtime>,
     epoch: u64,
     identity: &mut Connection,
+    established: &mut bool,
     endpoints: &mut Vec<quinn::Endpoint>,
     mut alpns:Vec<Vec<u8>>,
 ) -> Result<()> {
@@ -488,6 +524,7 @@ async fn serve(
         Ok((up,_))=>up,
         Err(e)=>{conn.close(if raw {1u32}else{0x102u32}.into(),b"upstream QUIC handshake failed");return Err(e);}
     };
+    *established=true;
     if raw {
         runtime.lifecycle(epoch,&identity,"Established","quic_stream","",identity.upstream_verification_skipped);
         return crate::quic_raw::serve(conn,up,runtime,epoch,identity,alpn_label(&alpns[0])).await;
@@ -535,6 +572,8 @@ async fn serve(
                     },
                     Err(e)=>{
                         if matches!(conn.close_reason(),Some(quinn::ConnectionError::ApplicationClosed(ref c)) if c.error_code.into_inner()==0 || c.error_code.into_inner()==0x100) {break;}
+                        if let Some(reason)=conn.close_reason(){return Err(transport_end("application",reason));}
+                        if let Some(reason)=up.close_reason(){return Err(transport_end("upstream",reason));}
                         return Err(e.into());
                     }
                 };
@@ -777,6 +816,62 @@ async fn forward(
 #[cfg(test)]
 mod raw_policy_tests {
     use super::*;
+    #[test]
+    fn only_established_transport_timeouts_are_closed() {
+        let timeout=transport_end("application",quinn::ConnectionError::TimedOut);
+        assert_eq!(terminal_status(false,Some(timeout.as_ref())),"Failed");
+        assert_eq!(terminal_status(true,Some(timeout.as_ref())),"Closed");
+        let reset=transport_end("upstream",quinn::ConnectionError::Reset);
+        assert_eq!(terminal_status(true,Some(reset.as_ref())),"Failed");
+        assert_eq!(terminal_status(true,None),"Closed");
+    }
+    #[test]
+    fn cancelled_quic_tasks_retire_once_and_respect_capture_epoch() {
+        use proxylane_protocol::cache::CacheConfig;
+        use serde_json::json;
+        let runtime = Runtime::new(CacheConfig { root: std::env::temp_dir().join("proxylane-quic-cancel-tests"), ..Default::default() }).unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let make = |id: &str| ConnectionLifecycle {
+            runtime: runtime.clone(), epoch: runtime.capture_epoch(),
+            identity: Connection { id: id.into(), transport: "udp".into(), decrypted: true, ..Default::default() }, ended: false, established:false,
+        };
+        // Cancel before the future is polled: its captured guard must still run.
+        let guard = make("1");
+        let task = executor.spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        task.abort();
+        assert!(executor.block_on(task).unwrap_err().is_cancelled());
+        // Cancel an established connection after the negotiated ALPN changed.
+        let mut guard = make("2");
+        let task = executor.spawn(async move {
+            guard.identity.quic_alpn = Some("h3".into());
+            guard.runtime.lifecycle(guard.epoch, &guard.identity, "Established", "h3", "", false);
+            std::future::pending::<()>().await;
+            drop(guard);
+        });
+        executor.block_on(tokio::task::yield_now());
+        task.abort();
+        assert!(executor.block_on(task).unwrap_err().is_cancelled());
+        // Normal error/close must keep its own reason, without a second close.
+        let mut guard = make("3"); guard.finish("Failed", "handshake timeout"); drop(guard);
+        let mut guard = make("4"); guard.finish("Closed", ""); drop(guard);
+        // A late cancellation after stop/restart must not enter the new capture.
+        let guard = make("5"); runtime.stop_capture().unwrap(); runtime.start_capture(); drop(guard);
+        let result = runtime.query(&json!({"type":"poll","limit":64})).unwrap();
+        let rows = result["records"].as_array().unwrap();
+        for (id, protocol) in [("1", "quic"), ("2", "h3")] {
+            let ended: Vec<_> = rows.iter().filter(|r|r["connection"]["id"]==id && r["status"]=="Closed").collect();
+            assert_eq!(ended.len(),1); assert_eq!(ended[0]["protocol"],protocol);
+            assert!(ended[0]["detail"].as_str().unwrap().contains("cancelled"));
+        }
+        assert_eq!(rows.iter().filter(|r|r["connection"]["id"]=="3").count(),1);
+        assert!(rows.iter().any(|r|r["connection"]["id"]=="3" && r["detail"]=="handshake timeout"));
+        assert_eq!(rows.iter().filter(|r|r["connection"]["id"]=="4").count(),1);
+        assert!(!rows.iter().any(|r|r["connection"]["id"]=="5"));
+        runtime.shutdown().unwrap();
+    }
     #[test]
     fn automatic_alpn_preserves_order_and_bytes() {
         let mut probe=crate::quic_probe::Probe::default();probe.version=Some(1);

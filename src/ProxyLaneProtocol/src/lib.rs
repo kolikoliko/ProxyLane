@@ -2,6 +2,10 @@
 //! Optional bounded temporary payload storage; no TLS or socket interception.
 pub mod cache;
 pub mod recording;
+pub mod recording_view;
+mod recording_hot;
+pub mod recording_reader;
+pub mod recording_index;
 mod recording_decode;
 pub mod dns;
 pub mod http3;
@@ -152,6 +156,10 @@ impl Analyzer {
     /// `clean` means an authenticated TLS close_notify (or ordinary TCP EOF
     /// for plaintext). Only EOF-delimited HTTP/1 responses depend on it.
     pub fn eof(&mut self, direction: Direction, clean: bool) -> Vec<Output> {
+        self.eof_with_reason(direction,clean,"capture ended before exchange completed")
+    }
+    /// Preserve the transport's cause when the second EOF drains pending requests.
+    pub fn eof_with_reason(&mut self, direction: Direction, clean: bool, reason:&str) -> Vec<Output> {
         if self.parser.is_none() || self.ended[direction.index()] {
             return Vec::new();
         }
@@ -168,7 +176,7 @@ impl Analyzer {
         }
         let mut out = self.wrap(exchanges);
         if self.ended == [true; 2] {
-            out.extend(self.close());
+            out.extend(self.close_with_reason(reason));
         }
         out
     }

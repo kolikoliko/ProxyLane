@@ -24,6 +24,7 @@ pub(crate) struct Http2 {
     resets: BTreeMap<u32, usize>,
     highest_stream: u32,
     goaway: Option<u32>,
+    goaway_reason: Option<String>,
 }
 fn unpad(mut payload: &[u8], flags: u8) -> Result<&[u8]> {
     if flags & 8 != 0 {
@@ -271,21 +272,26 @@ impl Http2 {
                 }
                 let last = u32::from_be_bytes(payload[..4].try_into().unwrap()) & 0x7fff_ffff;
                 let code = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                self.goaway_reason=Some(format!("HTTP/2 GOAWAY {code} from {} (last stream {last})",if side==0 {"application"}else{"upstream"}));
+                if let Some(cache)=cache {cache.connection_event(serde_json::json!({"type":"http2_goaway","side":side,"last_stream_id":last,"error_code":code}));}
                 if side == 1 {
                     self.goaway = Some(self.goaway.map_or(last, |old| old.min(last)));
                     let ids=self.streams.keys()?;
                     for id in ids {
                         let id=id?;if id<=last as u64 {continue;}
-                        let mut exchange = self.streams.remove(&id)?.unwrap();
+                        let exchange = self.streams.get_mut(&id)?.unwrap();
                         exchange.problem = Some(format!("GOAWAY {code}: stream not processed"));
+                        // A request body may still be in flight on the other leg.
+                        // Retain it until END_STREAM/EOF, even though no response is expected.
+                        if !exchange.request.as_ref().is_some_and(|m|m.complete) {continue;}
+                        let exchange = self.streams.remove(&id)?.unwrap();
                         exchange.finish_cache();
                         if cache.is_some_and(crate::cache::PayloadCache::is_recording) && out.len()>=limits.pending {out.remove(0);}
                         out.push(exchange);
                     }
                 }
-                if code != 0 {
-                    return Err(format!("GOAWAY error {code}"));
-                }
+                // A peer-reported error is a valid frame, not parser failure.
+                // Streams <= last_stream_id may still deliver their final data.
             }
             5 => return Err("HTTP/2 server push not implemented".into()),
             2 if stream == 0 || payload.len() != 5 => return Err("invalid PRIORITY".into()),
@@ -332,9 +338,6 @@ impl Http2 {
             if block.stream <= self.highest_stream {
                 return Err("reused/closed HTTP/2 stream".into());
             }
-            if self.goaway.is_some_and(|last| block.stream > last) {
-                return Err("new stream after GOAWAY".into());
-            }
             if self.streams.limited() {
                 return Err("pending exchange limit".into());
             }
@@ -347,6 +350,9 @@ impl Http2 {
                 },
             )?;
             self.streams.get_mut(&id)?.unwrap().start_cache(cache);
+            if self.goaway.is_some_and(|last| block.stream>last) {
+                self.streams.get_mut(&id)?.unwrap().problem=Some("GOAWAY: request in flight was not processed".into());
+            }
         }
         let exchange = self
             .streams
@@ -434,7 +440,7 @@ impl Http2 {
             return Err("HTTP/2 Content-Length mismatch".into());
         }
         message.complete = true;
-        if exchange.ready() {
+        if exchange.ready() || (side==0 && self.goaway.is_some_and(|last|stream>last)) {
             let exchange = self.streams.remove(&id)?.unwrap();
             exchange.finish_cache();
             out.push(exchange);
@@ -450,6 +456,6 @@ impl Http2 {
         Ok(())
     }
     pub(crate) fn drain(&mut self, reason: &str) -> Vec<Exchange> {
-        self.streams.drain(reason)
+        self.streams.drain(&self.goaway_reason.as_ref().map(|g|format!("{g}; {reason}")).unwrap_or_else(||reason.into()))
     }
 }

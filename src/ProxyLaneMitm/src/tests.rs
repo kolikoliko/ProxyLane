@@ -8,6 +8,34 @@ use std::{
     sync::Arc,
 };
 
+#[path = "tests_ech.rs"]
+mod ech;
+
+#[test]
+fn plaintext_mitm_reset_preserves_bytes_and_transport_close_cause() {
+    let f=Fixture::new();
+    let runtime=protocol::Runtime::new(proxylane_protocol::cache::CacheConfig {
+        root:f.path.join("reset-cause"),recording:Some(proxylane_protocol::recording::RecordingConfig {
+            total_bytes:16*1024*1024,min_free_bytes:0}),..Default::default()
+    }).unwrap();
+    let mut m=f.session();m.enable_protocol(runtime.clone(),proxylane_protocol::Connection{id:"reset".into(),..Default::default()});
+    m.feed(0,b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    m.feed(1,b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nretained-prefix").unwrap();
+    m.input_eof(0).unwrap();
+    m.transport_closed(1,10054);drop(m);
+    runtime.stop_capture().unwrap();
+    let root=std::path::PathBuf::from(runtime.recording_status()["directory"].as_str().unwrap());
+    let events=std::fs::read_to_string(root.join("events-000001.jsonl")).unwrap();
+    assert!(events.contains("upstream TCP transport closed (socket error 10054)"));
+    assert!(!events.contains("transport close cause unavailable"));
+    let row:serde_json::Value=std::fs::read_dir(root.join("payload/000000")).unwrap()
+        .map(|e|e.unwrap().path()).filter(|p|p.extension().is_some_and(|e|e=="json") && !p.to_string_lossy().ends_with(".cache.json"))
+        .map(|p|serde_json::from_slice::<serde_json::Value>(&std::fs::read(p).unwrap()).unwrap())
+        .find(|v|v["type"]=="exchange").unwrap();
+    assert!(row["exchange"]["problem"].as_str().unwrap().contains("socket error 10054"));
+    assert_eq!(std::fs::read(root.join("payload/000000").join(row["payloads"]["response"]["file"].as_str().unwrap())).unwrap(),b"retained-prefix");
+    runtime.shutdown().unwrap();
+}
 #[test]
 fn recording_tls_full_queue_resumes_and_stop_releases_pending_transport() {
     use std::time::{Duration,Instant};
@@ -892,7 +920,8 @@ fn abrupt_tls_eof_silences_application_close_but_never_fakes_clean_close() {
                 assert!(statuses.iter().any(|r| r["status"] == "Closed"), "{result}");
                 assert!(!statuses.iter().any(|r| r["status"] == "Failed"), "{result}");
             } else {
-                assert!(statuses.iter().any(|r| r["status"] == "Failed"), "{result}");
+                assert!(statuses.iter().any(|r| r["status"] == "Closed" && r["detail"].as_str().is_some_and(|s|s.contains("upstream TCP EOF"))), "{result}");
+                assert!(!statuses.iter().any(|r| r["status"] == "Failed"), "{result}");
             }
             runtime.shutdown().unwrap();
         }

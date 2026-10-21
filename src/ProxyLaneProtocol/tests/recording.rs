@@ -4,6 +4,54 @@ use std::{fs,io::Write,path::{Path,PathBuf},process::{Command,Stdio},time::{Dura
 
 fn root()->PathBuf {std::env::temp_dir().join(format!("proxylane-recording-test-{}-{}",std::process::id(),SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()))}
 #[test]
+fn recording_has_data_distinguishes_empty_run_headers_and_raw_payload() {
+    for mode in 0..3 {
+        let cache=PayloadCache::new(config(root(),64*1024*1024)).unwrap();
+        assert_eq!(cache.recording_status()["has_data"],false);
+        if mode==1 {
+            let mut parser=Analyzer::with_cache(Connection::default(),Protocol::Http1,Limits::default(),cache.clone()).unwrap();
+            parser.push(Direction::Client,0,b"GET / HTTP/1.1\r\nHost: test\r\n\r\n");
+            parser.push(Direction::Server,0,b"HTTP/1.1 204 No Content\r\n\r\n");
+        } else {
+            let stream=cache.stream(); // An empty allocated cache is not captured data.
+            if mode==2 {stream.append_stream(Direction::Client,b"raw payload");}
+            stream.finish_stream([if mode==2 {11}else{0},0],true);
+        }
+        cache.finish_recording().unwrap();
+        let status=cache.recording_status();
+        assert_eq!(status["ended"],true);assert_eq!(status["has_data"],mode!=0);
+        let manifest:Value=serde_json::from_slice(&fs::read(cache.directory().join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["has_data"],mode!=0);
+        cache.shutdown().unwrap();
+    }
+}
+#[test]
+fn recording_start_error_identifies_unusable_directory_and_preserves_existing_file() {
+    let base=root();fs::create_dir_all(&base).unwrap();
+    let blocker=base.join("not-a-directory");fs::write(&blocker,b"existing file").unwrap();
+    for location in [blocker.clone(),blocker.join("Recordings")] {
+        let error=match PayloadCache::new(config(location.clone(),64*1024*1024)) {
+            Ok(_)=>panic!("recording must not start on an unusable path"),Err(e)=>e,
+        };
+        let value:Value=serde_json::from_str(&error).unwrap();
+        assert_eq!(value["error"],"recording_directory_error");
+        assert_eq!(value["path"],location.to_string_lossy().as_ref());
+        assert!(value["detail"].as_str().unwrap().contains("directory"));
+        assert_eq!(fs::read(&blocker).unwrap(),b"existing file");
+    }
+    fs::remove_file(blocker).unwrap();fs::remove_dir(base).unwrap();
+}
+#[test]
+fn recording_start_disk_reserve_failure_is_not_reported_as_invalid_path() {
+    let location=root();let mut cfg=config(location.clone(),64*1024*1024);
+    cfg.recording.as_mut().unwrap().min_free_bytes=u64::MAX-1024*1024;
+    let error=match PayloadCache::new(cfg) {Ok(_)=>panic!("reserve must prevent recording"),Err(e)=>e};
+    let value:Value=serde_json::from_str(&error).unwrap();
+    assert_eq!(value["error"],"recording_initialize_error");
+    assert_eq!(value["path"],location.to_string_lossy().as_ref());
+    assert_eq!(value["detail"],"recording disk reserve reached");
+}
+#[test]
 fn one_resident_exchange_reconstructs_http1_pipeline_and_interleaved_http2() {
     for protocol in [Protocol::Http1,Protocol::H2] {
         let mut cfg=config(root(),64*1024*1024);cfg.queue_chunks=2;cfg.max_entries=2;
@@ -72,7 +120,7 @@ fn active_entry_limit_pages_metadata_without_losing_payloads() {
 fn config(root:PathBuf,total:u64)->CacheConfig {CacheConfig {root,entry_bytes:4,total_bytes:8,max_entries:2,queue_chunks:1024,
     recording:Some(RecordingConfig {total_bytes:total,min_free_bytes:0}),..Default::default()}}
 fn events(path:&Path)->Vec<Value> {
-    let mut files:Vec<_>=fs::read_dir(path).unwrap().map(|e|e.unwrap().path()).filter(|p|p.extension().is_some_and(|x|x=="jsonl")).collect();files.sort();
+    let mut files:Vec<_>=fs::read_dir(path).unwrap().map(|e|e.unwrap().path()).filter(|p|p.extension().is_some_and(|x|x=="jsonl") && p.file_name().unwrap().to_string_lossy().starts_with("events-")).collect();files.sort();
     files.into_iter().flat_map(|p|fs::read_to_string(p).unwrap().lines().map(|l|serde_json::from_str(l).unwrap()).collect::<Vec<Value>>()).collect()
 }
 fn size(path:&Path)->u64 {fs::read_dir(path).unwrap().map(|e|{let e=e.unwrap();if e.file_type().unwrap().is_dir(){size(&e.path())}else{e.metadata().unwrap().len()}}).sum()}
@@ -99,7 +147,10 @@ fn headers_and_payload_survive_shutdown_and_ram_retirement() {
     let lines=events(&path);assert_eq!(lines.iter().filter(|v|v["type"]=="exchange_end").count(),8);
     let first=lines.iter().find(|v|v["type"]=="message_head").unwrap();
     assert_eq!(first["context"]["connection"]["pid"],123);
-    assert_eq!(first["message"]["headers"].as_array().unwrap().len(),3);
+    assert!(first["message"].get("headers").is_none());
+    let snapshot:Value=serde_json::from_slice(&fs::read(path.join(first["detail_file"].as_str().unwrap())).unwrap()).unwrap();
+    let headers=fs::read_to_string(path.join("payload/000000").join(snapshot["exchange"]["request"]["headers_file"].as_str().unwrap())).unwrap();
+    assert!(headers.contains("X-Repeat: first\r\nX-Repeat: second") || headers.contains("x-repeat: first\r\nx-repeat: second"));
     for id in 1..=8 {assert_eq!(fs::read(path.join(payload_relative(id,1))).unwrap(),b"hello");}
     let manifest:Value=serde_json::from_slice(&fs::read(path.join("manifest.json")).unwrap()).unwrap();assert_eq!(manifest["status"],"completed");
     // Starting temporary-cache cleanup in the same parent must never remove an archive.
@@ -200,5 +251,13 @@ fn forced_process_exit_keeps_in_progress_headers_and_body() {
     assert!(lines.iter().any(|v|v["type"]=="payload_checkpoint"));
     assert!(!lines.iter().any(|v|v["type"]=="exchange_end"));
     assert_eq!(fs::read(path.join(payload_relative(1,1))).unwrap(),b"already persisted");
+    assert!(proxylane_protocol::recording_reader::Reader::open(&path).err().unwrap().starts_with(recording_index::REQUIRED));
+    let mut view=proxylane_protocol::recording_reader::Reader::rebuild(&path).unwrap();
+    let page=view.query(&serde_json::json!({"type":"recording_page"})).unwrap();
+    assert_eq!(page["total"],1);assert_eq!(page["records"][0]["exchange"]["request"]["target"],"/still-downloading");
+    let detail=view.query(&serde_json::json!({"type":"recording_detail","run_id":view.run,"cache_id":1})).unwrap();
+    assert_eq!(detail["exchange"]["request"]["headers"][0],serde_json::json!(["host","crash.test"]));
+    let payload=view.query(&serde_json::json!({"type":"cache_read","run_id":view.run,"cache_id":1,"direction":"server"})).unwrap();
+    assert_eq!(payload["payload"]["data_base64"],"YWxyZWFkeSBwZXJzaXN0ZWQ=");
     let another=PayloadCache::new(config(root,1024*1024)).unwrap();assert_ne!(another.directory(),path);another.shutdown().unwrap();assert!(path.exists());
 }

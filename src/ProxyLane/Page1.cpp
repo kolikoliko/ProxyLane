@@ -1181,6 +1181,31 @@ BOOL CPage1::IsProxyRunning() const
 	return m_proxyController.IsRunning();
 }
 
+CString CPage1::QuicUdpWarning()
+{
+	if (!m_btnHookUDP.GetSafeHwnd()) return CString();
+	BOOL blocked, hooked;
+	int type;
+	if (IsProxyRunning()) {
+		CSingleLock runtimeLock(&m_runtimeLock, TRUE);
+		if (!m_runtimeSettingsValid) return CString();
+		blocked = m_runtimeSettings.bBlockUDP;
+		hooked = m_runtimeSettings.bHookUDP;
+		type = m_ProxyInfo.GetProxyType();
+	} else {
+		blocked = m_btnBlockUDP.GetCheck() == BST_CHECKED;
+		hooked = m_btnHookUDP.GetCheck() == BST_CHECKED;
+		const int selected = m_cbProxyType.GetCurSel();
+		if (selected == CB_ERR) return CString();
+		CString name; m_cbProxyType.GetLBText(selected, name);
+		ProxyInfo info; info.strProxyType = name; type = info.GetProxyType();
+	}
+	if (blocked) return Localization::Get(L"mitm.quic_udp_blocked");
+	if (!ProxyTransportPolicy::SupportsUdpProxy(type)) return Localization::Get(L"mitm.quic_udp_unsupported");
+	if (!hooked) return Localization::Get(L"mitm.quic_udp_not_captured");
+	return CString();
+}
+
 void CPage1::OnDestroy()
 {
 	CModernDialog::OnDestroy();

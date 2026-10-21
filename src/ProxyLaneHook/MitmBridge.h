@@ -16,6 +16,7 @@ public:
     void OnRead(CPRCTcpPeer* peer, int error);
     void OnWritable();
     void Connected(int error);
+    void TransportClosed(unsigned side, int error);
 private:
     static void __cdecl Observe(uintptr_t user, uint32_t kind, const uint8_t* data, size_t length);
     ULONGLONG m_connection;
@@ -42,6 +43,7 @@ public:
     void Data(unsigned side, const void* bytes, size_t length);
     void Eof(unsigned side);
     void CloseReason(const char* reason);
+    void TransportClosed(unsigned side, int error);
     void Connected(int error);
     static bool Enabled();
     bool IsActive() const { return m_active.load(); }

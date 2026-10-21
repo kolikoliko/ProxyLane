@@ -42,7 +42,8 @@ fn plain(path: &Path, directory: bool) -> std::io::Result<()> {
         }
     }
     if meta.file_type().is_symlink() || meta.is_dir() != directory {
-        return Err(std::io::Error::other("unexpected cache path type"));
+        return Err(std::io::Error::other(format!("expected a regular {}, but found a different path type: {}",
+            if directory {"directory"} else {"file"},path.display())));
     }
     Ok(())
 }

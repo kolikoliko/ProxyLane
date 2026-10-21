@@ -22,6 +22,7 @@ use std::{
 };
 pub(crate) static SKIP_UPSTREAM_VERIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CONTEXT: Mutex<Option<Arc<Context>>> = Mutex::new(None);
+static RECORDING_VIEW: Mutex<Option<proxylane_protocol::recording_reader::Reader>> = Mutex::new(None);
 static PROTOCOL: Mutex<Option<Arc<protocol::Runtime>>> = Mutex::new(None);
 static MONITORING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // Serialize control requests, without holding the runtime slot during stop/drain.
@@ -64,7 +65,7 @@ unsafe fn write_error(output: *mut c_char, capacity: usize, error: &str) {
 }
 #[no_mangle]
 pub extern "C" fn plm_abi_version() -> u32 {
-    9
+    10
 }
 
 #[no_mangle]
@@ -216,6 +217,7 @@ pub unsafe extern "C" fn plm_stream_io(handle: *mut protocol::Tap, op: u32, side
         else if side < 2 {
             if op == 5 && !bytes.is_null() && len<=4096 {(*handle).close_reason(String::from_utf8_lossy(slice::from_raw_parts(bytes,len)).into_owned());}
             else if op == 4 { (*handle).transport_result(len); }
+            else if op == 6 { (*handle).transport_closed(side as usize,len); }
             else if op == 1 { (*handle).eof(side as usize, true); }
             else if op == 3 && !bytes.is_null() && len <= 65535 {
                 (*handle).datagram(side as usize, slice::from_raw_parts(bytes, len));
@@ -301,6 +303,7 @@ pub unsafe extern "C" fn plm_io(
                     | (i32::from(s.recording_pending()) << 9))
             }
             5 => { s.transport_result(len); Ok(0) },
+            6 => { s.transport_closed(side,len); Ok(0) },
             _ => Err("invalid operation".into()),
         }
     })
@@ -311,7 +314,7 @@ pub unsafe extern "C" fn plm_io(
 /// for `capacity` bytes (or null when no output is needed).
 pub unsafe extern "C" fn plm_error(handle: *mut Session, output: *mut c_char, capacity: usize) {
     if !handle.is_null() {
-        write_error(output, capacity, &(*handle).error);
+        write_error(output, capacity, (*handle).reported_error());
     }
 }
 #[no_mangle]
@@ -342,6 +345,22 @@ pub unsafe extern "C" fn plm_protocol(
             return Err("protocol query exceeds 4 KiB".into());
         }
         let request: serde_json::Value = serde_json::from_str(input).map_err(|e| e.to_string())?;
+        if request["type"]=="recording_open" || request["type"]=="recording_close" {
+            let _control=PROTOCOL_CONTROL.lock().map_err(|e|e.to_string())?;
+            if MONITORING.load(std::sync::atomic::Ordering::Acquire) {return Err("Stop monitoring before opening a recording.".into());}
+            let mut view=RECORDING_VIEW.lock().map_err(|e|e.to_string())?;
+            if request["type"]=="recording_close" {*view=None;return Ok("{}".into());}
+            let path=request["path"].as_str().ok_or("missing recording directory")?;
+            let reader=if request["rebuild_index"]==true {
+                proxylane_protocol::recording_reader::Reader::rebuild(std::path::Path::new(path))?
+            }else{proxylane_protocol::recording_reader::Reader::open(std::path::Path::new(path))?};
+            let run=reader.run.clone();*view=Some(reader);
+            return Ok(serde_json::json!({"run_id":run}).to_string());
+        }
+        if request["type"]=="recording_page" || request["type"]=="recording_detail" || request["run_id"].as_str().is_some_and(|s|s.starts_with("recording:")) {
+            let mut view=RECORDING_VIEW.lock().map_err(|e|e.to_string())?;
+            return Ok(view.as_mut().ok_or("No recording is open")?.query(&request)?.to_string());
+        }
         if request["type"]=="quic_locate" {
             return Ok(quic_locator::locate(request["path"].as_str().ok_or("missing module path")?)?.to_string());
         }
@@ -361,6 +380,7 @@ pub unsafe extern "C" fn plm_protocol(
             use std::sync::atomic::Ordering;
             let _control = PROTOCOL_CONTROL.lock().map_err(|e| e.to_string())?;
             if request["type"] == "analysis_start" {
+                if RECORDING_VIEW.lock().map_err(|e|e.to_string())?.is_some() {return Err("Close the recording view before starting monitoring.".into());}
                 // Exclude lazy initialization by arriving connections while the
                 // old runtime is drained and the new recording is constructed.
                 // A failed start must also leave capture disabled.

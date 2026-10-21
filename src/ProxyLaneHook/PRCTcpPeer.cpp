@@ -551,6 +551,10 @@ void CPRCTcpPeer::OnClose(int nErrorCode)
 	}
 
 	ATLTRACE("OnClose! All.sent: %I64d/%I64d, recvd: %I64d/%I64d \r\n", m_DataLenSent, m_pPartner->m_DataLenSent, m_DataLenRecvd, m_pPartner->m_DataLenRecvd);
+	// Metadata only: keep the existing socket shutdown/drain behavior.
+	const unsigned side = m_pProxyLayer ? 1 : 0;
+	if (m_pNotify->m_pProtocol) m_pNotify->m_pProtocol->TransportClosed(side, nErrorCode);
+	if (m_pNotify->m_pMitm) m_pNotify->m_pMitm->TransportClosed(side, nErrorCode);
 
 	m_ppi.errcode = nErrorCode;
 	m_ppi.datafrom = m_pProxyLayer?1:0;;

@@ -21,6 +21,7 @@ pub struct State {
     ended: AtomicBool,
     reason: Mutex<Option<String>>,
     used: AtomicU64,
+    has_data: AtomicBool,
     gaps: AtomicU64,
     fallbacks: AtomicU64,
     analysis_fallbacks: AtomicU64,
@@ -89,6 +90,7 @@ impl State {
     pub fn status(&self, path: &Path) -> Value {
         json!({"enabled":true,"directory":path,"stopped":self.stopped.load(Ordering::Acquire),
             "ended":self.ended.load(Ordering::Acquire),"reason":self.reason(),"used_bytes":self.used.load(Ordering::Acquire),
+            "has_data":self.has_data.load(Ordering::Acquire),
             "quality":self.completeness(),"body_decoding":self.decoding()})
     }
 }
@@ -102,7 +104,7 @@ impl Drop for ObservationTime {fn drop(&mut self){OBSERVED.with(|v|v.set(self.0)
 pub fn payload_relative(id: u64, side: usize) -> String {
     format!("payload/{:06}/{id:012}.{}.bin", id/1000, if side==0 {"request"} else {"response"})
 }
-pub fn metadata_relative(id: u64) -> String { format!("payload/{:06}/{id:012}.json",id/1000) }
+pub fn metadata_relative(id: u64) -> String { format!("payload/{:06}/{id:012}.cache.json",id/1000) }
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct SavedEntry {
@@ -111,8 +113,21 @@ pub(crate) struct SavedEntry {
     pub context: Value,
 }
 
+#[derive(Default, Serialize)]
+struct Timing { calls:u64, total_us:u64, max_us:u64 }
+/// Fixed stage names only. No payloads, per-packet logs, or growing samples.
+#[derive(Clone,Copy)]
+pub(crate) enum Stage { Projection, Replace, Decode, PayloadWrite, PayloadSync, IndexSync, Manifest }
+impl Stage {
+    fn name(self)->&'static str {match self {
+        Self::Projection=>"session_projection",Self::Replace=>"atomic_file_replace",Self::Decode=>"body_decode",
+        Self::PayloadWrite=>"payload_write",Self::PayloadSync=>"payload_sync",Self::IndexSync=>"index_sync",Self::Manifest=>"manifest",
+    }}
+}
+
 pub(crate) struct Journal {
-    root: PathBuf,
+    timings:BTreeMap<&'static str,Timing>,
+    pub(crate) root: PathBuf,
     config: RecordingConfig,
     pub state: Arc<State>,
     file: File,
@@ -126,10 +141,25 @@ pub(crate) struct Journal {
     free_credit: u64,
     space_checked: Instant,
     bytes_since_space_check: u64,
+    list_file: File,
+    list_sequence: u64,
+    list_recent: crate::recording_index::Recent,
+    list_failed: bool,
+    list_lock: Option<File>,
+    hot: crate::recording_hot::HotFiles,
+    payload_sizes: std::collections::BTreeMap<(u64,usize),Option<u64>>,
+    #[cfg(test)]
+    list_disk_full: bool,
 }
 impl Journal {
+    pub(crate) fn measure(&mut self,stage:Stage,start:Instant) {
+        let elapsed=start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        let value=self.timings.entry(stage.name()).or_default();
+        value.calls=value.calls.saturating_add(1);value.total_us=value.total_us.saturating_add(elapsed);value.max_us=value.max_us.max(elapsed);
+    }
     pub fn decode_queued(&mut self) {self.state.decode_queued.fetch_add(1,Ordering::AcqRel);}
-    pub fn decode_update(&mut self,value:Value,terminal:bool)->Result<(),String> {
+    pub fn decode_update(&mut self,mut value:Value,terminal:bool)->Result<(),String> {
+        for key in ["file","source_file"] {if value[key].as_str().is_some_and(|p|!self.root.join(p).is_file()){value[key]=Value::Null;}}
         let mut summary=value.clone();
         if let Some(enc)=summary["encodings"].as_array_mut() {
             enc.truncate(4);
@@ -160,12 +190,19 @@ impl Journal {
         reserve.write_all(&vec![0;RESERVE as usize]).map_err(|e|e.to_string())?;
         reserve.sync_all().map_err(|e|e.to_string())?;
         let file=OpenOptions::new().create_new(true).append(true).open(root.join("events-000001.jsonl")).map_err(|e|e.to_string())?;
+        let list_file=OpenOptions::new().create_new(true).append(true).open(root.join(crate::recording_index::NAME)).map_err(|e|e.to_string())?;
+        let list_lock=OpenOptions::new().create_new(true).read(true).write(true).open(root.join("sessions.index.lock")).map_err(|e|e.to_string())?;
+        fs2::FileExt::try_lock_exclusive(&list_lock).map_err(|e|e.to_string())?;
         state.used.store(README.len() as u64 + RESERVE,Ordering::Release);
         let free_credit=free.saturating_sub(config.min_free_bytes).saturating_sub(2*RESERVE);
-        let mut journal=Self {root:root.to_owned(),config,state,file,volume:1,volume_bytes:0,sequence:0,
+        let mut journal=Self {timings:Default::default(),root:root.to_owned(),config,state,file,volume:1,volume_bytes:0,sequence:0,
             started:now_ms(),manifest_size:0,dirty:false,finalized:false,
             free_credit,
-            space_checked:Instant::now(),bytes_since_space_check:0};
+            space_checked:Instant::now(),bytes_since_space_check:0,
+            list_file,list_sequence:0,list_recent:Default::default(),list_failed:false,list_lock:Some(list_lock),
+            hot:Default::default(),payload_sizes:Default::default(),
+            #[cfg(test)] list_disk_full:false};
+        journal.list_write(json!({"format":"ProxyLaneListIndex","version":1}))?;
         journal.manifest("recording",None)?;
         journal.event(json!({"type":"recording_started"}))?;
         journal.flush()?;
@@ -196,6 +233,9 @@ impl Journal {
         let next_sequence=self.sequence+1;
         value["sequence"]=next_sequence.into(); value["timestamp_unix_ms"]=now_ms().into();
         value["recording_id"]=self.root.file_name().unwrap().to_string_lossy().to_string().into();
+        let started=Instant::now();let projected=crate::recording_view::project(self,&mut value);
+        self.measure(Stage::Projection,started);
+        if let Err(e)=projected {self.list_failed=true;return Err(e);}
         let mut line=serde_json::to_vec(&value).map_err(|e|e.to_string())?;line.push(b'\n');
         self.charge(line.len() as u64)?;
         if self.volume_bytes>0 && self.volume_bytes+line.len() as u64>VOLUME {
@@ -204,19 +244,70 @@ impl Journal {
             self.file=OpenOptions::new().create_new(true).append(true).open(self.root.join(format!("events-{:06}.jsonl",self.volume))).map_err(|e|e.to_string())?;
         }
         self.file.write_all(&line).map_err(|e|format!("recording index write failed: {e}"))?;
+        // Administrative files/events alone do not mean traffic was captured.
+        if matches!(value["type"].as_str(),Some("observation"|"message_head"|"exchange_end"|"websocket_message")) ||
+            (value["type"]=="payload_checkpoint" &&
+                (value["cache"]["request_bytes"].as_u64().unwrap_or(0)>0 || value["cache"]["response_bytes"].as_u64().unwrap_or(0)>0)) {
+            self.state.has_data.store(true,Ordering::Release);
+        }
         self.sequence=next_sequence;
         self.volume_bytes+=line.len() as u64;self.dirty=true;
         Ok(())
     }
-    pub fn working_file(&mut self, relative:&str, data:&[u8]) -> Result<(),String> {
+    pub fn append_file(&mut self, relative:&str, data:&[u8])->Result<(),String> {
+        self.charge(data.len() as u64)?;
         let path=self.root.join(relative);
-        let previous=fs::metadata(&path).map_or(0,|m|m.len());
+        fs::create_dir_all(path.parent().unwrap()).map_err(|e|e.to_string())?;
+        let mut file=OpenOptions::new().create(true).append(true).open(path).map_err(|e|e.to_string())?;
+        file.write_all(data).map_err(|e|e.to_string())
+    }
+    fn list_write(&mut self,value:Value)->Result<(),String> {
+        let bytes=crate::recording_index::line(self.list_sequence,value)?;
+        self.charge(bytes.len() as u64)?;
+        #[cfg(test)]
+        if self.list_disk_full {
+            // Fault injection: a partially written row followed by ERROR_DISK_FULL.
+            self.list_file.write_all(&bytes[..bytes.len()/2]).unwrap();self.list_failed=true;
+            return Err(format!("recording list index write failed: {}",std::io::Error::from_raw_os_error(112)));
+        }
+        if let Err(e)=self.list_file.write_all(&bytes){self.list_failed=true;return Err(format!("recording list index write failed: {e}"));}
+        self.list_sequence+=1;self.dirty=true;Ok(())
+    }
+    pub(crate) fn list_snapshot(&mut self,value:&Value)->Result<(),String> {
+        let Some(summary)=crate::recording_index::summary(value) else{return Ok(());};
+        let key=crate::recording_index::key(&summary)?;
+        let hash=crate::recording_index::checksum(&serde_json::to_vec(&summary).unwrap());
+        if self.list_recent.changed(key,hash){self.list_write(summary)?;} Ok(())
+    }
+    pub fn working_file(&mut self, relative:&str, data:&[u8]) -> Result<(),String> {
+        let started=Instant::now();let result=self.working_file_inner(relative,data);
+        self.measure(Stage::Replace,started);result
+    }
+    pub(crate) fn read_working(&mut self,relative:&str)->std::io::Result<Arc<Vec<u8>>> {
+        if let Some(data)=self.hot.get(relative){return Ok(data);}
+        let data=Arc::new(fs::read(self.root.join(relative))?);self.hot.put(relative,data.clone());Ok(data)
+    }
+    pub(crate) fn payload_written(&mut self,id:u64,side:usize,size:Option<u64>) {
+        if self.payload_sizes.len()>=512 && !self.payload_sizes.contains_key(&(id,side)) {self.payload_sizes.pop_first();}
+        self.payload_sizes.insert((id,side),size);
+    }
+    pub(crate) fn payload_size(&mut self,id:u64,side:usize)->Option<u64> {
+        if let Some(size)=self.payload_sizes.get(&(id,side)){return *size;}
+        let size=fs::metadata(self.root.join(payload_relative(id,side))).ok().map(|m|m.len());
+        self.payload_written(id,side,size);size
+    }
+    fn working_file_inner(&mut self, relative:&str, data:&[u8]) -> Result<(),String> {
+        let path=self.root.join(relative);
+        let cached=self.hot.get(relative);
+        let previous=cached.as_ref().map_or_else(||fs::metadata(&path).map_or(0,|m|m.len()),|b|b.len() as u64);
         if data==b"null" && relative.starts_with("analysis/") {
             // Completed working state is disposable; recorded traffic is not.
             if path.exists() {fs::remove_file(&path).map_err(|e|e.to_string())?;}
             self.state.used.fetch_sub(previous,Ordering::AcqRel);
+            self.hot.remove(relative);
             return Ok(());
         }
+        if cached.as_ref().is_some_and(|b|b.as_slice()==data){return Ok(());}
         // Charge the replacement before writing. Work files count against the
         // same capacity/disk reserve as payloads, not an unbounded side cache.
         self.charge(data.len() as u64)?;
@@ -225,16 +316,31 @@ impl Journal {
         fs::write(&temp,data).map_err(|e|e.to_string())?;
         replace(&temp,&path).map_err(|e|e.to_string())?;
         self.state.used.fetch_sub(previous,Ordering::AcqRel);
+        self.hot.put(relative,Arc::new(data.to_vec()));
         Ok(())
     }
     fn manifest(&mut self, status: &str, reason: Option<String>) -> Result<(),String> {
-        let value=json!({"format":"ProxyLaneRecording","version":1,"recording_id":self.root.file_name().unwrap().to_string_lossy(),
+        let started=Instant::now();let result=self.manifest_inner(status,reason);
+        self.measure(Stage::Manifest,started);result
+    }
+    fn manifest_inner(&mut self, status: &str, reason: Option<String>) -> Result<(),String> {
+        let mut value=json!({"format":"ProxyLaneRecording","version":2,"producer":{"name":"ProxyLane","version":env!("PROXYLANE_PRODUCT_VERSION")},"recording_id":self.root.file_name().unwrap().to_string_lossy(),
             "started_unix_ms":self.started,"updated_unix_ms":now_ms(),"status":status,"stop_reason":reason,
             "last_sequence":self.sequence,"volumes":self.volume,"capacity_bytes":self.config.total_bytes,
             "min_free_bytes":self.config.min_free_bytes,"used_bytes":self.state.used.load(Ordering::Acquire),
-            "events":"events-*.jsonl","readme":"README.txt","quality":self.state.completeness(),
-            "body_decoding":self.state.decoding()});
-        let bytes=serde_json::to_vec_pretty(&value).map_err(|e|e.to_string())?;
+            "events":"events-*.jsonl","readme":"README.txt","list_index":{"file":crate::recording_index::NAME,"version":1},"has_data":self.state.has_data.load(Ordering::Acquire),"quality":self.state.completeness(),
+            "body_decoding":self.state.decoding(),
+            "performance":{"unit":"microseconds","stages":self.timings,
+                "note":"Inclusive worker timings; stages overlap and must not be summed. Final manifest write is excluded."}});
+        // Include this replacement's size, including changes in timing fields
+        // and the digit count of used_bytes itself.
+        let base=self.state.used.load(Ordering::Acquire).saturating_sub(self.manifest_size);
+        let bytes=loop {
+            let bytes=serde_json::to_vec_pretty(&value).map_err(|e|e.to_string())?;
+            let used=base+bytes.len() as u64;
+            if value["used_bytes"].as_u64()==Some(used) {break bytes;}
+            value["used_bytes"]=used.into();
+        };
         // Working/terminal manifest replacements are bounded by the preallocated finish reserve.
         if bytes.len()>8192 { return Err("recording manifest exceeds reserve".into()); }
         let temp=self.root.join("manifest.next");
@@ -249,23 +355,33 @@ impl Journal {
     pub fn flush(&mut self) -> Result<(),String> {
         if self.finalized {return Ok(());}
         self.issues()?;
-        if self.dirty {self.file.sync_data().map_err(|e|format!("recording index sync failed: {e}"))?;self.dirty=false;}
+        if self.dirty {
+            let started=Instant::now();let result=self.file.sync_data().and_then(|_|self.list_file.sync_data());
+            self.measure(Stage::IndexSync,started);
+            result.map_err(|e|format!("recording index sync failed: {e}"))?;self.dirty=false;
+        }
         self.manifest("recording",None)
     }
     pub fn finish(&mut self) -> Result<(),String> {
         if self.finalized {return Ok(());}
         if !self.state.stopped.load(Ordering::Acquire) {if let Err(e)=self.issues() {self.state.stop(&e);}}
+        if !self.list_failed && !self.state.stopped.load(Ordering::Acquire) {
+            if let Err(e)=self.list_write(json!({"end":self.list_sequence})) {self.list_failed=true;self.state.stop(&e);}
+        }
         self.finalized=true;self.state.ended.store(true,Ordering::Release);
         // Release real allocated space for the final manifest even after disk exhaustion.
         if fs::remove_file(self.root.join("finish.reserve")).is_ok() {self.state.used.fetch_sub(RESERVE,Ordering::AcqRel);}
-        let sync=self.file.sync_data().map_err(|e|format!("recording index sync failed: {e}"));
+        let started=Instant::now();
+        let sync=self.file.sync_data().and_then(|_|self.list_file.sync_data()).map_err(|e|format!("recording index sync failed: {e}"));
+        self.measure(Stage::IndexSync,started);
         if let Err(e)=&sync {self.state.stop(e);}
-        self.manifest(if self.state.stopped.load(Ordering::Acquire) {"stopped"}else{"completed"},self.state.reason())?;
+        let manifest=self.manifest(if self.state.stopped.load(Ordering::Acquire) {"stopped"}else{"completed"},self.state.reason());
+        self.list_lock.take();manifest?;
         sync
     }
 }
 
-fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)] { use std::os::windows::ffi::OsStrExt;
         #[link(name="kernel32")] extern "system" {fn MoveFileExW(from:*const u16,to:*const u16,flags:u32)->i32;}
         let a:Vec<u16>=from.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -278,6 +394,32 @@ fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn list_index_disk_full_preserves_details_and_requires_rebuild() {
+        let path=std::env::temp_dir().join(format!("proxylane-list-full-{}-{}",std::process::id(),now_ms()));fs::create_dir_all(&path).unwrap();
+        File::create(path.join("owner.lock")).unwrap();
+        let state=Arc::new(State::default());let mut journal=Journal::new(&path,RecordingConfig{total_bytes:1024*1024,min_free_bytes:0},state.clone()).unwrap();
+        journal.list_disk_full=true;
+        let error=journal.event(json!({"type":"observation","record":{"type":"connection","protocol":"h3","connection":{"id":"quic-29"},"status":"Closed"}})).unwrap_err();
+        assert!(error.contains("list index write failed"));state.stop(&error);journal.finish().unwrap();drop(journal);
+        assert!(path.join("connections/quic-29.json").is_file(),"detail was committed before the failed index write");
+        assert!(crate::recording_reader::Reader::open(&path).err().unwrap().starts_with(crate::recording_index::REQUIRED));
+        let mut reader=crate::recording_reader::Reader::rebuild(&path).unwrap();
+        assert_eq!(reader.query(&json!({"type":"recording_page"})).unwrap()["total"],1);
+        let manifest:Value=serde_json::from_slice(&fs::read(path.join("manifest.json")).unwrap()).unwrap();assert_eq!(manifest["status"],"stopped");
+    }
+    #[test]
+    fn list_index_counts_toward_capacity_and_recent_dedup_is_bounded() {
+        let path=std::env::temp_dir().join(format!("proxylane-list-quota-{}-{}",std::process::id(),now_ms()));fs::create_dir_all(&path).unwrap();
+        let state=Arc::new(State::default());let mut journal=Journal::new(&path,RecordingConfig{total_bytes:1024*1024,min_free_bytes:0},state.clone()).unwrap();
+        let snapshot=json!({"format":"ProxyLaneSession","version":2,"type":"connection","connection":{"id":"1"},"status":"Active"});
+        let before=state.used.load(Ordering::Acquire);journal.list_snapshot(&snapshot).unwrap();
+        let after=state.used.load(Ordering::Acquire);assert!(after>before);
+        journal.list_snapshot(&snapshot).unwrap();assert_eq!(state.used.load(Ordering::Acquire),after);
+        journal.config.total_bytes=after+8192;
+        assert_eq!(journal.list_snapshot(&json!({"format":"ProxyLaneSession","version":2,"type":"connection","connection":{"id":"2"}})).unwrap_err(),"recording capacity reached");
+        journal.finish().unwrap();assert!(state.stopped.load(Ordering::Acquire));
+    }
     #[test]
     fn analysis_quality_is_checkpointed_and_survives_notice_overflow() {
         let path=std::env::temp_dir().join(format!("proxylane-analysis-quality-{}-{}",std::process::id(),now_ms()));

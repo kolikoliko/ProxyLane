@@ -158,8 +158,19 @@ int CMitmControl::QueryProtocol(const char* request, char* output, size_t capaci
         // Always reconcile with the runtime on an explicit start. Proxy shutdown
         // can discard the runtime while the host's monitoring flag is still set.
         if (query) {
-            char response[1024] = {};
-            if (query(start ? "{\"type\":\"analysis_start\"}" : "{\"type\":\"analysis_stop\"}", response, sizeof(response)) < 0) {
+            char response[8192] = {}; // Preserve recording path and error details for the GUI.
+            const int result=query(start ? "{\"type\":\"analysis_start\"}" : "{\"type\":\"analysis_stop\"}", response, sizeof(response));
+            if(stop) {
+                char status[2048]={};const int n=query("{\"type\":\"monitor_stop_status\"}",status,sizeof(status));
+                if(n>0 && n<=sizeof(status)) {
+                    auto timing=nlohmann::json::parse(status,nullptr,false);
+                    if(timing.is_object() && timing.contains("elapsed_ms"))
+                        PrintText(L"Monitor stop %s: total=%I64u ms, analysis=%I64u ms, payload/decode=%I64u ms, finalize=%I64u ms.\r\n",
+                            result<0?L"failed":L"completed",timing.value("elapsed_ms",uint64_t(0)),timing.value("analysis_ms",uint64_t(0)),
+                            timing.value("write_ms",uint64_t(0)),timing.value("finalize_ms",uint64_t(0)));
+                }
+            }
+            if (result < 0) {
                 ++monitorGeneration;enabledMode.store(0);streamMonitoring.store(false);quicEnabled.store(false);
                 if (output && capacity) _snprintf_s(output, capacity, _TRUNCATE, "%s", response);
                 return -1;
@@ -200,7 +211,7 @@ int CMitmControl::QueryProtocol(const char* request, char* output, size_t capaci
         if (output && capacity >= sizeof(reply)) memcpy(output, reply, sizeof(reply));
         return sizeof(reply);
     }
-    if (request && strstr(request, "mitm_options")) LoadMitm();
+    if (request && (strstr(request, "mitm_options") || strstr(request, "recording_open"))) LoadMitm();
     PLM_PROTOCOL_FN query = protocolQuery.load();
     if (query) return query(request, output, capacity);
     const char inactive[] = "{\"type\":\"inactive\"}";
@@ -283,6 +294,12 @@ void CProtocolTap::Connected(int error)
 {
     if (m_handle) m_io(m_handle, 4, 0, NULL, error);
 }
+void CMitmBridge::TransportClosed(unsigned side, int error) {
+    if (m_session) m_io(m_session, PLM_TRANSPORT_CLOSED, side, NULL, error);
+}
+void CProtocolTap::TransportClosed(unsigned side, int error) {
+    if (m_handle) m_io(m_handle, 6, side, NULL, error);
+}
 void CMitmBridge::Fail(int error)
 {
     if (m_failed) return;
@@ -294,7 +311,8 @@ void CMitmBridge::Fail(int error)
     const bool quietClose = error == 0
         && strncmp(text, quietPrefix, sizeof(quietPrefix) - 1) == 0
         && (strstr(text, "(during transfer)") || strstr(text, "(opposite peer already sent close_notify)"));
-    if (!quietClose)
+    const bool echRetry = error == 0 && strncmp(text, "ECH negotiation rejected;", 25) == 0;
+    if (!quietClose && !echRetry)
         PrintText(_T("MITM pid=%lu socket=%I64u failed: %hs (socket error %d).\r\n"),
             m_task->m_PRCClient.dwPid, m_task->m_PRCClient.s, text, error ? error : WSAECONNABORTED);
     m_task->m_pServer->OnClose(error ? error : WSAECONNABORTED);

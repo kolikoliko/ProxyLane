@@ -28,7 +28,8 @@ fn feed(cache:&PayloadCache,encoding:&str,encoded:&[u8],complete:bool)->u64 {
     cache.stats().unwrap();id
 }
 fn state(path:&Path,id:u64)->Value {
-    serde_json::from_slice(&fs::read(path.join(payload_relative(id,1).replace(".bin",".decode.json"))).unwrap()).unwrap()
+    { let mut value=proxylane_protocol::recording_view::decode_metadata(path,id,1).unwrap();
+      for key in ["file","source_file"] { if let Some(name)=value[key].as_str() {value[key]=format!("payload/{:06}/{name}",id/1000).into();} } value }
 }
 #[test]
 fn all_encodings_and_layers_are_fully_recorded_beyond_preview_limits() {
@@ -47,6 +48,8 @@ fn all_encodings_and_layers_are_fully_recorded_beyond_preview_limits() {
         assert_eq!(fs::read(path.join(payload_relative(id,1))).unwrap(),bytes);
         // UI reads a prefix of the already decoded file, not the full body.
         assert_eq!(c.decode_preview(id,Direction::Server,1024,100).unwrap().data_base64,&body[..100]);
+        assert_eq!(c.preview_read(id,Direction::Server,0,100,true).unwrap().data_base64,&body[..100]);
+        assert_eq!(c.preview_status(id).unwrap()["preview_decode"][1]["state"],"complete");
     }
     c.finish_recording().unwrap();
     assert_eq!(c.recording_status()["body_decoding"]["pending"],0);

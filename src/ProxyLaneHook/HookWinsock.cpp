@@ -75,13 +75,21 @@ static BOOL NormalizeSocketAddress(const SOCKADDR *address, int addressLength,
 	return TRUE;
 }
 
-static BOOL IsUdpLoopbackDestination(SOCKET socketHandle,
+BOOL CHookWinsock::IsUdpAllowedLoopback(const _SockAddr& address)
+{
+	// Dummy DNS addresses represent remote hosts, even inside 127.0.0.0/8.
+	return address.IsLoopback() &&
+		!(address.IsIPv4() && m_DummyDNS.IsDummyIP(address.GetdwIP())) &&
+		!(address.IsIPv6() && m_DummyDNS.IsDummyIPv6(address.GetAddr6()));
+}
+
+BOOL CHookWinsock::IsUdpLoopbackDestination(SOCKET socketHandle,
 	const SOCKADDR *destination, int destinationLength)
 {
 	_SockAddr normalized;
 	if (destination)
 		return NormalizeSocketAddress(destination, destinationLength,
-			&normalized) && normalized.IsLoopback();
+			&normalized) && IsUdpAllowedLoopback(normalized);
 
 	SOCKADDR_STORAGE peer;
 	ZeroMemory(&peer, sizeof(peer));
@@ -90,7 +98,7 @@ static BOOL IsUdpLoopbackDestination(SOCKET socketHandle,
 		&peerLength) == SOCKET_ERROR)
 		return FALSE;
 	return NormalizeSocketAddress(reinterpret_cast<SOCKADDR *>(&peer),
-		peerLength, &normalized) && normalized.IsLoopback();
+		peerLength, &normalized) && IsUdpAllowedLoopback(normalized);
 }
 
 static BOOL GetSocketDestination(SOCKET socketHandle,
@@ -973,7 +981,7 @@ CHookWinsock::inhook_connect(SOCKET s, const struct sockaddr FAR * name, int nam
 	int socketTypeLength = sizeof(socketType);
 	if (m_psi.bBlockUDP &&
 		getsockopt(s, SOL_SOCKET, SO_TYPE, (char*)&socketType, &socketTypeLength) == 0 &&
-		socketType == SOCK_DGRAM && !addrname.IsLoopback())
+		socketType == SOCK_DGRAM && !IsUdpAllowedLoopback(addrname))
 	{
 		LogBlockedUDP(s, name, namelen);
 		WSASetLastError(WSAEACCES);
@@ -1031,7 +1039,7 @@ CHookWinsock::inhook_WSAConnect(SOCKET s, const struct sockaddr* name, int namel
 	int socketTypeLength = sizeof(socketType);
 	if (m_psi.bBlockUDP &&
 		getsockopt(s, SOL_SOCKET, SO_TYPE, (char*)&socketType, &socketTypeLength) == 0 &&
-		socketType == SOCK_DGRAM && !addrname.IsLoopback())
+		socketType == SOCK_DGRAM && !IsUdpAllowedLoopback(addrname))
 	{
 		LogBlockedUDP(s, name, namelen);
 		WSASetLastError(WSAEACCES);

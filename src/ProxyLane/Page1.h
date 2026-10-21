@@ -129,6 +129,7 @@ public:
 	BOOL StartProxy(BOOL showErrors);
 	BOOL StopProxy();
 	BOOL IsProxyRunning() const;
+	CString QuicUdpWarning(); // UI thread: active settings, or selected draft while stopped.
 	BOOL ConfirmDiscardUnsavedChanges();
 	BOOL HasUnsavedProfileChanges() const { return m_profileDirty; }
 	void GetSavedProfileNames(std::vector<CString>& names);

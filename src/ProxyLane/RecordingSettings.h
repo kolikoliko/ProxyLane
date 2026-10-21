@@ -24,6 +24,25 @@ inline Values Load() {
     if(v.reserveMiB<16 || v.reserveMiB>1048576)v.reserveMiB=512;
     return v;
 }
+inline CString BrowseDirectory() {
+    auto normalized=[](CString path) {
+        if(path.Left(8)==L"\\\\?\\UNC\\")path=L"\\\\"+path.Mid(8);
+        else if(path.Left(4)==L"\\\\?\\")path=path.Mid(4);
+        path.Replace(L'/',L'\\');
+        wchar_t full[32768]={};DWORD n=GetFullPathNameW(path,_countof(full),full,nullptr);
+        if(n && n<_countof(full))path=full;
+        while(path.GetLength()>3 && path.Right(1)==L"\\")path=path.Left(path.GetLength()-1);
+        return path;
+    };
+    auto exists=[](const CString& path) {DWORD a=GetFileAttributesW(path);return a!=INVALID_FILE_ATTRIBUTES && (a&FILE_ATTRIBUTE_DIRECTORY)!=0;};
+    CString root=normalized(Load().directory);
+    if(!exists(root))root=normalized(DefaultDirectory());
+    CString last=normalized(ReadPath(L"LastDirectory"));
+    // A changed save location must not send the picker back to an old root.
+    CString prefix=root.Right(1)==L"\\"?root:root+L"\\";
+    if(last.GetLength()>prefix.GetLength() && last.Left(prefix.GetLength()).CompareNoCase(prefix)==0 && exists(last))return last;
+    return root;
+}
 inline std::string Utf8(const CString& text) {
     int n=WideCharToMultiByte(CP_UTF8,0,text,text.GetLength(),nullptr,0,nullptr,nullptr);
     std::string out(n,'\0');if(n)WideCharToMultiByte(CP_UTF8,0,text,text.GetLength(),&out[0],n,nullptr,nullptr);return out;

@@ -128,6 +128,8 @@ pub struct Session {
     started: Instant,
     pub error: String,
     drain_error: String,
+    ech_rejected: bool,
+    transport_end: String,
     capture: Option<Capture>,
     protocol_source: Option<(
         Arc<crate::protocol::Runtime>,
@@ -195,6 +197,8 @@ impl Session {
             started: Instant::now(),
             error: String::new(),
             drain_error: String::new(),
+            ech_rejected: false,
+            transport_end: String::new(),
             capture: log,
             protocol_source: None,
             protocol: None,
@@ -226,8 +230,20 @@ impl Session {
         if error == 0 { if self.state == 0 { self.status("Established", ""); } }
         else { self.fail(format!("TCP connection failed: {error}")); }
     }
+    pub fn transport_closed(&mut self,side:usize,error:usize) {
+        self.transport_end=format!("{} TCP transport closed (socket error {error})",Self::side_name(side));
+        if let Some(t)=&self.protocol {t.transport_closed(side,error);}
+        if self.error.is_empty() && self.drain_error.is_empty() {self.status(if self.ready(){"Closed"}else{"Failed"},&self.transport_end.clone());}
+    }
+    pub fn reported_error(&self)->&str {
+        if self.ech_rejected {"ECH negotiation rejected; application may retry without ECH."}else{&self.error}
+    }
     fn status(&mut self, state: &str, problem: &str) {
-        let (state, problem) = if Self::quiet_application_close(problem) {
+        let (state, problem) = if self.ech_rejected {
+            ("Closed", "ECH negotiation rejected; application may retry without ECH.")
+        } else if problem.starts_with("TLS truncated: upstream TCP EOF without close_notify (") && !problem.ends_with("(during handshake)") {
+            ("Closed",problem) // Preserve truncation on individual incomplete messages.
+        } else if Self::quiet_application_close(problem) {
             ("Closed", "")
         } else { (state, problem) };
         if state == self.last_status { return; }
@@ -276,9 +292,11 @@ impl Session {
             self.finish_pending_capture();
             // Close means capture stopped, never fabricate a clean TLS EOF.
             self.status("Failed", &error);
-            if let Some(t)=&self.protocol {t.close_reason(format!("TLS transport failed: {error}"));}
+            if let Some(t)=&self.protocol {t.close_reason(if self.ech_rejected {
+                "ECH negotiation rejected; application may retry without ECH.".into()
+            }else{format!("TLS transport failed: {error}")});}
             self.protocol.take();
-            let _ = self.event(json!({"event":"error", "message":error}));
+            let _ = self.event(json!({"event":if self.ech_rejected {"ech_rejected"}else{"error"}, "message":error}));
             self.error = error;
         }
     }
@@ -511,7 +529,18 @@ impl Session {
                 if connection.read_tls(&mut input).map_err(|e| e.to_string())? == 0 {
                     return Err("TLS input made no progress".into());
                 }
-                connection.process_new_packets().map_err(|e| e.to_string())?
+                match connection.process_new_packets() {
+                    Ok(state)=>state,
+                    Err(e)=>{
+                        // The ECH rejection alert may follow the client's Finished
+                        // record, so is_handshaking() is not a reliable discriminator.
+                        // Match the exact typed alert, never a generic certificate error.
+                        // This does not claim that a subsequent retry succeeded.
+                        self.ech_rejected=side==0
+                            && matches!(e,rustls::Error::AlertReceived(rustls::AlertDescription::EncryptedClientHelloRequired));
+                        return Err(e.to_string());
+                    }
+                }
             };
             if state.peer_has_closed() {
                 if let Some(t)=&self.protocol {t.close_reason(format!("{} TLS close_notify",Self::side_name(side)));}
@@ -688,7 +717,9 @@ impl Session {
             return Ok(());
         }
         if self.state == 1 {
-            if let Some(tap) = &mut self.protocol { tap.eof(side, true); }
+            if let Some(tap) = &mut self.protocol {
+                tap.close_reason(format!("{} TCP EOF",Self::side_name(side)));tap.eof(side, true);
+            }
         }
         self.eof[side] = true;
         self.pump()
@@ -717,7 +748,12 @@ impl Drop for Session {
     fn drop(&mut self) {
         // Teardown must not discard a decoded fragment waiting for recording.
         self.finish_pending_capture();
-        if self.error.is_empty() && self.drain_error.is_empty() { self.status("Closed", ""); }
+        if let Some(t)=&self.protocol {
+            t.close_reason(if !self.transport_end.is_empty(){self.transport_end.clone()}
+                else if self.eof==[true,true]{"Both TCP directions ended".into()}
+                else {"TCP forwarding task released before both directions ended".into()});
+        }
+        if self.error.is_empty() && self.drain_error.is_empty() { self.status("Closed", &self.transport_end.clone()); }
         let error = if Self::quiet_application_close(&self.error) { "" } else { &self.error };
         let _ = self.event(json!({"event":"closed", "state":self.state, "error":error}));
     }

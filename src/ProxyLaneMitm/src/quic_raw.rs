@@ -127,8 +127,8 @@ pub async fn serve(down:quinn::Connection,up:quinn::Connection,runtime:Arc<Runti
     }
     let result=tokio::select! {
         biased;
-        e=down.closed()=>{close_peer(&up,&e);connection_result(e)}
-        e=up.closed()=>{close_peer(&down,&e);connection_result(e)}
+        e=down.closed()=>{close_peer(&up,&e);connection_result("application",e)}
+        e=up.closed()=>{close_peer(&down,&e);connection_result("upstream",e)}
         task=tasks.join_next()=>{task.ok_or("QUIC relay ended")??}
     };
     tasks.abort_all();while tasks.join_next().await.is_some() {}
@@ -141,9 +141,9 @@ fn close_peer(peer:&quinn::Connection,error:&quinn::ConnectionError) {
     if let quinn::ConnectionError::ApplicationClosed(c)=error {peer.close(c.error_code,&c.reason);}
     else {peer.close(1u32.into(),b"QUIC peer transport closed");}
 }
-fn connection_result(error:quinn::ConnectionError)->Result<()> {
+fn connection_result(side:&'static str,error:quinn::ConnectionError)->Result<()> {
     match error {
         quinn::ConnectionError::ApplicationClosed(ref c) if c.error_code==VarInt::from_u32(0)=>Ok(()),
-        _=>Err(error.into())
+        _=>Err(crate::quic_live::transport_end(side,error))
     }
 }

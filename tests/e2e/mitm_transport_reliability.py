@@ -118,6 +118,17 @@ async def run():
             assert report['early_mitm']==report['early_direct'],report
             assert report['early_client_stops_upload']==report['early_direct'],report
             assert report['after_early_other_request'].get('complete'),report
+            bp,idle_bridge=await get_bridge()
+            cc.idle_timeout=.5
+            async with p.connect('127.0.0.1',bp,configuration=cc,create_protocol=Client) as peer:
+                report['before_idle_timeout']=await peer.request('/ok')
+                assert report['before_idle_timeout'].get('complete')
+                await asyncio.sleep(3)
+                rows=engine.query(type='poll',limit=512)['records']
+                closed=[r for r in rows if r.get('type')=='connection' and 'connection ended:' in r.get('detail','')]
+                report['idle_connection_statuses']=[{'status':r.get('status'),'detail':r.get('detail')} for r in closed]
+                assert any(r['status']=='Closed' and 'timed out' in r['detail'].lower() for r in closed),report['idle_connection_statuses']
+            cc.idle_timeout=60
             bp,b=await get_bridge()
             async with p.connect('127.0.0.1',bp,configuration=cc,create_protocol=Client) as peer:
                 inflight=asyncio.create_task(peer.request('/body/8388608',timeout=60))
@@ -134,12 +145,24 @@ async def run():
             assert report['goaway_inflight'].get('complete') and report['goaway_inflight']['bytes']==8388608
             assert report['downstream_goaway_ids'] and min(report['downstream_goaway_ids'])>4,report['downstream_goaway_ids']
             if '--quick' in sys.argv:return
+            # aioquic in this Python harness can be CPU/timer limited on Windows.
+            # Measure the same workload without MITM; keep a finite deadline and
+            # validate every byte instead of treating 90 s as a product SLA.
+            start=time.monotonic()
+            async with p.connect('127.0.0.1',port,configuration=cc,create_protocol=Client) as peer:
+                direct=await asyncio.gather(*(peer.request('/body/16777216',timeout=300) for _ in range(4)))
+            expected=hashlib.sha256(CHUNK*1024).hexdigest()
+            report['direct_4x16MiB']={'seconds':time.monotonic()-start,'responses':direct}
+            assert all(r.get('complete') and r['bytes']==16777216 and r['sha256']==expected for r in direct),direct
+            print('direct bulk',report['direct_4x16MiB']['seconds'],flush=True)
             bp,b=await get_bridge()
             async with p.connect('127.0.0.1',bp,configuration=cc,create_protocol=Client) as peer:
-                rows=await asyncio.gather(*(peer.request('/body/16777216',timeout=90) for _ in range(4)))
+                start=time.monotonic()
+                rows=await asyncio.gather(*(peer.request('/body/16777216',timeout=300) for _ in range(4)))
                 expected=hashlib.sha256(CHUNK*1024).hexdigest()
-                report['concurrent_4x16MiB']={'pass':all(r.get('complete') and r['bytes']==16777216 and r['sha256']==expected for r in rows),'responses':rows}
+                report['concurrent_4x16MiB']={'seconds':time.monotonic()-start,'pass':all(r.get('complete') and r['bytes']==16777216 and r['sha256']==expected for r in rows),'responses':rows}
                 assert report['concurrent_4x16MiB']['pass'],rows
+                print('mitm bulk',report['concurrent_4x16MiB']['seconds'],flush=True)
                 cancelled=set()
                 def cancel(client,sid,count):
                     if count>=65536 and sid not in cancelled:
@@ -161,7 +184,7 @@ async def run():
                         t=time.monotonic();engine.query(type='analysis_stop');stopped.append(time.monotonic()-t)
                         report['stop_snapshot']=engine.query(type='poll',limit=512)['next']
                 peer.when_data=stop
-                report['stop_mid_64MiB']=await peer.request('/body/67108864',timeout=180)
+                report['stop_mid_64MiB']=await peer.request('/body/67108864',timeout=300)
                 report['stop_call_seconds']=stopped;await asyncio.sleep(.3)
                 report['stop_no_new_records']=engine.query(type='poll',limit=512)['next']==report['stop_snapshot']
                 stopped_result=report['stop_mid_64MiB']

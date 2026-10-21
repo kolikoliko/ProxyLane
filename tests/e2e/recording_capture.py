@@ -120,8 +120,10 @@ async def run(mode,limited):
         heads=[e for e in lines if e['type']=='message_head'];assert heads
         assert any(e['context']['connection']['pid']==client.pid and e['context']['connection']['process_name'] for e in heads)
         assert any(e['context']['connection']['process_path'] for e in heads)
-        cid=heads[0]['cache_id'];entry=next(e for e in lines if e['type']=='payload_registered' and e['cache_id']==cid)
-        body=archive/entry['files'][1];saved=body.read_bytes()
+        cid=heads[0]['cache_id']
+        # Registration correctly has null paths until bytes exist. Inspect the
+        # recorded source body, including a prefix preserved after capacity stop.
+        body=archive/f'payload/{cid//1000:06}/{cid:012}.response.bin';saved=body.read_bytes()
         assert hashlib.sha256(saved).hexdigest()==digest(len(saved))
         assert (0<len(saved)<size) if limited else len(saved)==size
         total=sum(f.stat().st_size for f in archive.rglob('*') if f.is_file());assert total<=settings['recording']['capacity_mib']*1024*1024

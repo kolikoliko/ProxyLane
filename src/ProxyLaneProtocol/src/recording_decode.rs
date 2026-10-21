@@ -7,9 +7,6 @@ use std::{fs::{self,File,OpenOptions},io::{self,Read,Write,BufRead,BufReader},pa
 pub fn relative(id:u64,side:usize)->String {
     recording::payload_relative(id,side).replace(".bin",".decoded.bin")
 }
-pub fn metadata(id:u64,side:usize)->String {
-    recording::payload_relative(id,side).replace(".bin",".decode.json")
-}
 fn invalid(message:&str)->io::Error {io::Error::new(io::ErrorKind::InvalidData,message)}
 struct Source {file:File,error:Arc<Mutex<Option<String>>>}
 impl Read for Source {
@@ -99,10 +96,12 @@ pub(crate) fn run(journal:&mut Journal,root:&Path,id:u64,side:usize,info:&BodyIn
     let mut storage_failure=false;
     let source_error=Arc::new(Mutex::new(None));
     let result=(||->Result<(),String>{
-        journal.decode_update(value.clone(),false)?;
-        journal.working_file(&metadata(id,side),&serde_json::to_vec_pretty(&value).unwrap())?;
-        journal.flush()?;
+        // Empty/uncompressed bodies reuse the source already committed by the
+        // writer. There is no long-running decode to checkpoint: publish the
+        // terminal result below, without a transient event + forced journal sync.
         if !compressed {total=stored;return Ok(());}
+        journal.decode_update(value.clone(),false)?;
+        journal.flush()?;
         // Source writes precede Finished on the same queue. Do not read growing data.
         let input:Box<dyn Read>=if stored==0 {Box::new(io::empty())}else {
             Box::new(Source {file:File::open(root.join(&original)).map_err(|e|{storage_failure=true;format!("decode source read failed: {e}")})?,error:source_error.clone()})
@@ -127,7 +126,6 @@ pub(crate) fn run(journal:&mut Journal,root:&Path,id:u64,side:usize,info:&BodyIn
                     output.sync_data().map_err(|e|{storage_failure=true;e.to_string()})?;
                     value["decoded_bytes"]=total.into();
                     journal.decode_update(value.clone(),false)?;
-                    journal.working_file(&metadata(id,side),&serde_json::to_vec_pretty(&value).unwrap())?;
                     journal.flush()?;checkpoint=Instant::now();
                 }
             }
@@ -144,7 +142,4 @@ pub(crate) fn run(journal:&mut Journal,root:&Path,id:u64,side:usize,info:&BodyIn
     // Even if disk/capacity prevents a terminal event, the finishing reserve persists
     // this last result and aggregate counters in manifest.json. Never claim success.
     if let Err(e)=journal.decode_update(value.clone(),true) {journal.state.stop(&e);}
-    if journal.state.accepting() {
-        if let Err(e)=journal.working_file(&metadata(id,side),&serde_json::to_vec_pretty(&value).unwrap()) {journal.state.stop(&e);}
-    }
 }

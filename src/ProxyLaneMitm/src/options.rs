@@ -40,7 +40,8 @@ impl Options {
             return Err("recording capacity/reserve must be between 16 and 1048576 MiB".into());
         }
         if r.enabled && (r.directory.is_empty() || r.directory.len()>2048 || !std::path::Path::new(&r.directory).is_absolute()) {
-            return Err("recording directory must be an absolute path (at most 2048 UTF-8 bytes)".into());
+            return Err(serde_json::json!({"error":"recording_directory_error","path":r.directory,
+                "detail":"Recording directory must be an absolute path (at most 2048 UTF-8 bytes)."}).to_string());
         }
         for (name, value, min, max) in [
             ("entry_mib",self.entry_mib,1,1024), ("total_mib",self.total_mib,16,8192),

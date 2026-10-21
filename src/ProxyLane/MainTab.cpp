@@ -82,6 +82,7 @@ BOOL CMainTab::CreateTabCtrl(CWnd* parent)
 	}
 
 	m_pages[PAGE_PROXY] = &m_page1;
+	m_page4.SetQuicUdpWarningProvider([this]() { return m_page1.QuicUdpWarning(); });
 	m_pages[PAGE_APPLICATIONS] = &m_page3;
 	m_pages[PAGE_LOG] = &m_page2;
 	m_pages[PAGE_MONITOR] = &m_page4;

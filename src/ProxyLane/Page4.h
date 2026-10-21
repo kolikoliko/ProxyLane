@@ -6,9 +6,12 @@
 #include "../ProxyLaneHook/PlatformSupport.h"
 #include <memory>
 #include <vector>
+#include <string>
+#include <functional>
 
 struct MitmJob;
 struct ProtocolPageData;
+namespace ProtocolView { struct Row; }
 class CPage4 : public CModernDialog
 {
     friend class ProtocolPageHarness; // Native-control regression harness.
@@ -17,9 +20,11 @@ public:
     CPage4(CWnd* parent = NULL);
     virtual ~CPage4();
     enum { IDD = IDD_Page4 };
-    void UpdateMonitorStatus();
+    void UpdateMonitorStatus(bool offerRecordingDirectory = false);
     bool IsMonitoring() const { return m_recording; }
+    void SetQuicUdpWarningProvider(std::function<CString()> provider) { m_quicUdpWarning = provider; }
 protected:
+    std::function<CString()> m_quicUdpWarning;
     virtual void DoDataExchange(CDataExchange* dx);
     virtual BOOL OnInitDialog();
     virtual BOOL PreTranslateMessage(MSG* message);
@@ -40,6 +45,7 @@ protected:
     afx_msg void OnCaptureChanged(CWnd*);
     afx_msg void OnClear();
     afx_msg void OnCA();
+    afx_msg void OnOptions();
     afx_msg void OnRecordingOptions();
     afx_msg void OnRequestSelected(NMHDR*, LRESULT*);
     afx_msg void OnRequestInfoTip(NMHDR*, LRESULT*);
@@ -48,6 +54,8 @@ protected:
 private:
     void LayoutControls(int cx, int cy);
     void SetMonitorControls(bool busy);
+    void UpdateStopStatus();
+    DWORD m_stopStarted=0, m_stopStatusPoll=0;
     void OpenCA(bool enableAfterClose);
     void StartMonitoring();
     bool PrepareReconnect(bool decrypt);
@@ -59,6 +67,15 @@ private:
     void InitProtocolColumns();
     void LayoutProtocolView(int x, int y, int width, int height);
     void TickProtocolView();
+    bool IsViewingRecording() const;
+    void UpdateRecordingControls();
+    void QueueRecordingPage(int action, const std::string& path = "");
+    afx_msg void OnOpenRecording();
+    void SetRecordingListMode(bool offline);
+    const ProtocolView::Row* RequestRow(int item) const;
+    afx_msg void OnRequestDisplay(NMHDR*, LRESULT*);
+    CModernButton m_openRecording;
+    CStatic m_recordingViewStatus;
     void ClearProtocolView();
     void ShowProtocolDetail();
     void UpdateDetailTooltip();
@@ -80,11 +97,13 @@ private:
     CString m_detailStatusText;
     std::shared_ptr<ProtocolPageData> m_protocol;
     CButton m_monitor;
-    CModernButton m_clear, m_ca, m_recordOptions;
+    CModernButton m_clear, m_options;
+    CStatic m_recordStatus;
     CFont m_font;
     IProxyTlsControl* m_tls;
     bool m_recording;
     bool m_keepRecordingRequested=false;
+    bool m_retainedRecording=false;
     bool m_recordingGapNotified=false;
     bool m_mitmSupported = ProxySupportsOptionalModules();
     std::shared_ptr<MitmJob> m_job, m_stopJob;

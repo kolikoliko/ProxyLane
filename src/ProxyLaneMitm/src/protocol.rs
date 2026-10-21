@@ -22,6 +22,26 @@ const CONNECTIONS: usize = 128;
 const RECORDS: usize = 256;
 const RECORD_BYTES: usize = 16 * 1024 * 1024;
 const POLL_BYTES: usize = 2 * 1024 * 1024;
+#[derive(Default)]
+struct StopProgress {
+    start:Option<Instant>, phase_start:Option<Instant>, phase:&'static str,
+    analysis_ms:u64, write_ms:u64, finalize_ms:u64, total_ms:u64, error:Option<String>,
+}
+impl StopProgress {
+    fn begin(&mut self) {let now=Instant::now();*self=Self{start:Some(now),phase_start:Some(now),phase:"analysis",..Default::default()};}
+    fn advance(&mut self,phase:&'static str) {
+        let elapsed=self.phase_start.map_or(0,|s|s.elapsed().as_millis() as u64);
+        match self.phase {"analysis"=>self.analysis_ms=elapsed,"writing"=>self.write_ms=elapsed,"finalizing"=>self.finalize_ms=elapsed,_=>()}
+        self.total_ms=self.start.map_or(0,|s|s.elapsed().as_millis() as u64);
+        self.phase=phase;self.phase_start=Some(Instant::now());
+    }
+    fn snapshot(&self)->Value {
+        let active=matches!(self.phase,"analysis"|"writing"|"finalizing");
+        json!({"type":"monitor_stop_status","active":active,"phase":self.phase,
+            "elapsed_ms":if active {self.start.map_or(0,|s|s.elapsed().as_millis() as u64)}else{self.total_ms},
+            "analysis_ms":self.analysis_ms,"write_ms":self.write_ms,"finalize_ms":self.finalize_ms,"error":self.error})
+    }
+}
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -41,6 +61,12 @@ struct Ticket {
     pending: AtomicUsize,
     closed: AtomicBool,
     lost: AtomicBool,
+}
+fn eof_reason(ticket:&Ticket,side:usize,clean:bool)->String {
+    lock(&ticket.close_reason).as_ref().map(|(_,s)|s.clone()).unwrap_or_else(|| {
+        let peer=if side==0 {"application"}else{"upstream"};
+        if clean {format!("{peer} clean transport EOF")}else{format!("{peer} TCP EOF without TLS close_notify")}
+    })
 }
 enum Event {
     Timed(u64,Box<Event>),
@@ -63,6 +89,11 @@ pub enum H3Part { Head(proxylane_protocol::Message), Data(Vec<u8>), End(proxylan
 struct Results {
     archive: Option<PayloadCache>,
     sequence: u64,
+    published: Arc<Mutex<PublishedResults>>,
+}
+#[derive(Default)]
+struct PublishedResults {
+    sequence:u64,
     bytes: usize,
     evicted: u64,
     records: VecDeque<(u64, Value, usize)>,
@@ -80,12 +111,15 @@ impl Results {
                 "connection":value["connection"], "detail":"result exceeds retention limit"});
         }
         let size = serde_json::to_vec(&value).unwrap().len();
-        self.bytes += size;
-        self.records.push_back((self.sequence, value, size));
-        while self.bytes > RECORD_BYTES || self.records.len() > RECORDS {
-            if let Some((_, _, size)) = self.records.pop_front() {
-                self.bytes -= size;
-                self.evicted += 1;
+        // The recording queue may wait above, but never with this UI lock held.
+        let mut published=lock(&self.published);
+        published.sequence=self.sequence;
+        published.bytes += size;
+        published.records.push_back((self.sequence, value, size));
+        while published.bytes > RECORD_BYTES || published.records.len() > RECORDS {
+            if let Some((_, _, size)) = published.records.pop_front() {
+                published.bytes -= size;
+                published.evicted += 1;
             }
         }
     }
@@ -101,6 +135,8 @@ fn record_metadata(mut value:Value)->Value {
 }
 
 pub struct Runtime {
+    published:Arc<Mutex<PublishedResults>>,
+    stop_progress:Mutex<StopProgress>,
     space: Arc<tokio::sync::Notify>,
     pub(crate) options: crate::options::Options,
     sender: SyncSender<Event>,
@@ -136,10 +172,19 @@ impl Runtime {
     }
     pub fn capture_epoch(&self) -> u64 { *lock(&self.capture_epoch) }
     pub fn start_capture(&self) {
+        *lock(&self.stop_progress)=StopProgress::default();
         let mut epoch = lock(&self.capture_epoch);
         if *epoch % 2 == 0 { *epoch += 1; }
     }
     pub fn stop_capture(&self) -> Result<(), String> {
+        lock(&self.stop_progress).begin();
+        let result=self.finish_capture();
+        let mut progress=lock(&self.stop_progress);
+        progress.advance(if result.is_ok(){"complete"}else{"failed"});
+        progress.error=result.as_ref().err().cloned();
+        result
+    }
+    fn finish_capture(&self) -> Result<(), String> {
         // Only close the gate under the producer lock. Never hold it while
         // waiting for analysis or disk I/O: forwarding must keep running.
         {
@@ -150,7 +195,10 @@ impl Runtime {
         self.sender.send(Event::StopCapture(tx).timed()).map_err(|_| "analysis worker unavailable")?;
         rx.recv().map_err(|_| "analysis worker unavailable")?;
         // stats is a FIFO disk-worker barrier, retaining all existing payloads.
-        if let Some(cache) = &self.cache { cache.stats()?;cache.finish_recording()?; }
+        lock(&self.stop_progress).advance("writing");
+        if let Some(cache) = &self.cache { cache.stats()?; }
+        lock(&self.stop_progress).advance("finalizing");
+        if let Some(cache) = &self.cache { cache.finish_recording()?; }
         Ok(())
     }
     pub fn configured() -> Result<Arc<Self>, String> {
@@ -198,6 +246,7 @@ impl Runtime {
             Err(e) => (None, Some(e)),
         };
         let results = Arc::new(Mutex::new(Results {archive:if retained {cache.clone()}else{None},..Default::default()}));
+        let published=lock(&results).published.clone();
         let active = Arc::new(AtomicUsize::new(0));
         let parsers = Arc::new(AtomicUsize::new(0));
         let (sender, receiver) = mpsc::sync_channel(queue);
@@ -222,6 +271,8 @@ impl Runtime {
             })
             .map_err(|e| e.to_string())?;
         Ok(Arc::new(Self {
+            published,
+            stop_progress:Mutex::new(StopProgress::default()),
             space,
             options,
             sender,
@@ -327,20 +378,28 @@ impl Runtime {
     }
     // Query calls belong on a consumer/background thread, never the PRC thread.
     pub fn query(&self, request: &Value) -> Result<Value, String> {
+        // Never queue behind the workers being drained. The GUI can poll this
+        // tiny snapshot even while an analysis/disk barrier is waiting.
+        if request["type"]=="monitor_stop_status" {return Ok(lock(&self.stop_progress).snapshot());}
         if request["type"]=="recording_status" {return Ok(self.recording_status());}
         if self.stopping.load(Ordering::Acquire) {
             return Err("analysis stopped".into());
         }
+        // Only the live GUI opts into eventual, already-published snapshots.
+        // Library callers and stop/finalization keep their existing barriers.
+        let preview=request["live_preview"]==true && self.is_recording();
+        if !preview {
         let (tx, rx) = mpsc::channel();
         self.sender
             .send(Event::Barrier(tx))
             .map_err(|_| "analysis worker unavailable")?;
         rx.recv().map_err(|_| "analysis worker unavailable")?;
+        }
         let kind = request["type"].as_str().ok_or("missing query type")?;
         let result = match kind {
             "stats" => {
-                let cache = self.cache.as_ref().map(PayloadCache::stats).transpose()?;
-                let records = lock(&self.results);
+                let cache = if preview {None}else{self.cache.as_ref().map(PayloadCache::stats).transpose()?};
+                let records = lock(&self.published);
                 json!({"type":"stats", "active_connections":self.active.load(Ordering::Acquire),
                     "active_parsers":self.parsers.load(Ordering::Acquire),
                     "rejected_connections":self.rejected.load(Ordering::Relaxed),
@@ -351,7 +410,7 @@ impl Runtime {
             "poll" => {
                 let after = request["after"].as_u64().unwrap_or(0);
                 let limit = request["limit"].as_u64().unwrap_or(16).clamp(1, 64) as usize;
-                let records = lock(&self.results);
+                let records = lock(&self.published);
                 let mut bytes = 0;
                 let mut output = Vec::new();
                 let mut next = after;
@@ -381,25 +440,28 @@ impl Runtime {
                 let cache = self.cache.as_ref().ok_or("payload cache unavailable")?;
                 let id = request["cache_id"].as_u64().ok_or("missing cache_id")?;
                 if kind == "cache_status" {
-                    json!({"type":"cache_status", "cache":cache.status(id)?})
+                    if preview {json!({"type":"cache_status","cache":cache.preview_status(id)?})}
+                    else {json!({"type":"cache_status", "cache":cache.status(id)?})}
                 } else {
                     let direction: Direction = serde_json::from_value(request["direction"].clone())
                         .map_err(|e| e.to_string())?;
                     let payload = if kind == "cache_read" || kind == "dns_read" {
                         let length =
                             request["length"].as_u64().unwrap_or(65536).min(1024*1024+1) as usize;
-                        cache.read(
+                        if preview {cache.preview_read(id,direction,request["offset"].as_u64().unwrap_or(0),length,false)?}
+                        else {cache.read(
                             id,
                             direction,
                             request["offset"].as_u64().unwrap_or(0),
                             length,
-                        )?
+                        )?}
                     } else {
                         let preview=request["preview_bytes"].as_u64().unwrap_or(65536).clamp(1,1024*1024) as usize;
                         // DNS parsing needs the complete wire message even when the GUI
                         // displays a smaller prefix. Its wire size is bounded to 65535.
-                        cache.decode_preview(id, direction, self.options.decode_mib * 1024 * 1024,
-                            if kind=="doh_read" {preview.max(65535)} else {preview})?
+                        let length=if kind=="doh_read" {preview.max(65535)} else {preview};
+                        if request["live_preview"]==true && self.is_recording() {cache.preview_read(id,direction,0,length,true)?}
+                        else {cache.decode_preview(id, direction, self.options.decode_mib * 1024 * 1024,length)?}
                     };
                     let decoded = if (kind == "dns_read" || kind == "doh_read") && !payload.data_base64.is_empty() {
                         Some(proxylane_protocol::dns::decode(&payload.data_base64).map(|p|p.text))
@@ -517,6 +579,10 @@ impl Tap {
     pub fn is_capturing(&self)->bool { *lock(&self.owner.capture_epoch)==self.epoch && self.epoch%2!=0 && self.accepting() }
     pub fn http3(&self, side:usize, part:H3Part) { self.send(Event::Http3(self.id,side,part,self.ticket.clone())); }
     pub fn close_reason(&self,reason:String) {let mut slot=lock(&self.ticket.close_reason);if slot.is_none(){*slot=Some((proxylane_protocol::recording::observed_ms(),reason));}}
+    pub fn transport_closed(&self,side:usize,error:usize) {
+        *lock(&self.ticket.close_reason)=Some((proxylane_protocol::recording::observed_ms(),
+            format!("{} TCP transport closed (socket error {error})",if side==0 {"application"}else{"upstream"})));
+    }
     pub fn note(&self, note:String) {self.send(Event::Note(self.id,note,self.ticket.clone()));}
     pub fn transport_result(&mut self, error: usize) { self.send(Event::State(self.id,error,self.ticket.clone())); }
     fn accepting(&self) -> bool {
@@ -734,7 +800,7 @@ impl Worker {
                 let side=header[1] as usize;let mut bytes=vec![0;n];file.read_exact(&mut bytes).map_err(|e|e.to_string())?;
                 match header[0] {
                     1=>{self.data(stream,side,offsets[side],&bytes);offsets[side]+=n as u64;}
-                    2=>{if let Some(p)=&mut stream.analyzer {self.output(p.eof(direction(side),bytes==[1]));}}
+                    2=>{if let Some(p)=&mut stream.analyzer {self.output(p.eof_with_reason(direction(side),bytes==[1],&eof_reason(&stream.ticket,side,bytes==[1])));}}
                     3=>self.datagram(stream,side,&bytes),
                     _=>return Err("unknown analysis backlog event".into()),
                 }
@@ -932,7 +998,7 @@ impl Worker {
                         if let Some(c)=&self.cache {c.record(json!({"type":"transport_eof","connection":stream.identity,"side":side,"clean":clean}));}
                         if stream.deferred.is_some() {self.defer(&mut stream,2,side,&[u8::from(clean)]);}
                         if let Some(parser) = &mut stream.analyzer {
-                            if let Some(reason)=self.output(parser.eof(direction(side), clean)) {self.fallback(&mut stream,&reason);}
+                            if let Some(reason)=self.output(parser.eof_with_reason(direction(side), clean,&eof_reason(&stream.ticket,side,clean))) {self.fallback(&mut stream,&reason);}
                         }
                         else { stream.dirty = true; }
                         self.connections.insert(id, stream);
@@ -1025,9 +1091,18 @@ pub fn identity(metadata: &Value, host: &str) -> Result<Connection, String> {
             .as_u64()
             .ok_or_else(|| format!("missing identity: {name}"))
     };
-    let destination = metadata["destination"]
+    let address = metadata["destination"]
         .as_str()
         .ok_or("missing destination")?;
+    let target = if host.is_empty() { address } else { host };
+    let port = u16::try_from(number("port")?).map_err(|e| e.to_string())?;
+    // Preserve the original target separately from any later TLS SNI update.
+    // Bracket IPv6 literals so their colons cannot be confused with the port.
+    let destination = if target.contains(':') && !target.starts_with('[') {
+        format!("[{target}]:{port}")
+    } else {
+        format!("{target}:{port}")
+    };
     let pid = u32::try_from(number("pid")?).map_err(|e| e.to_string())?;
     let process_start = number("process_create_time")?;
     let process_path=process_name(pid,process_start);
@@ -1039,12 +1114,12 @@ pub fn identity(metadata: &Value, host: &str) -> Result<Connection, String> {
         process_path,
         socket: number("socket")?,
         generation: number("socket_generation")?,
-        destination: format!("{host} [{destination}]:{}", number("port")?),
+        destination,
         decrypted: false,
         upstream_verification_skipped: false,
         transport: metadata["transport"].as_str().unwrap_or("tcp").to_owned(),
         server_name: host.to_owned(),
-        server_port: u16::try_from(number("port")?).map_err(|e| e.to_string())?,
+        server_port: port,
         ..Default::default()
     })
 }
@@ -1052,6 +1127,25 @@ pub fn identity(metadata: &Value, host: &str) -> Result<Connection, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn destination_keeps_original_target_and_unambiguous_port() {
+        for transport in ["tcp", "udp"] {
+            for (host, address, expected) in [
+                ("www.bing.com", "127.255.0.4", "www.bing.com:443"),
+                ("150.171.110.136", "150.171.110.136", "150.171.110.136:443"),
+                ("2001:db8::1", "2001:db8::1", "[2001:db8::1]:443"),
+                ("[2001:db8::1]", "2001:db8::1", "[2001:db8::1]:443"),
+                ("fe80::1%12", "fe80::1%12", "[fe80::1%12]:443"),
+                ("", "::1", "[::1]:443"),
+            ] {
+                let metadata = json!({"pid":0,"process_create_time":0,"connection_id":1,
+                    "socket":2,"socket_generation":3,"destination":address,"port":443,"transport":transport});
+                let mut connection = super::identity(&metadata, host).unwrap();
+                connection.server_name = "adsdk.microsoft.com".into();
+                assert_eq!(serde_json::to_value(connection).unwrap()["destination"], expected);
+            }
+        }
+    }
     #[test]
     fn dns_and_quic_live_records_cache_and_identity() {
         let r=Runtime::new(CacheConfig { root:std::env::temp_dir().join("proxylane-live-protocol-tests"),entry_bytes:4096,total_bytes:16384,..Default::default() }).unwrap();
@@ -1234,7 +1328,10 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(2);
         let cache=PayloadCache::new(CacheConfig {root:std::env::temp_dir().join("proxylane-analysis-overload-test"),
             recording:Some(proxylane_protocol::recording::RecordingConfig {total_bytes:1024*1024,min_free_bytes:0}),..Default::default()}).unwrap();
+        let published=Arc::new(Mutex::new(PublishedResults::default()));
         let r = Arc::new(Runtime {
+            published:published.clone(),
+            stop_progress:Mutex::new(StopProgress::default()),
             space:Arc::new(tokio::sync::Notify::new()),
             options:Default::default(),
             sender,
@@ -1245,7 +1342,7 @@ mod tests {
             active: Arc::new(AtomicUsize::new(0)),
             parsers: Arc::new(AtomicUsize::new(0)),
             rejected: AtomicU64::new(0),
-            results: Arc::new(Mutex::new(Results::default())),
+            results: Arc::new(Mutex::new(Results {published,..Default::default()})),
             cache: Some(cache.clone()),
             cache_error: None,
             run_id: "test".into(),
@@ -1458,6 +1555,26 @@ mod tests {
 mod stop_tests {
     use super::*;
     #[test]
+    fn stop_progress_is_readable_while_analysis_is_blocked() {
+        let r=Runtime::new(CacheConfig {root:std::env::temp_dir().join("proxylane-stop-progress"),..Default::default()}).unwrap();
+        let resume=r.pause_worker();let stopped=r.clone();
+        let worker=thread::spawn(move||stopped.stop_capture());
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while !r.query(&json!({"type":"monitor_stop_status"})).unwrap()["active"].as_bool().unwrap() {
+            assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(25));
+        let progress=r.query(&json!({"type":"monitor_stop_status"})).unwrap();
+        assert_eq!(progress["phase"],"analysis");assert!(progress["elapsed_ms"].as_u64().unwrap()>=20);
+        assert!(!worker.is_finished());resume.send(()).unwrap();worker.join().unwrap().unwrap();
+        let progress=r.query(&json!({"type":"monitor_stop_status"})).unwrap();
+        assert_eq!(progress["phase"],"complete");assert_eq!(progress["active"],false);
+        assert!(progress["analysis_ms"].as_u64().unwrap()>=20);
+        assert_eq!(progress,r.query(&json!({"type":"monitor_stop_status"})).unwrap());
+        r.start_capture();assert_eq!(r.query(&json!({"type":"monitor_stop_status"})).unwrap()["elapsed_ms"],0);
+        r.shutdown().unwrap();
+    }
+    #[test]
     fn concurrent_stop_drains_writes_retains_history_and_invalidates_old_taps() {
         let r=Runtime::new(CacheConfig {root:std::env::temp_dir().join("proxylane-stop-race"),..Default::default()}).unwrap();
         let mut tap=r.tap_transport(Connection {id:"race".into(),transport:"udp".into(),..Default::default()},None,false).unwrap();
@@ -1495,8 +1612,35 @@ mod recording_tests {
             recording:Some(proxylane_protocol::recording::RecordingConfig {total_bytes:32*1024*1024,min_free_bytes:0}),..Default::default()},
             crate::options::Options {udp_packets:16,..Default::default()}).unwrap()
     }
+    #[test]
+    fn live_preview_bypasses_analysis_barrier_and_recording_publication_lock() {
+        let r=runtime();
+        let mut tap=r.tap_transport(Connection{id:"preview".into(),transport:"tcp".into(),..Default::default()},None,false).unwrap();
+        tap.data(0,b"SSH-2.0-preview\r\n");
+        let batch=r.query(&json!({"type":"poll"})).unwrap();
+        let id=batch["records"].as_array().unwrap().iter()
+            .find_map(|v|v["stream"]["cache"]["id"].as_u64()).unwrap();
+        r.cache.as_ref().unwrap().stats().unwrap();
+        let resume=r.pause_worker();
+        // This is the lock an observation holds while waiting for disk queue space.
+        let publication=lock(&r.results);
+        let reader=r.clone();let run=r.run_id.clone();let (done,wait)=mpsc::channel();
+        let task=thread::spawn(move|| {
+            assert!(reader.query(&json!({"type":"stats","live_preview":true})).is_ok());
+            assert!(reader.query(&json!({"type":"poll","live_preview":true})).is_ok());
+            let reply=reader.query(&json!({"type":"cache_read","live_preview":true,"run_id":run,
+                "cache_id":id,"direction":"client","length":100})).unwrap();
+            assert_eq!(reply["payload"]["data_base64"],"U1NILTIuMC1wcmV2aWV3DQo=");
+            assert!(reader.query(&json!({"type":"cache_status","live_preview":true,"run_id":"stale","cache_id":id})).is_err());
+            done.send(()).unwrap();
+        });
+        let result=wait.recv_timeout(Duration::from_secs(2));
+        drop(publication);resume.send(()).unwrap();task.join().unwrap();
+        assert!(result.is_ok(),"UI queries waited for analysis/recording instead of reading published snapshots");
+        drop(tap);r.stop_capture().unwrap();r.shutdown().unwrap();
+    }
     fn events(path:&std::path::Path)->Vec<Value> {
-        let mut files:Vec<_>=fs::read_dir(path).unwrap().map(|e|e.unwrap().path()).filter(|p|p.extension().is_some_and(|x|x=="jsonl")).collect();files.sort();
+        let mut files:Vec<_>=fs::read_dir(path).unwrap().map(|e|e.unwrap().path()).filter(|p|p.extension().is_some_and(|x|x=="jsonl") && p.file_name().unwrap().to_string_lossy().starts_with("events-")).collect();files.sort();
         files.into_iter().flat_map(|p|fs::read_to_string(p).unwrap().lines().map(|l|serde_json::from_str(l).unwrap()).collect::<Vec<Value>>()).collect()
     }
     #[test]
@@ -1592,6 +1736,30 @@ mod recording_tests {
         r.shutdown().unwrap();
     }
     #[test]
+    fn deferred_and_live_eof_preserve_close_reason_and_ingress_time() {
+        let r=runtime();let path=PathBuf::from(r.recording_status()["directory"].as_str().unwrap());
+        let mut live=r.tap(Connection{id:"live-eof".into(),..Default::default()},Some(b"http/1.1".to_vec())).unwrap();
+        {let _time=proxylane_protocol::recording::observation_time(1000);live.data(0,b"GET /live HTTP/1.1\r\nHost: test\r\n\r\n");}
+        live.close_reason("upstream TLS close_notify".into());live.eof(1,true);live.eof(0,false);drop(live);
+        r.query(&json!({"type":"stats"})).unwrap();
+        let held:Vec<_>=(0..128).map(|i|r.tap(Connection{id:format!("held-{i}"),..Default::default()},Some(b"h2".to_vec())).unwrap()).collect();
+        let mut delayed=r.tap(Connection{id:"delayed-eof".into(),..Default::default()},Some(b"http/1.1".to_vec())).unwrap();
+        {let _time=proxylane_protocol::recording::observation_time(2000);delayed.data(0,b"GET /delayed HTTP/1.1\r\nHost: test\r\n\r\n");}
+        delayed.close_reason("upstream TLS close_notify".into());delayed.eof(1,true);delayed.eof(0,false);drop(delayed);
+        r.query(&json!({"type":"stats"})).unwrap();drop(held);r.stop_capture().unwrap();
+        let lines=events(&path);assert!(lines.iter().any(|e|e["type"]=="analysis_queued" && e["connection"]["id"]=="delayed-eof"));
+        for (target,time) in [("/live",1000),("/delayed",2000)] {
+            let end=lines.iter().find(|e|e["type"]=="exchange_end" && e["request"]["target"]==target).unwrap();
+            assert_eq!(end["problem"],"upstream TLS close_notify");assert!(end["response"].is_null());
+            let id=end["cache_id"].as_u64().unwrap();
+            let saved:Value=serde_json::from_slice(&fs::read(path.join(proxylane_protocol::recording_view::session_relative(id))).unwrap()).unwrap();
+            assert_eq!(saved["first_observed_unix_ms"],time);assert_eq!(saved["exchange"]["cache"],saved["cache"]);
+            let registered=lines.iter().find(|e|e["type"]=="payload_registered" && e["cache_id"]==id).unwrap();
+            assert_eq!(registered["observed_unix_ms"],time);
+        }
+        assert_eq!(r.recording_status()["quality"]["gap_count"],0);r.shutdown().unwrap();
+    }
+    #[test]
     fn recording_more_than_old_capture_limit_has_no_gaps() {
         let r=runtime();let path=PathBuf::from(r.recording_status()["directory"].as_str().unwrap());let mut taps=Vec::new();
         for id in 0..1050 {
@@ -1643,8 +1811,10 @@ mod recording_tests {
         assert!(lines.iter().any(|v|v["type"]=="observation" && v["record"]["detail"]=="SETTINGS ACK without captured SETTINGS"));
         assert!(lines.iter().any(|v|v["type"]=="exchange_end" && v["request"]["target"]=="/healthy" && v["response"]["complete"]==true));
         let raw=lines.iter().find(|v|v["type"]=="payload_registered" && v["context"]["kind"]=="analysis_fallback").unwrap();
-        assert_eq!(fs::read(path.join(raw["files"][0].as_str().unwrap())).unwrap(),bad);
-        assert_eq!(fs::read(path.join(raw["files"][1].as_str().unwrap())).unwrap(),b"later raw bytes");
+        assert!(raw["files"][0].is_null(),"registration precedes payload creation");
+        let checkpoint=lines.iter().rev().find(|v|v["type"]=="payload_checkpoint" && v["cache_id"]==raw["cache_id"]).unwrap();
+        assert_eq!(fs::read(path.join(checkpoint["files"][0].as_str().unwrap())).unwrap(),bad);
+        assert_eq!(fs::read(path.join(checkpoint["files"][1].as_str().unwrap())).unwrap(),b"later raw bytes");
         assert!(lines.iter().any(|v|v["type"]=="analysis_fallback_chunk" && v["source_offset"]==24));
         let manifest:Value=serde_json::from_slice(&fs::read(path.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest["quality"]["capture_incomplete"],false);

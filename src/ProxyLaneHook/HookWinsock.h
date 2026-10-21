@@ -798,6 +798,8 @@ private:
 	BOOL EnsureRequestPipe();
 	void LogBlockedIPv6(SOCKET socketHandle, const _SockAddr& destination);
 	void LogBlockedUDP(SOCKET socketHandle, const SOCKADDR* destination, int length);
+	BOOL IsUdpAllowedLoopback(const _SockAddr& address);
+	BOOL IsUdpLoopbackDestination(SOCKET socketHandle, const SOCKADDR* destination, int length);
 	CUdpBlockLogLimiter m_udpBlockLogLimiter;
 
 };

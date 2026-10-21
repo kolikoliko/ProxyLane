@@ -26,6 +26,9 @@ public:
     std::atomic<bool> packetPayload{false};
     std::atomic<unsigned> queries{0};
     std::atomic<unsigned> polls{0};
+    std::atomic<bool> livePreviewRequested{false};
+    std::atomic<bool> indexMissing{false};
+    std::atomic<unsigned> indexRebuilds{0};
     std::string processPath;
     FakeTls() {
         wchar_t path[MAX_PATH]={};GetModuleFileNameW(nullptr,path,_countof(path));
@@ -43,10 +46,35 @@ public:
         ++queries;
         using J = ProtocolView::Json;
         auto command = J::parse(request); J reply;
+        if(command.value("live_preview",false)) livePreviewRequested=true;
         std::string type = command.at("type");
         // recording_status is an atomic snapshot; unlike cache reads it never waits for disk.
-        if (delay.load() && type!="recording_status") Sleep(delay.load());
-        if(type=="recording_status") reply={{"enabled",activeRecording},{"ended",false},{"stopped",false},{"directory",activeRecording?"D:/test-recording":""},{"quality",recordingQuality}};
+        if (delay.load() && type!="recording_status" && type!="monitor_stop_status") Sleep(delay.load());
+        if(type=="recording_open" || type=="recording_close") {
+            if(type=="recording_open" && command.value("rebuild_index",false)){++indexRebuilds;indexMissing=false;}
+            if(type=="recording_open" && indexMissing){strcpy_s(output,capacity,"INDEX_REBUILD_REQUIRED: missing test index");return -1;}
+            reply={{"run_id","recording:fake"}};
+        }
+        else if(type=="recording_page" || type=="recording_detail") {
+            const bool detail=type=="recording_detail";
+            auto offset=detail?command.value("cache_id",uint64_t(1))-1:command.value("offset",uint64_t(0));
+            std::vector<char> buffer(65536);J rows=J::array();
+            const bool filter=!command.value("filter",std::string()).empty();
+            if(filter)offset=529;
+            for(int page=0;page<(detail||filter?1:4);++page) {
+                auto input=J{{"type","poll"},{"after",offset+rows.size()}}.dump();
+                int required=QueryProtocol(input.c_str(),buffer.data(),buffer.size());if(required<=0 || required>(int)buffer.size())throw std::runtime_error("fake archive page reply");
+                auto parsed=J::parse(buffer.data());
+                for(auto row:parsed["records"]) {
+                    row["recording_number"]=row["sequence"];
+                    rows.push_back(row);if(detail||filter)break;
+                }
+            }
+            if(detail)reply=rows.at(0);
+            else reply={{"type","records"},{"run_id","recording:fake"},{"records",rows},{"next",0},{"offset",filter?0:offset},{"total",filter?1:count.load()},{"warnings",0},{"manifest",{{"status","completed"}}}};
+        }
+        else if(type=="monitor_stop_status") reply={{"active",true},{"phase","writing"}};
+        else if(type=="recording_status") reply={{"enabled",activeRecording},{"ended",false},{"stopped",false},{"directory",activeRecording?"D:/test-recording":""},{"quality",recordingQuality}};
         else if(type=="quic_injection_policy") {injectionQuic=command.value("enabled",injectionQuic);reply={{"enabled",injectionQuic}};}
         else if (type == "monitor_start") {
             ++starts;lastDecrypt=command.value("decrypt",false);
@@ -69,7 +97,7 @@ public:
                 response["headers"] = J::array({J::array({"content-type", "application/json"}), J::array({"content-encoding", "gzip"})});
                 records.push_back({{"type", "exchange"}, {"sequence", id}, {"protocol", id % 2 ? "http1" : "h2"},
                     {"connection", {{"id", std::to_string(id)}, {"pid", id % 2 ? 1234 : 5678}, {"process_start", id % 2 + 1},
-                        {"socket", id + 99}, {"generation", 1}, {"destination", "ifconfig.test [127.255.0.1]:443"},
+                        {"socket", id + 99}, {"generation", 1}, {"destination", "ifconfig.test:443"},
                         {"process_name", "curl.exe"}, {"process_path",processPath}, {"server_name", "ifconfig.test"}, {"server_port", 443}}},
                     {"exchange", {{"id", id}, {"cache", {{"id", id}}}, {"problem", nullptr}, {"request", request},
                         {"response", response}, {"informational", J::array()}}}});
@@ -143,17 +171,25 @@ public:
             if (done()) return;
             Sleep(10);
         } while (GetTickCount() - start < timeout);
+        std::cerr << "Timeout: offline=" << page.m_protocol->offline << " selected=" << page.m_protocol->selected << " next=" << page.m_protocol->next << " final=" << page.m_protocol->finalPoll << " rows=" << page.m_requests.GetItemCount() << " job=" << (page.m_protocol->job?1:0) << "\n";
         throw std::runtime_error("page worker timeout");
+    }
+    static void Screenshot(CPage4& page,LPCWSTR path) {
+        CRect rect;page.GetClientRect(rect);CImage image;image.Create(rect.Width(),rect.Height(),32);
+        HDC dc=image.GetDC();page.SendMessage(WM_PRINT,(WPARAM)dc,PRF_CLIENT|PRF_CHILDREN|PRF_ERASEBKGND);image.ReleaseDC();
+        Require(SUCCEEDED(image.Save(path)),"toolbar screenshot");
     }
     static void Run(bool nativeScroll) {
         FakeTls fake;
+        QueryFor(&fake)(ProtocolView::Json{{"type","stats"}});
+        Require(fake.livePreviewRequested,"live page queries opt into independent recording previews");
         CWnd parent;
         Require(parent.CreateEx(0, AfxRegisterWndClass(0), L"Protocol page regression", WS_OVERLAPPEDWINDOW,
             CRect(0, 0, 980, 720), nullptr, 0) != FALSE, "create parent");
         CPage4 page(&parent);
         Require(page.Create(IDD_Page4, &parent) != FALSE, "create page");
 #ifndef _WIN64
-        Require(!page.m_mitmSupported && !page.m_monitor.IsWindowEnabled() && !page.m_ca.IsWindowEnabled(),"32-bit host disables MITM and monitoring controls");
+        Require(!page.m_mitmSupported && !page.m_monitor.IsWindowEnabled() && !page.m_options.IsWindowEnabled(),"32-bit host disables MITM and monitoring controls");
         char unsupported[512]={};
         Require(page.m_tls->QueryProtocol("{\"type\":\"mitm_options\",\"skip_upstream_verify\":true}",unsupported,sizeof(unsupported))<0,"32-bit backend rejects persisted options");
         SetEnvironmentVariable(L"PROXYLANE_MITM",L"1");
@@ -195,12 +231,24 @@ public:
             const bool originalEnabled=RecordingSettings::Load().enabled;
             GetPrivateProfileSectionW(L"recording",original,_countof(original),path);WritePrivateProfileSectionW(L"recording",nullptr,path);
             auto values=RecordingSettings::Load();Require(values.capacityMiB==8192,"new default recording capacity is 8 GiB");
+            const CString defaultDirectory=values.directory;
+            wchar_t folder[MAX_PATH]={};GetFullPathNameW(L"build\\qa\\recording-picker",_countof(folder),folder,nullptr);
+            CreateDirectoryW(folder,nullptr);CString recent=CString(folder)+L"\\recording-test";CreateDirectoryW(recent,nullptr);
+            values.directory=folder;Require(RecordingSettings::Save(values),"save picker root");
+            WritePrivateProfileStringW(L"recording",L"LastDirectory",recent,path);
+            Require(RecordingSettings::BrowseDirectory()==recent,"picker preselects recent recording inside configured root");
+            CString other=CString(folder)+L"\\other-root";CreateDirectoryW(other,nullptr);
+            values.directory=other;Require(RecordingSettings::Save(values),"change picker root");
+            Require(RecordingSettings::BrowseDirectory()==other,"picker follows changed root instead of stale last directory");
+            values.directory=CString(folder)+L"\\missing";Require(RecordingSettings::Save(values),"missing picker root");
+            Require(RecordingSettings::BrowseDirectory()==defaultDirectory,"picker falls back to default recording root");
+            values.directory=defaultDirectory;
             values.enabled=true;Require(RecordingSettings::Save(values),"enable recording before first start");
             const auto idleQueries=fake.queries.load();CString idleCaption;
-            page.SetMonitorControls(false);page.OnTimer(1);page.m_recordOptions.GetWindowText(idleCaption);
+            page.SetMonitorControls(false);page.OnTimer(1);page.m_recordStatus.GetWindowText(idleCaption);
             Require(idleCaption==Localization::Get(L"recording.enabled") && fake.queries==idleQueries,"session recording opt-in is visible before monitoring without loading the optional backend");
             values.enabled=false;Require(RecordingSettings::Save(values),"disable idle recording");
-            page.SetMonitorControls(false);page.OnTimer(1);page.m_recordOptions.GetWindowText(idleCaption);
+            page.SetMonitorControls(false);page.OnTimer(1);page.m_recordStatus.GetWindowText(idleCaption);
             Require(idleCaption==Localization::Get(L"recording.disabled") && fake.queries==idleQueries,"idle recording disabled state stays visible across refresh");
             values.enabled=true;Require(RecordingSettings::Save(values),"restore enabled recording for start");
             page.SetMonitorControls(false);
@@ -215,14 +263,25 @@ public:
 
         page.MoveWindow(0, 0, 960, 660); page.ShowWindow(SW_SHOW);
         parent.ShowWindow(SW_SHOWNOACTIVATE);
+        Require(!page.m_openRecording.IsWindowVisible() && !page.m_recordingViewStatus.IsWindowVisible(),"live toolbar has no extra recording row");
+        Require(page.m_recordStatus.IsWindowVisible() && page.m_options.IsWindowVisible(),"recording state remains visible beside single options menu");
+        {
+            CRect status,options;page.m_recordStatus.GetWindowRect(status);page.m_options.GetWindowRect(options);
+            CClientDC dc(&page.m_recordStatus);auto old=dc.SelectObject(page.m_recordStatus.GetFont());CString label;page.m_recordStatus.GetWindowText(label);
+            Require(status.Width()==dc.GetTextExtent(label).cx,"recording status click area exactly fits its text");dc.SelectObject(old);
+            Require(options.left-status.right>20,"toolbar has noninteractive whitespace after status");
+            CPoint blank(status.right+10,status.CenterPoint().y);page.ScreenToClient(&blank);
+            Require(page.ChildWindowFromPoint(blank,CWP_SKIPINVISIBLE|CWP_SKIPDISABLED)!=&page.m_recordStatus,"blank area does not hit recording options status");
+        }
+        Screenshot(page,L"build\\qa\\monitor-toolbar-live.png");
         page.m_recording = true;
         {
             Require(MitmSettings::Defaults()[5]==128,"default concurrent analysis limit is 128");
             fake.activeRecording=true;fake.recordingQuality={{"analysis_deferred_count",1}};
-            page.OnTimer(1);CString caption;page.m_recordOptions.GetWindowText(caption);
+            page.OnTimer(1);CString caption;page.m_recordStatus.GetWindowText(caption);
             Require(caption==Localization::Get(L"recording.active_deferred"),"raw fallback is visible without stopping recording");
             fake.recordingQuality={{"capture_incomplete",true},{"gap_count",1}};page.m_recordingGapNotified=true;
-            page.OnTimer(1);page.m_recordOptions.GetWindowText(caption);
+            page.OnTimer(1);page.m_recordStatus.GetWindowText(caption);
             Require(caption==Localization::Get(L"recording.active_incomplete") && page.m_recording,"recording gap has a persistent warning caption and keeps monitoring");
             fake.activeRecording=false;fake.recordingQuality=nlohmann::json::object();page.m_recordingGapNotified=false;
         }
@@ -629,7 +688,7 @@ public:
             CPage4 legacy(&parent); legacy.m_mitmSupported=false;
             Require(legacy.Create(IDD_Page4,&parent)!=FALSE,"create legacy page");
             legacy.m_tls=&fake; legacy.ShowWindow(SW_SHOW);
-            Require(!legacy.m_monitor.IsWindowEnabled() && !legacy.m_ca.IsWindowEnabled(),"legacy entry points disabled");
+            Require(!legacy.m_monitor.IsWindowEnabled() && !legacy.m_options.IsWindowEnabled(),"legacy entry points disabled");
             const unsigned queries=fake.queries;
             legacy.OnCA();
             legacy.m_monitor.SetCheck(BST_CHECKED); legacy.OnMonitor(); legacy.UpdateMonitorStatus();
@@ -686,6 +745,25 @@ public:
             Require(MitmSettings::SaveDecryptQUIC(false),"start QUIC options test off");
             const bool hadIni=GetFileAttributes(path)!=INVALID_FILE_ATTRIBUTES;
             fake.caOk=true;
+            for(auto key:{L"mitm.quic_udp_blocked",L"mitm.quic_udp_unsupported",L"mitm.quic_udp_not_captured"}) {
+                const CString warning=Localization::Get(key);
+                CMitmCaDialog options(&parent,&fake,false,warning);
+                Require(options.Create(IDD_MITM_CA,&parent),"UDP warning options");options.ShowWindow(SW_SHOW);
+                for(int n=0;n<40;++n){Sleep(10);options.OnTimer(1);}
+                CWnd* label=nullptr;
+                for(CWnd* child=options.GetWindow(GW_CHILD);child;child=child->GetNextWindow()) {
+                    CString text;child->GetWindowText(text);if(text==warning){label=child;break;}
+                }
+                Require(label && !(label->GetStyle()&WS_VISIBLE),"unchecked QUIC hides UDP warning");
+                options.CheckDlgButton(1303,BST_CHECKED);options.SendMessage(WM_COMMAND,MAKEWPARAM(1303,BN_CLICKED));
+                for(int n=0;n<40;++n){Sleep(10);options.OnTimer(1);}
+                Require((label->GetStyle()&WS_VISIBLE)!=0,"checked QUIC shows UDP warning");
+                CRect textRect,heading;label->GetWindowRect(textRect);options.GetDlgItem(IDC_CA_HINT)->GetWindowRect(heading);
+                Require(textRect.Height()>0 && textRect.bottom<=heading.top,"UDP warning does not overlap CA section");
+                options.CheckDlgButton(1303,BST_UNCHECKED);options.SendMessage(WM_COMMAND,MAKEWPARAM(1303,BN_CLICKED));
+                Require(!(label->GetStyle()&WS_VISIBLE),"unchecking QUIC removes UDP warning");
+                options.KillTimer(1);options.DestroyWindow();
+            }
             // Hint follows an actual new decryption choice, never simply opening
             // options during monitoring (including an already decrypted run).
             auto hintVisible=[](CMitmCaDialog& dialog) {
@@ -826,13 +904,21 @@ public:
             WritePrivateProfileSectionW(L"recording",original[0]?original:nullptr,path);
             RecordingSettings::SessionEnabled().store(originalEnabled);
         }
-        fake.delay=300;page.m_recording=true;page.m_monitor.SetCheck(BST_UNCHECKED);
+        page.ShowWindow(SW_SHOW);
+        fake.delay=300;page.m_recording=true;page.m_retainedRecording=true;page.m_monitor.SetCheck(BST_UNCHECKED);
         const auto finalSequence=fake.count.load()+70;fake.count=finalSequence;
         const DWORD stopStarted=GetTickCount();page.UpdateMonitorStatus();
         Require(GetTickCount()-stopStarted<200,"monitor stop does not wait for disk work on the UI thread");
         Require(!page.IsMonitoring() && page.m_stopJob && !page.m_monitor.IsWindowEnabled(),"stop blocks rapid restart until drained");
+        CString stopText;page.m_recordingViewStatus.GetWindowText(stopText);
+        Require(page.m_recordingViewStatus.IsWindowVisible() && stopText.Find(Localization::Get(L"monitor.stop_writing"))>=0,"stop visibly reports payload/decode stage");
+        page.m_monitor.GetWindowText(stopText);Require(stopText==Localization::Get(L"monitor.stopping"),"stop control has explicit busy caption");
+        page.m_recordStatus.GetWindowText(stopText);Require(stopText==Localization::Get(L"recording.finishing"),"retained recording shows finalization independently of next-run preferences");
+        Require(!page.m_clear.IsWindowEnabled() && !page.m_options.IsWindowEnabled(),"stop excludes conflicting actions");
+        Screenshot(page,L"build\\qa\\monitor-toolbar-stopping.png");
         Pump(page,[&] {return !page.m_stopJob;});
         Require(page.m_monitor.IsWindowEnabled() && page.m_monitor.GetCheck()==BST_UNCHECKED,"stop completion restores controls without restarting capture");
+        Require(!page.m_recordingViewStatus.IsWindowVisible(),"temporary stop status row is removed after draining");
         fake.delay=0;
         Pump(page,[&] {return page.m_protocol->next==finalSequence && !page.m_protocol->finalPoll && !page.m_protocol->job;});
         const auto finalQueries=fake.queries.load();idleFor(1200);
@@ -861,6 +947,70 @@ public:
         }
         h3["sequence"]=7;h3["exchange"]["id"]=4;pushH3();
         Require(page.m_requests.GetItemCount()==2 && page.m_protocol->selected==selectedH3,"another HTTP/3 stream gets its own row");
+        std::cout << "Testing recording viewer\n" << std::flush;
+        page.ShowWindow(SW_SHOW);
+        page.m_protocol->selected.clear();page.m_protocol->haveDetail=false;
+        Pump(page,[&] {return !page.m_protocol->job;});fake.count=4096;
+        fake.indexMissing=true;
+        for(int answer:{IDNO,IDYES}) {
+            std::atomic<bool> answered{false};
+            CString caption=Localization::Get(L"recording.view_open");
+            std::thread responder([&,caption,answer] {
+                for(int retry=0;retry<500;++retry) {
+                    HWND dialog=FindWindowW(L"#32770",caption);DWORD pid=0;if(dialog)GetWindowThreadProcessId(dialog,&pid);
+                    if(dialog && pid==GetCurrentProcessId()) {Sleep(300);answered=true;PostMessage(dialog,WM_COMMAND,answer,0);return;}Sleep(10);
+                }
+            });
+            page.QueueRecordingPage(1,"D:/fake-recording");
+            Pump(page,[&] {return !page.m_protocol->job;});responder.join();
+            Require(answered,"missing index asks before scanning");
+            if(answer==IDNO)Require(!page.m_protocol->offline && fake.indexRebuilds==0,"declining leaves recording unopened and never rebuilds");
+            else Require(page.m_protocol->offline && fake.indexRebuilds==1,"explicit approval performs one rebuild and opens the recording");
+        }
+        Require(!page.m_monitor.IsWindowEnabled(),"archive open excludes monitor start");
+        Pump(page,[&] {return page.m_protocol->offline && !page.m_protocol->job;});
+        Require(page.m_requests.GetItemCount()==4096 && page.m_protocol->history.rows.size()==128,"virtual list exposes entire recording with bounded summaries");
+        Require(!page.m_clear.IsWindowEnabled() && !page.m_follow.IsWindowEnabled(),"read-only view disables destructive/live controls");
+        Require(!page.m_monitor.IsWindowVisible() && !page.m_options.IsWindowVisible() && !page.m_clear.IsWindowVisible() && page.m_openRecording.IsWindowVisible(),"archive toolbar shows return and caption without live actions");
+        Require((page.m_requests.GetStyle()&LVS_OWNERDATA)!=0,"offline list is virtual");
+        page.m_requests.SetColumnWidth(1,211);
+        page.m_requests.SetItemState(0,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);
+        Pump(page,[&] {return page.m_protocol->haveDetail && !page.m_protocol->job;});
+        const auto keptSelection=page.m_protocol->selected;
+        const auto keptHeaders=page.m_protocol->detail.request.headers;
+        for(int index:{600,1200,1800,2400,3000,4095}) {
+            page.m_requests.EnsureVisible(index,FALSE);
+            Pump(page,[&] {return page.RequestRow(index)!=nullptr && !page.m_protocol->job;});
+            CString expected;expected.Format(L"%d",index+1);
+            Require(page.m_requests.GetItemText(index,0)==expected,"scroll loads requested global row");
+            Require(page.m_protocol->history.rows.size()<=512 && page.m_protocol->history.bytes<=16*1024*1024,"scrolling does not grow summary cache without bound");
+            Require(page.m_protocol->selected==keptSelection && page.m_protocol->detail.request.headers==keptHeaders,"scrolling preserves selected detail");
+            Require(page.m_requests.GetColumnWidth(1)==211,"scrolling preserves column width");
+        }
+        page.m_requests.EnsureVisible(0,FALSE);
+        Pump(page,[&] {return page.RequestRow(10)!=nullptr && !page.m_protocol->job;});
+        Require(page.m_requests.GetTopIndex()==0 && page.m_requests.GetItemText(10,0)==L"11","scroll backward reloads evicted summaries without moving viewport");
+        page.m_requests.EnsureVisible(2200,FALSE);
+        page.m_requests.SetItemState(2200,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);
+        Pump(page,[&] {return page.RequestRow(2200)!=nullptr && page.m_protocol->haveDetail && !page.m_protocol->job;});
+        Require(page.m_protocol->selected==page.RequestRow(2200)->key,"selecting an unloaded row loads its detail");
+        fake.delay=30;
+        page.m_requests.EnsureVisible(3500,FALSE);page.TickProtocolView();
+        Require(page.m_protocol->job && page.m_protocol->job->archiveAction==2,"scroll read starts asynchronously");
+        page.m_filter.SetWindowText(L"old filter");
+        page.m_filter.SetWindowText(L"item-529");
+        fake.delay=0;
+        page.m_filter.SetWindowText(L"item-529");Pump(page,[&] {return !page.m_protocol->archiveRefresh && !page.m_protocol->job;});
+        Require(page.m_requests.GetItemCount()==1 && page.m_requests.GetItemText(0,0)==L"530","filter searches entire recording");
+        page.m_requests.SetItemState(0,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);
+        Pump(page,[&] {return page.m_protocol->haveDetail && !page.m_protocol->job;});
+        Require(page.m_protocol->detail.request.headers.find("GET /ip")!=std::string::npos,"offline detail hydrates headers on demand");
+        CRect archiveRect;page.GetClientRect(archiveRect);CImage archiveImage;archiveImage.Create(archiveRect.Width(),archiveRect.Height(),32);
+        HDC archiveDc=archiveImage.GetDC();page.SendMessage(WM_PRINT,(WPARAM)archiveDc,PRF_CLIENT|PRF_CHILDREN|PRF_ERASEBKGND);archiveImage.ReleaseDC();
+        Require(SUCCEEDED(archiveImage.Save(L"build\\qa\\recording-view.png")),"offline screenshot");
+        page.OnOpenRecording();Pump(page,[&] {return !page.m_protocol->job;});
+        Require(!page.m_protocol->offline && page.m_monitor.IsWindowEnabled(),"return live releases archive without starting monitoring");
+        Require((page.m_requests.GetStyle()&LVS_OWNERDATA)==0 && page.m_requests.GetColumnWidth(1)==211,"live list and user column width restored");
         page.DestroyWindow();parent.DestroyWindow();
         std::cout << "PASS actual page controls: saved process names, clean address, no raw log, per-request HEX, selection races, headers, decoded body, eviction, resize, bounds, clear\n";
     }
