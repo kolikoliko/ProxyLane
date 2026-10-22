@@ -366,6 +366,20 @@ typedef struct _HookNewProcessInfo
 	ULONGLONG processCreateTime;
 }HookNewProcessInfo, *LPHookNewProcessInfo;
 
+// Creation notification snapshot. Fixed-width packed fields have the same
+// layout in 32/64-bit senders; other child lifecycle messages stay unchanged.
+struct HookProcessSnapshot
+{
+    DWORD dwProcessId;
+    ULONGLONG processCreateTime;
+    WCHAR szAppPath[MAX_PATH];
+};
+struct HookProcessCreationNotice
+{
+    HookNewProcessInfo child;
+    HookProcessSnapshot parent;
+};
+
 
 
 //PRC Pipe Protocol Data Head

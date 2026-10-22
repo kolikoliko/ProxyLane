@@ -8,6 +8,7 @@
 #include "PRCPipeClient.h"
 #include "BrowserQuicPolicy.h"
 #include "AppContainerPipeAccess.h"
+#include "ProcessCreationSnapshot.h"
 
 CPRCPipeClient::CPRCPipeClient(void)
 {
@@ -246,18 +247,19 @@ BOOL CPRCPipeClient::PRCGetProxySettingsInfo(LPProxySettingsInfo lpPSI)
 }
 
 
-BOOL CPRCPipeClient::PRCShouldInjectNewProcess(LPHookNewProcessInfo lphnpi)
+BOOL CPRCPipeClient::PRCShouldInjectNewProcess(LPHookNewProcessInfo lphnpi, bool recordOnly)
 {
 	PRCPipeDataHead hdr;
+    const HookProcessCreationNotice notice = MakeProcessCreationNotice(*lphnpi);
 
 	hdr.action = PRCPD_SHOULD_INJECT_NEW_PROCESS;
-	hdr.flag = 0;
-	hdr.dataSize = sizeof(*lphnpi);
+	hdr.flag = recordOnly ? 1 : 0;
+	hdr.dataSize = sizeof(notice);
 
 	if(!WritePipe(&hdr, sizeof(hdr)))
 		return FALSE;
 
-	if(!WritePipe(lphnpi, sizeof(*lphnpi)))
+	if(!WritePipe(&notice, sizeof(notice)))
 		return FALSE;
 
 	if(!ReadPipe(&hdr, sizeof(hdr)))

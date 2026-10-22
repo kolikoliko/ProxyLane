@@ -6,6 +6,33 @@ Stop live monitoring before opening. Return to live closes the viewer only.
 The list scrolls through all sessions with bounded on-demand summaries. Filters search
 all sessions using the list index, and details/headers/bodies are loaded only on selection.
 
+process-events-000001.jsonl (then 000002, etc., at 16 MiB) is an independent
+append-only process creation journal, present when observations were captured.
+It does not add session rows or change existing connection/request metadata.
+Each process_created row contains parent and child {pid, process_start, path},
+source, observed_unix_ms, writer timestamp_unix_ms, recording_id,
+and a sequence independent of traffic events. process_start is Windows FILETIME.
+Join a traffic connection's pid + process_start to child, then follow parent.
+Never join by PID alone. Unknown identities/paths remain 0/empty with identity_note.
+parent identifies the creation notification sender (or the local launcher),
+even when a different OS parent was designated. No separate creator is recorded.
+The notifying process collects its own identity and the child's identity before
+sending the creation notification. PRC forwards the snapshot without identity
+checks; the Rust recorder never queries processes. Later exit does not erase it.
+Paths retain the notification's MAX_PATH bound; a full buffer is marked as
+possibly truncated rather than silently treated as a complete path.
+Rows include children excluded from injection. Failed OS creates are not creations.
+Launcher package activation uses process_activated: activation may reuse a process.
+Only observed creation hooks/launcher operations during recording are included;
+this is NOT a system-wide process audit or a reconstruction of earlier creations.
+Disabled child hooks and unobserved ancestors can leave gaps in ancestry coverage.
+No command lines are collected. This journal shares the recording capacity/reserve,
+background writer and periodic sync; bounded queue pressure waits on the notifying
+pipe/launcher thread, never the shared network thread. Stop drains admitted notices.
+After abnormal exit, read complete JSONL lines; an incomplete tail is not a record.
+The last unsynced data can be lost on power failure, as with other recording files.
+manifest.process_events identifies the journal version (1), volume and row counts.
+
 sessions.index.jsonl is a continuously appended list index (independent version 1).
 Each envelope contains sequence, a 64-bit FNV-1a accidental-corruption checksum,
 and a structured record object. The checksum is over the compact JSON serialization of record. Sequence 0 identifies ProxyLaneListIndex/version 1.

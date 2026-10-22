@@ -131,6 +131,10 @@ pub(crate) struct Journal {
     config: RecordingConfig,
     pub state: Arc<State>,
     file: File,
+    process_file: Option<File>,
+    process_volume: u64,
+    process_bytes: u64,
+    process_sequence: u64,
     volume: u64,
     volume_bytes: u64,
     sequence: u64,
@@ -195,7 +199,7 @@ impl Journal {
         fs2::FileExt::try_lock_exclusive(&list_lock).map_err(|e|e.to_string())?;
         state.used.store(README.len() as u64 + RESERVE,Ordering::Release);
         let free_credit=free.saturating_sub(config.min_free_bytes).saturating_sub(2*RESERVE);
-        let mut journal=Self {timings:Default::default(),root:root.to_owned(),config,state,file,volume:1,volume_bytes:0,sequence:0,
+        let mut journal=Self {process_file:None,process_volume:0,process_bytes:0,process_sequence:0,timings:Default::default(),root:root.to_owned(),config,state,file,volume:1,volume_bytes:0,sequence:0,
             started:now_ms(),manifest_size:0,dirty:false,finalized:false,
             free_credit,
             space_checked:Instant::now(),bytes_since_space_check:0,
@@ -253,6 +257,29 @@ impl Journal {
         self.sequence=next_sequence;
         self.volume_bytes+=line.len() as u64;self.dirty=true;
         Ok(())
+    }
+    /// Independent journal: no session projection, traffic event or list row.
+    pub fn process_event(&mut self, mut value:Value)->Result<(),String> {
+        if self.finalized {return Err("recording already finalized".into());}
+        value["sequence"]=(self.process_sequence+1).into();
+        value["timestamp_unix_ms"]=now_ms().into();
+        value["recording_id"]=self.root.file_name().unwrap().to_string_lossy().to_string().into();
+        let mut line=serde_json::to_vec(&value).map_err(|e|e.to_string())?;line.push(b'\n');
+        self.charge(line.len() as u64)?;
+        if self.process_file.is_none() || self.process_bytes+line.len() as u64>VOLUME {
+            if let Some(file)=&self.process_file {file.sync_data().map_err(|e|format!("process journal sync failed: {e}"))?;}
+            self.process_volume+=1;self.process_bytes=0;
+            self.process_file=Some(OpenOptions::new().create_new(true).append(true)
+                .open(self.root.join(format!("process-events-{:06}.jsonl",self.process_volume)))
+                .map_err(|e|format!("process journal open failed: {e}"))?);
+        }
+        self.process_file.as_mut().unwrap().write_all(&line).map_err(|e|format!("process journal write failed: {e}"))?;
+        self.process_sequence+=1;self.process_bytes+=line.len() as u64;
+        self.state.has_data.store(true,Ordering::Release);self.dirty=true;Ok(())
+    }
+    fn sync_files(&self)->std::io::Result<()> {
+        self.file.sync_data()?;self.list_file.sync_data()?;
+        if let Some(file)=&self.process_file {file.sync_data()?;} Ok(())
     }
     pub fn append_file(&mut self, relative:&str, data:&[u8])->Result<(),String> {
         self.charge(data.len() as u64)?;
@@ -328,6 +355,8 @@ impl Journal {
             "started_unix_ms":self.started,"updated_unix_ms":now_ms(),"status":status,"stop_reason":reason,
             "last_sequence":self.sequence,"volumes":self.volume,"capacity_bytes":self.config.total_bytes,
             "min_free_bytes":self.config.min_free_bytes,"used_bytes":self.state.used.load(Ordering::Acquire),
+            "process_events":{"files":"process-events-*.jsonl","version":1,"last_sequence":self.process_sequence,"volumes":self.process_volume,
+                "scope":"Observed child creation notifications and launcher operations during this recording; not a system-wide process audit"},
             "events":"events-*.jsonl","readme":"README.txt","list_index":{"file":crate::recording_index::NAME,"version":1},"has_data":self.state.has_data.load(Ordering::Acquire),"quality":self.state.completeness(),
             "body_decoding":self.state.decoding(),
             "performance":{"unit":"microseconds","stages":self.timings,
@@ -356,7 +385,7 @@ impl Journal {
         if self.finalized {return Ok(());}
         self.issues()?;
         if self.dirty {
-            let started=Instant::now();let result=self.file.sync_data().and_then(|_|self.list_file.sync_data());
+            let started=Instant::now();let result=self.sync_files();
             self.measure(Stage::IndexSync,started);
             result.map_err(|e|format!("recording index sync failed: {e}"))?;self.dirty=false;
         }
@@ -372,7 +401,7 @@ impl Journal {
         // Release real allocated space for the final manifest even after disk exhaustion.
         if fs::remove_file(self.root.join("finish.reserve")).is_ok() {self.state.used.fetch_sub(RESERVE,Ordering::AcqRel);}
         let started=Instant::now();
-        let sync=self.file.sync_data().and_then(|_|self.list_file.sync_data()).map_err(|e|format!("recording index sync failed: {e}"));
+        let sync=self.sync_files().map_err(|e|format!("recording index sync failed: {e}"));
         self.measure(Stage::IndexSync,started);
         if let Err(e)=&sync {self.state.stop(e);}
         let manifest=self.manifest(if self.state.stopped.load(Ordering::Acquire) {"stopped"}else{"completed"},self.state.reason());

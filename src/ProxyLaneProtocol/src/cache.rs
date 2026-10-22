@@ -231,6 +231,7 @@ enum Command {
     #[cfg(test)]
     Pause(mpsc::Sender<()>,mpsc::Receiver<()>),
     Event(Value),
+    ProcessCreated(Value),
     Finished(Arc<Ticket>),
     Register(Arc<Ticket>),
     Append(Arc<Ticket>, usize, Vec<u8>),
@@ -335,6 +336,16 @@ impl PayloadCache {
         event["connection"]=self.context["connection"].clone();
         event["protocol"]=self.context["protocol"].clone();self.record(event);
     }
+    /// Creation notification producer only; bounded lossless disk queue.
+    pub fn record_process_created(&self,event:Value)->Result<(),String> {
+        if !self.is_recording() {return Ok(());}
+        // Bound callers too, rather than accepting arbitrary large JSON values.
+        if serde_json::to_vec(&event).map_err(|e|e.to_string())?.len()>128*1024 {
+            self.inner.fail("process creation event exceeds 128 KiB");
+            return Err("process creation event exceeds 128 KiB".into());
+        }
+        self.inner.try_send(Command::ProcessCreated(event)).map_err(|e|{self.inner.fail(e);e.to_string()})
+    }
     pub fn finish_recording(&self)->Result<(),String> {if self.is_recording() {self.inner.query(Query::FinishRecording)?;}Ok(())}
     pub fn stream(&self) -> CacheRef { self.entry() }
     pub fn new(config: CacheConfig) -> Result<Self, String> {
@@ -376,6 +387,11 @@ impl PayloadCache {
                         #[cfg(test)]
                         Command::Pause(entered,resume)=>{let _=entered.send(());let _=resume.recv();},
                         Command::Event(value)=>worker.event(value),
+                        Command::ProcessCreated(value)=>{
+                            if let Some(j)=&mut worker.journal {
+                                if let Err(e)=j.process_event(value) {j.state.stop(&e);}
+                            }
+                        },
                         Command::Finished(ticket)=>worker.finished(&ticket),
                         Command::Register(ticket) => {
                             worker.register(ticket);

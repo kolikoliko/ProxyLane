@@ -22,6 +22,7 @@ use std::{
 };
 pub(crate) static SKIP_UPSTREAM_VERIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CONTEXT: Mutex<Option<Arc<Context>>> = Mutex::new(None);
+mod process_events;
 static RECORDING_VIEW: Mutex<Option<proxylane_protocol::recording_reader::Reader>> = Mutex::new(None);
 static PROTOCOL: Mutex<Option<Arc<protocol::Runtime>>> = Mutex::new(None);
 static MONITORING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -345,6 +346,13 @@ pub unsafe extern "C" fn plm_protocol(
             return Err("protocol query exceeds 4 KiB".into());
         }
         let request: serde_json::Value = serde_json::from_str(input).map_err(|e| e.to_string())?;
+        if request["type"]=="recording_process_created" {
+            // No lazy initialization, barriers or global control lock here. This
+            // endpoint runs only on pipe-client/launcher threads, never PRC I/O.
+            let runtime=PROTOCOL.lock().map_err(|e|e.to_string())?.clone();
+            let accepted=if let Some(runtime)=runtime {runtime.record_process_created(&request)?}else{false};
+            return Ok(serde_json::json!({"accepted":accepted}).to_string());
+        }
         if request["type"]=="recording_open" || request["type"]=="recording_close" {
             let _control=PROTOCOL_CONTROL.lock().map_err(|e|e.to_string())?;
             if MONITORING.load(std::sync::atomic::Ordering::Acquire) {return Err("Stop monitoring before opening a recording.".into());}

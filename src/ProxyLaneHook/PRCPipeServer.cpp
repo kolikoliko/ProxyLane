@@ -6,6 +6,7 @@
 #include "stdafx.h"
 #include "PRCPipeServer.h"
 #include "BrowserQuicPolicy.h"
+#include "ProcessCreationRecording.h"
 #include "GlobalProxy.h"
 #include "ProxyReceptionCentre.h"
 #include "token.h"
@@ -564,21 +565,29 @@ DWORD WINAPI CPRCPipeServer::_InstanceThread(HANDLE hPipe, HANDLE hThread)
 
 		case PRCPD_SHOULD_INJECT_NEW_PROCESS:
 			{
-				HookNewProcessInfo hnpi;
+				HookProcessCreationNotice notice;
 
-				if (hdr.dataSize != sizeof(hnpi))
+				if (hdr.dataSize != sizeof(notice))
 					goto SEC_ERROR;
 
-				if(! ReadPipe(hPipe, &hnpi, hdr.dataSize))
+				if(! ReadPipe(hPipe, &notice, hdr.dataSize))
 					goto SEC_ERROR;
 
+                const bool recordOnly = hdr.flag == 1;
+                HookNewProcessInfo& hnpi = notice.child;
+                hnpi.szAppPath[_countof(hnpi.szAppPath)-1] = L'\0';
+                hnpi.szCommandLine[_countof(hnpi.szCommandLine)-1] = L'\0';
+                notice.parent.szAppPath[_countof(notice.parent.szAppPath)-1] = L'\0';
+                // Record successful creation before injection/filter decisions.
+                RecordProcessCreation(m_pPRC->m_pGlobalProxy->GetTlsControl(),
+                    notice, recordOnly ? "launcher" : "hook");
 				//先写协议头
 				hdr.action = PRCPD_REPLY;
 				hdr.flag = false;
 				hdr.dataSize = 0;
 
-				hdr.flag = (BYTE)m_pPRC->m_pGlobalProxy->GetLogInstance()->ShouldInjectNewProcess(&hnpi);
-				if (hdr.flag && !AuthorizeAppContainerChild(
+				hdr.flag = recordOnly || (BYTE)m_pPRC->m_pGlobalProxy->GetLogInstance()->ShouldInjectNewProcess(&hnpi);
+				if (!recordOnly && hdr.flag && !AuthorizeAppContainerChild(
 					m_pPRC->m_pGlobalProxy, hnpi, pipeClientPid))
 				{
 					const DWORD error = GetLastError();

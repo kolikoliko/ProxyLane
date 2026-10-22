@@ -13,6 +13,8 @@
 #include "PackagedAppSupport.h"
 #include "ApplicationPicker.h"
 #include "ProcessActions.h"
+#include "../ProxyLaneHook/ProcessCreationRecording.h"
+#include "../ProxyLaneHook/ProcessCreationSnapshot.h"
 #include "ScopedProcessSuspension.h"
 
 #include "..\ProxyLaneHook\ProxyModule.h"
@@ -2893,6 +2895,9 @@ AppLaunchResult CPage3::LaunchAndProxyApp(
 #endif
 	}
 
+    hnpi.processCreateTime = ProcessActions::CreationTime(pi.hProcess);
+    RecordProcessCreation(g_GlobalProxy ? g_GlobalProxy->GetTlsControl() : NULL,
+        MakeProcessCreationNotice(hnpi), "launcher");
 	BOOL injectionSucceeded = InjectNewProcess(&hnpi);
 	if (!injectionSucceeded && strictInjection)
 	{
@@ -2991,6 +2996,13 @@ AppLaunchResult CPage3::LaunchPackagedAppById(LPCTSTR aumid, const CString& argu
 		return APP_LAUNCH_PACKAGED_INJECTION_FAILED;
 	}
 	const ULONGLONG creationTime = ProcessActions::CreationTime(hTargetProc);
+    // Activation can return an existing process; do not invent a creation event.
+    HookNewProcessInfo activated = {};
+    activated.dwProcessId = processId;
+    activated.processCreateTime = creationTime;
+    ResolveChildAppPath(hTargetProc, activated.szAppPath, _countof(activated.szAppPath));
+    activated.szAppPath[_countof(activated.szAppPath)-1] = L'\0';
+    RecordProcessCreation(g_GlobalProxy->GetTlsControl(), MakeProcessCreationNotice(activated), "launcher_activation");
 	// Authorization must finish before freezing the app. It used to query a
 	// busy synchronous server pipe, stranding the app while the GUI waited.
 	if (!pPRC->AuthorizeProcessPipeAccess(hTargetProc))

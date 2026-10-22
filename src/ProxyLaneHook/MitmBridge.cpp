@@ -109,6 +109,15 @@ int CMitmControl::QueryProtocol(const char* request, char* output, size_t capaci
         return -1;
     }
     auto command = nlohmann::json::parse(request ? request : "", nullptr, false);
+    if(command.is_object() && command.value("type",nlohmann::json())=="recording_process_created") {
+        // Creation notifications never load the optional module or take the
+        // monitor control lock. Rust admits/drains events against its capture epoch.
+        auto query=protocolQuery.load();
+        if(streamMonitoring.load() && query)return query(request,output,capacity);
+        const char reply[]="{\"accepted\":false}";
+        if(output && capacity>=sizeof(reply))memcpy(output,reply,sizeof(reply));
+        return sizeof(reply);
+    }
     if(command.is_object() && command.value("type",nlohmann::json())=="monitor_status") {
         auto reply=nlohmann::json{{"monitoring",streamMonitoring.load()},{"quic",quicEnabled.load()}}.dump();
         if(output&&capacity>reply.size())memcpy(output,reply.c_str(),reply.size()+1);return (int)reply.size()+1;

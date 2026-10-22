@@ -10,10 +10,11 @@ class Settings : public IProxySettings {
 public:
     bool blockUdp=false;
     bool hookTcp=false;
+    bool hookChildren=false;
     int port;
     const wchar_t* type;
     BOOL GetProxySettings(LPProxySettingsInfo s) {
-        ZeroMemory(s,sizeof(*s)); s->bHookUDP=TRUE; s->bHookTCP=hookTcp; s->bHookLanIP=TRUE; s->bBlockUDP=blockUdp;
+        ZeroMemory(s,sizeof(*s)); s->bHookUDP=TRUE; s->bHookTCP=hookTcp; s->bHookLanIP=TRUE; s->bBlockUDP=blockUdp; s->bHookCreateProcess=hookChildren;
         s->nDNSOption=PSI_DNSOPT_REMOTE; return TRUE;
     }
     BOOL GetProxyInfo(const LPPRCClient, LPProxyInfo p) {
@@ -34,6 +35,11 @@ public:
 };
 
 #include "../../third_party/nlohmann/json.hpp"
+#include <atlbase.h>
+#include <atlconv.h>
+using namespace ATL;
+#include "../../src/ProxyLaneHook/ProcessCreationRecording.h"
+#include "../../src/ProxyLaneHook/ProcessCreationSnapshot.h"
 #include <iostream>
 int wmain(int argc,wchar_t** argv) {
     gp_UnhookWinsock(); WSADATA wsa;WSAStartup(MAKEWORD(2,2),&wsa);
@@ -48,7 +54,17 @@ int wmain(int argc,wchar_t** argv) {
         try {auto q=Json::parse(line);auto type=q.value("type",std::string());
             if(type=="quit")break;
             if(type=="test_pipe") {reply={{"pipe",pipe}};
+            } else if(type=="test_recorded_launch") {
+                HookNewProcessInfo child={};GetSystemDirectoryW(child.szAppPath,MAX_PATH);wcscat_s(child.szAppPath,L"\\cmd.exe");
+                WCHAR command[]=L"cmd.exe /D /C exit 0";STARTUPINFOW si={sizeof(si)};PROCESS_INFORMATION pi={};
+                if(!CreateProcessW(child.szAppPath,command,NULL,NULL,FALSE,CREATE_SUSPENDED|CREATE_NO_WINDOW,NULL,NULL,&si,&pi))throw std::runtime_error("create launcher child");
+                child.dwProcessId=pi.dwProcessId;child.dwThreadId=pi.dwThreadId;FILETIME c={},e={},k={},u={};
+                GetProcessTimes(pi.hProcess,&c,&e,&k,&u);child.processCreateTime=(ULONGLONG(c.dwHighDateTime)<<32)|c.dwLowDateTime;
+                RecordProcessCreation(proxy->GetTlsControl(),MakeProcessCreationNotice(child),"launcher");
+                ResumeThread(pi.hThread);WaitForSingleObject(pi.hProcess,30000);CloseHandle(pi.hThread);CloseHandle(pi.hProcess);
+                reply={{"child_pid",child.dwProcessId},{"child_start",child.processCreateTime}};
             } else if(type=="test_udp_policy") { settings.blockUdp=q.value("blocked",false);reply={{"ok",true}};
+            } else if(type=="test_child_policy") { settings.hookChildren=q.value("enabled",false);reply={{"ok",true}};
             } else if(type=="test_tcp_policy") { settings.hookTcp=q.value("enabled",false);reply={{"ok",true}};
             } else if(type=="attach") {
                 DWORD pid=q.at("pid");HANDLE h=OpenProcess(PROCESS_ALL_ACCESS,FALSE,pid);

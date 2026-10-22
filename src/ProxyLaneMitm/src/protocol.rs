@@ -10,7 +10,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender},
-        Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard, Condvar,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -144,6 +144,9 @@ pub struct Runtime {
     stopping: AtomicBool,
     // Odd epochs accept capture. Even epochs are paused; old taps never resume.
     capture_epoch: Mutex<u64>,
+    process_events: Mutex<()>,
+    process_inflight: Mutex<usize>,
+    process_drained: Condvar,
     next: AtomicU64,
     active: Arc<AtomicUsize>,
     parsers: Arc<AtomicUsize>,
@@ -170,6 +173,34 @@ impl Runtime {
         lock(&self.results).add(json!({"type":"connection", "connection":identity, "protocol":protocol,
             "status":state,"detail":problem,"upstream_verification_skipped":skipped}));
     }
+    pub(crate) fn record_process_created(&self, request:&Value)->Result<bool,String> {
+        self.record_process_with(||crate::process_events::collect(request))
+    }
+    fn record_process_with(&self, collect:impl FnOnce()->Result<Value,String>)->Result<bool,String> {
+        if !self.is_recording() {return Ok(false);}
+        let observed=proxylane_protocol::recording::now_ms();
+        {
+            let epoch=lock(&self.capture_epoch);
+            if *epoch%2==0 || self.stopping.load(Ordering::Acquire) || self.recording_failed() {return Ok(false);}
+            *lock(&self.process_inflight)+=1;
+        }
+        struct Admission<'a>(&'a Runtime);
+        impl Drop for Admission<'_> {fn drop(&mut self) {
+            let mut n=lock(&self.0.process_inflight);*n-=1;
+            if *n==0 {self.0.process_drained.notify_all();}
+        }}
+        let _admission=Admission(self);
+        // Serialize only creation notifications. Never hold the capture gate,
+        // results lock, or protocol slot while serializing / waiting for disk.
+        let _producer=lock(&self.process_events);
+        let mut event=collect()?;event["observed_unix_ms"]=observed.into();
+        self.cache.as_ref().unwrap().record_process_created(event)?;
+        Ok(true)
+    }
+    fn drain_process_events(&self) {
+        let mut n=lock(&self.process_inflight);
+        while *n!=0 {n=self.process_drained.wait(n).unwrap_or_else(|e|e.into_inner());}
+    }
     pub fn capture_epoch(&self) -> u64 { *lock(&self.capture_epoch) }
     pub fn start_capture(&self) {
         *lock(&self.stop_progress)=StopProgress::default();
@@ -191,6 +222,9 @@ impl Runtime {
             let mut epoch = lock(&self.capture_epoch);
             if *epoch % 2 != 0 { *epoch += 1; }
         }
+        // A notification admitted before the gate closed must be enqueued
+        // before the disk-worker finish barrier. No network locks are held.
+        self.drain_process_events();
         let (tx, rx) = mpsc::channel();
         self.sender.send(Event::StopCapture(tx).timed()).map_err(|_| "analysis worker unavailable")?;
         rx.recv().map_err(|_| "analysis worker unavailable")?;
@@ -279,6 +313,9 @@ impl Runtime {
             worker: Mutex::new(Some(worker)),
             stopping: AtomicBool::new(false),
             capture_epoch: Mutex::new(1),
+            process_events: Mutex::new(()),
+            process_inflight: Mutex::new(0),
+            process_drained: Condvar::new(),
             next: AtomicU64::new(1),
             active,
             parsers,
@@ -479,7 +516,8 @@ impl Runtime {
     }
     pub fn shutdown(&self) -> Result<(), String> {
         let mut worker = lock(&self.worker);
-        self.stopping.store(true, Ordering::Release);
+        {let _gate=lock(&self.capture_epoch);self.stopping.store(true, Ordering::Release);}
+        self.drain_process_events();
         if let Some(handle) = worker.take() {
             let _ = self.sender.send(Event::Shutdown);
             handle.join().map_err(|_| "analysis worker panicked")?;
@@ -1338,6 +1376,9 @@ mod tests {
             worker: Mutex::new(None),
             stopping: AtomicBool::new(false),
             capture_epoch: Mutex::new(1),
+            process_events: Mutex::new(()),
+            process_inflight: Mutex::new(0),
+            process_drained: Condvar::new(),
             next: AtomicU64::new(1),
             active: Arc::new(AtomicUsize::new(0)),
             parsers: Arc::new(AtomicUsize::new(0)),
@@ -1611,6 +1652,28 @@ mod recording_tests {
         Runtime::with_options(CacheConfig {root:std::env::temp_dir().join("proxylane-runtime-recordings"),queue_chunks:1024,
             recording:Some(proxylane_protocol::recording::RecordingConfig {total_bytes:32*1024*1024,min_free_bytes:0}),..Default::default()},
             crate::options::Options {udp_packets:16,..Default::default()}).unwrap()
+    }
+    #[test]
+    fn process_notifications_drain_on_stop_without_holding_capture_gate() {
+        let r=runtime();let root=PathBuf::from(r.recording_status()["directory"].as_str().unwrap());
+        let (entered,ready)=mpsc::channel();let (resume,wait)=mpsc::channel();let producer=r.clone();
+        let job=thread::spawn(move||producer.record_process_with(|| {
+            entered.send(()).unwrap();wait.recv().unwrap();
+            Ok(json!({"type":"process_created","child":{"pid":123},"parent":{"pid":456}}))
+        }).unwrap());
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(r.capture_epoch.try_lock().is_ok(),"identity lookup held network capture gate");
+        // Network lifecycle publication still completes while producer waits.
+        let mut tap=r.tap_transport(Connection{id:"process-test".into(),..Default::default()},None,false).unwrap();
+        tap.data(0,b"network remains usable");
+        let (done,finished)=mpsc::channel();let stopped=r.clone();
+        let stopper=thread::spawn(move||{let result=stopped.stop_capture();done.send(result).unwrap();});
+        assert!(finished.recv_timeout(Duration::from_millis(100)).is_err(),"stop lost an admitted creation");
+        assert!(!r.record_process_with(||panic!("post-stop query must not run")).unwrap());
+        resume.send(()).unwrap();assert!(job.join().unwrap());finished.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();stopper.join().unwrap();
+        let text=fs::read_to_string(root.join("process-events-000001.jsonl")).unwrap();assert_eq!(text.lines().count(),1);
+        let manifest:Value=serde_json::from_slice(&fs::read(root.join("manifest.json")).unwrap()).unwrap();assert_eq!(manifest["process_events"]["last_sequence"],1);
+        drop(tap);r.shutdown().unwrap();
     }
     #[test]
     fn live_preview_bypasses_analysis_barrier_and_recording_publication_lock() {
