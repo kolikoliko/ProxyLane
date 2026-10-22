@@ -347,7 +347,7 @@ bool CMitmBridge::Pump()
             if (!sent) break;
             if (m_io(m_session, PLM_CONSUME, side, NULL, sent) < 0) { Fail(); return false; }
             peers[1-side]->m_DataLenSent += sent;
-            m_task->m_pTaskmgr->m_pPRC->RecordTraffic(m_task->m_ProxyInfo, side == 0, sent);
+            m_task->m_pTaskmgr->m_pPRC->RecordTraffic(side == 0, sent);
             budget -= sent;
         }
         if (budget <= 0) peers[side]->TriggerEvent(FD_WRITE);

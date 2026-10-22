@@ -53,7 +53,10 @@ int wmain(int argc,wchar_t** argv) {
         Json reply;
         try {auto q=Json::parse(line);auto type=q.value("type",std::string());
             if(type=="quit")break;
-            if(type=="test_pipe") {reply={{"pipe",pipe}};
+            if(type=="test_traffic") {
+                ULONGLONG upload=0,download=0;proxy->GetPRCInstance()->GetTrafficTotals(upload,download);
+                reply={{"upload",upload},{"download",download}};
+            } else if(type=="test_pipe") {reply={{"pipe",pipe}};
             } else if(type=="test_recorded_launch") {
                 HookNewProcessInfo child={};GetSystemDirectoryW(child.szAppPath,MAX_PATH);wcscat_s(child.szAppPath,L"\\cmd.exe");
                 WCHAR command[]=L"cmd.exe /D /C exit 0";STARTUPINFOW si={sizeof(si)};PROCESS_INFORMATION pi={};

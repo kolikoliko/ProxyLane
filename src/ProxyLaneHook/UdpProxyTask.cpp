@@ -414,7 +414,7 @@ VOID CUdpProxyTask::OnServerWritable()
 		}
 		m_pendingBytes -= (DWORD)packet.data.size();
 		m_pending.pop_front();
-		m_pTaskmgr->m_pPRC->RecordTraffic(m_ProxyInfo, false, sent);
+		m_pTaskmgr->m_pPRC->RecordTraffic(false, sent);
 	}
 
 	// ForwardClientDatagram owns each packet, including the first direct
@@ -628,7 +628,7 @@ BOOL CUdpProxyTask::ForwardUpstreamDatagram(CPRCUdpPeer::_CSAddrInfo target,cons
 		}
 		if (sent != SOCKET_ERROR)
 		{
-			m_pTaskmgr->m_pPRC->RecordTraffic(m_ProxyInfo, false, sent);
+			m_pTaskmgr->m_pPRC->RecordTraffic(false, sent);
 			return TRUE;
 		}
 		if (WSAGetLastError() != WSAEWOULDBLOCK)
@@ -693,7 +693,7 @@ BOOL CUdpProxyTask::DeliverServerDatagram(UdpRoute& route,const char* data,int l
 		application.Size());
 	if (sent == length)
 	{
-		m_pTaskmgr->m_pPRC->RecordTraffic(m_ProxyInfo, true, sent);
+		m_pTaskmgr->m_pPRC->RecordTraffic(true, sent);
 		return TRUE;
 	}
 	return QueueReply(selected->peer, application, data, length);
@@ -753,7 +753,7 @@ VOID CUdpProxyTask::FlushPendingReplies(CPRCUdpPeer *routePeer)
 		}
 		m_pendingReplyBytes -= (DWORD)it->data.size();
 		it = m_pendingReplies.erase(it);
-		m_pTaskmgr->m_pPRC->RecordTraffic(m_ProxyInfo, true, sent);
+		m_pTaskmgr->m_pPRC->RecordTraffic(true, sent);
 	}
 }
 

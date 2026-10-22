@@ -28,10 +28,10 @@ public:
 	{
 		m_traffic.GetTotals(upload, download);
 	}
-	void RecordTraffic(ProxyInfo& proxy, bool download, int bytes)
+	void RecordTraffic(bool download, int bytes)
 	{
-		if (proxy.GetProxyType() != PROXYTYPE_NOPROXY)
-			m_traffic.RecordTransfer(download, bytes);
+		// Count all successfully forwarded traffic, including direct routes.
+		m_traffic.RecordTransfer(download, bytes);
 	}
 	//
 	BOOL CreatePRC();
