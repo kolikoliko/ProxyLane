@@ -23,11 +23,13 @@ int ProcessActionsTestsMain()
 	invalidTargets.push_back(wrongIdentity);
 	invalidTargets.push_back(self);
 	const std::vector<DWORD> rejected = ProcessActions::TerminateExactProcesses(invalidTargets);
-	if (!rejected[0] || !rejected[1] ||
+	if (rejected[0] || !rejected[1] ||
 		WaitForSingleObject(child.hProcess, 0) != WAIT_TIMEOUT) ++failures;
 	HANDLE wrong = ProcessActions::OpenForTermination(child.dwProcessId, created + 1);
+	if (!wrong && GetLastError() != ERROR_NOT_FOUND) ++failures;
 	if (wrong) { ++failures; CloseHandle(wrong); }
 	HANDLE unknown = ProcessActions::OpenForTermination(child.dwProcessId, 0);
+	if (!unknown && GetLastError() != ERROR_INVALID_DATA) ++failures;
 	if (unknown) { ++failures; CloseHandle(unknown); }
 	if (WaitForSingleObject(child.hProcess, 0) != WAIT_TIMEOUT) ++failures;
 	HANDLE held = ProcessActions::OpenForTermination(child.dwProcessId, created);

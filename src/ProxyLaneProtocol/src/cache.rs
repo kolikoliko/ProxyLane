@@ -229,6 +229,8 @@ enum Answer {
 }
 enum Command {
     #[cfg(test)]
+    Panic,
+    #[cfg(test)]
     Pause(mpsc::Sender<()>,mpsc::Receiver<()>),
     Event(Value),
     ProcessCreated(Value),
@@ -238,6 +240,7 @@ enum Command {
     Query(Query, mpsc::Sender<Result<Answer, String>>),
 }
 struct Inner {
+    failure: Arc<crate::worker_failure::WorkerFailure>,
     preview: Arc<preview::Reader>,
     recording: Option<Arc<recording::State>>,
     sender: Mutex<Option<SyncSender<Command>>>,
@@ -254,6 +257,7 @@ impl Inner {
         } else {self.fail(reason);}
     }
     fn try_send(&self, command: Command) -> Result<(), &'static str> {
+        if self.failure.failed() {return Err("cache worker failed");}
         let sender = locked(&self.sender).clone();
         match sender.as_ref() {
             None => Err("cache closed"),
@@ -266,6 +270,7 @@ impl Inner {
         }
     }
     fn query(&self, query: Query) -> Result<Answer, String> {
+        if let Some(reason)=self.failure.reason() {return Err(reason);}
         let (sender, receiver) = mpsc::channel();
         // Reads/flushes are explicitly synchronous API operations, not called
         // from the analyzer's packet path. Do not hold sender mutex while waiting.
@@ -277,7 +282,7 @@ impl Inner {
             .send(Command::Query(query, sender))
             .map_err(|_| "cache worker unavailable")?;
         drop(queue);
-        receiver.recv().map_err(|_| "cache worker unavailable")?
+        receiver.recv().map_err(|_| self.failure.reason().unwrap_or_else(||"cache worker unavailable".into()))?
     }
     fn shutdown(&self) -> Result<(), String> {
         // Serialize simultaneous shutdowns; drain accepted writes before cleanup.
@@ -301,6 +306,11 @@ pub struct PayloadCache {
     context: Value,
 }
 impl PayloadCache {
+    pub fn worker_failed(&self)->bool {self.inner.failure.failed()}
+    pub fn worker_error(&self)->Option<String> {self.inner.failure.reason()}
+    pub fn analysis_worker_failed(&self,reason:&str) {
+        if let Some(state)=&self.inner.recording {state.fail_worker(reason);}
+    }
     pub fn working_id(&self)->u64 {
         static NEXT:AtomicU64=AtomicU64::new(1);
         NEXT.fetch_add(1,Ordering::Relaxed)
@@ -371,12 +381,15 @@ impl PayloadCache {
         let (sender, receiver) = mpsc::sync_channel(config.queue_chunks);
         let preview = Arc::new(preview::Reader::new(path.clone(), config.max_entries));
         let worker_preview = preview.clone();
+        let failure=Arc::new(crate::worker_failure::WorkerFailure::default());
+        let worker_failure=failure.clone();
         let worker = thread::Builder::new()
             .name("protocol-payload-cache".into())
             .spawn(move || {
                 let mut worker = Worker::new(config, directory);
                 worker.preview = Some(worker_preview);
                 worker.journal=journal;
+                let outcome=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut checkpoint=Instant::now();
                 loop {
                     let command=match receiver.recv_timeout(Duration::from_millis(250)) {
@@ -384,6 +397,8 @@ impl PayloadCache {
                     };
                     if let Some(command)=command {
                     match command {
+                        #[cfg(test)]
+                        Command::Panic=>panic!("injected cache panic"),
                         #[cfg(test)]
                         Command::Pause(entered,resume)=>{let _=entered.send(());let _=resume.recv();},
                         Command::Event(value)=>worker.event(value),
@@ -413,9 +428,21 @@ impl PayloadCache {
                 }
                 worker.checkpoint();
                 if let Some(j)=&mut worker.journal {let _=j.finish();}
+                }));
+                if let Err(payload)=outcome {
+                    let reason=crate::worker_failure::panic_reason("protocol-payload-cache",payload.as_ref());
+                    if let Some(j)=&mut worker.journal {j.worker_panicked(&reason);}
+                    worker_failure.set(&reason);
+                    // Disconnect first: release producers and synchronous queries
+                    // before any best-effort terminal disk I/O.
+                    drop(receiver);
+                    let _=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if let Some(j)=&mut worker.journal {let _=j.finish();}
+                    }));
+                }
                 // Close payload handles before removing their files on Windows.
                 for record in worker.records.values() {
-                    record.ticket.stop("cache closed");
+                    record.ticket.stop(&worker_failure.reason().unwrap_or_else(||"cache closed".into()));
                 }
                 worker.records.clear();
                 worker
@@ -426,6 +453,7 @@ impl PayloadCache {
             .map_err(|e| e.to_string())?;
         Ok(Self {
             inner: Arc::new(Inner {
+                failure,
                 preview,
                 recording,
                 sender: Mutex::new(Some(sender)),
@@ -957,6 +985,34 @@ impl Worker {
 mod tests {
     use super::*;
     #[test]
+    fn worker_panic_unblocks_waiters_and_finalizes_failure() {
+        for retained in [false,true] {
+            let config=CacheConfig {root:std::env::temp_dir().join("proxylane-audit-worker-tests"),queue_chunks:2,recording:retained.then_some(RecordingConfig{total_bytes:1024*1024,min_free_bytes:0}),..Default::default()};
+            let cache=PayloadCache::new(config.clone()).unwrap();let path=cache.directory().to_owned();
+            let stream=cache.stream();stream.append_stream(Direction::Client,b"before panic");cache.stats().unwrap();
+            let (entered,ready)=mpsc::channel();let (resume,wait)=mpsc::channel();
+            let sender=locked(&cache.inner.sender).as_ref().unwrap().clone();
+            sender.send(Command::Pause(entered,wait)).unwrap();ready.recv_timeout(Duration::from_secs(3)).unwrap();
+            sender.send(Command::Panic).unwrap();
+            let (reply,answer)=mpsc::channel();sender.send(Command::Query(Query::Stats,reply)).unwrap();
+            let (done,result)=mpsc::channel();let producer=sender.clone();
+            let blocked=thread::spawn(move||done.send(producer.send(Command::Event(json!({"type":"test"}))).is_err()).unwrap());
+            resume.send(()).unwrap();
+            assert!(result.recv_timeout(Duration::from_secs(3)).unwrap());blocked.join().unwrap();
+            assert!(answer.recv_timeout(Duration::from_secs(3)).is_err());drop(sender);
+            cache.shutdown().unwrap();
+            assert!(cache.worker_error().unwrap().contains("injected cache panic"));
+            assert!(cache.stats().err().unwrap().contains("injected cache panic"));
+            if retained {
+                let manifest:Value=serde_json::from_slice(&fs::read(path.join("manifest.json")).unwrap()).unwrap();
+                assert_eq!(manifest["status"],"stopped");assert_eq!(manifest["quality"]["capture_incomplete"],true);
+                assert!(manifest["stop_reason"].as_str().unwrap().contains("injected cache panic"));
+                assert_eq!(fs::read(path.join(recording::payload_relative(stream.id(),0))).unwrap(),b"before panic");
+            }
+            let fresh=PayloadCache::new(config).unwrap();assert!(fresh.stats().is_ok());fresh.shutdown().unwrap();
+        }
+    }
+    #[test]
     fn recording_previews_read_published_prefix_while_writer_is_paused() {
         let cache=PayloadCache::new(CacheConfig {
             root:std::env::temp_dir().join(format!("proxylane-preview-{}-{}",std::process::id(),recording::now_ms())),
@@ -1027,6 +1083,7 @@ mod tests {
     fn recording_full_queue_waits_then_keeps_every_byte() {
         let (sender, receiver) = mpsc::sync_channel(1);
         let cache = PayloadCache { context:Value::Null, inner: Arc::new(Inner {
+            failure: Default::default(),
             preview:Arc::new(preview::Reader::new(PathBuf::new(),1)),
             recording:Some(Arc::new(recording::State::default())), sender:Mutex::new(Some(sender)),
             worker:Mutex::new(None),next:AtomicU64::new(1),completion:AtomicU64::new(1),directory:PathBuf::new(),

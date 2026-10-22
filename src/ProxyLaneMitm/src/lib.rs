@@ -395,7 +395,7 @@ pub unsafe extern "C" fn plm_protocol(
                 MONITORING.store(false, Ordering::Release);
                 let (changed, old) = {
                     let mut slot = PROTOCOL.lock().map_err(|e| e.to_string())?;
-                    let changed = slot.as_ref().is_some_and(|r| r.is_recording() || !r.options.same_analysis(&options::current()));
+                    let changed = slot.as_ref().is_some_and(|r| r.worker_error().is_some() || r.is_recording() || !r.options.same_analysis(&options::current()));
                     let old = if changed { slot.take() } else { None };
                     if let Some(runtime) = slot.as_ref() { runtime.start_capture(); }
                     (changed, old)

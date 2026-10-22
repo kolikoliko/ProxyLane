@@ -12,6 +12,37 @@ use std::{
 mod ech;
 
 #[test]
+fn analysis_panic_preserves_established_tls_forwarding() {
+    for retained in [false,true] {
+        let f=Fixture::new();
+        let runtime=protocol::Runtime::new(proxylane_protocol::cache::CacheConfig {
+            root:f.path.join("panic-cache"),
+            recording:retained.then_some(proxylane_protocol::recording::RecordingConfig{total_bytes:16*1024*1024,min_free_bytes:0}),
+            ..Default::default()
+        }).unwrap();
+        let mut m=f.session();
+        m.enable_protocol(runtime.clone(),proxylane_protocol::Connection{id:"panic-forward".into(),..Default::default()});
+        let (mut app,mut origin)=f.endpoints(false,true);
+        for _ in 0..30 {exchange(&mut m,&mut app,&mut origin,4096).unwrap();}
+        app.writer().write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+        for _ in 0..4 {exchange(&mut m,&mut app,&mut origin,4096).unwrap();}
+        let _=origin.reader().read_to_end(&mut Vec::new());
+        runtime.query(&json!({"type":"stats"})).unwrap();runtime.panic_worker();
+        // More than the TLS high-water mark, both directions, same connection.
+        for n in 0..64 {
+            let bytes=vec![n;16384];
+            app.writer().write_all(&bytes).unwrap();origin.writer().write_all(&bytes).unwrap();
+            for _ in 0..3 {exchange(&mut m,&mut app,&mut origin,4096).unwrap();}
+            let mut upstream=Vec::new();let _=origin.reader().read_to_end(&mut upstream);
+            let mut downstream=Vec::new();let _=app.reader().read_to_end(&mut downstream);
+            assert_eq!(upstream,bytes);assert_eq!(downstream,bytes);
+        }
+        assert!(runtime.stop_capture().unwrap_err().contains("injected analysis panic"));
+        drop(m);runtime.shutdown().unwrap();
+    }
+}
+
+#[test]
 fn plaintext_mitm_reset_preserves_bytes_and_transport_close_cause() {
     let f=Fixture::new();
     let runtime=protocol::Runtime::new(proxylane_protocol::cache::CacheConfig {

@@ -187,10 +187,9 @@ int CMitmControl::QueryProtocol(const char* request, char* output, size_t capaci
         }
         if (start) {
             char status[8192]={};
-            const int length=query ? query("{\"type\":\"recording_status\"}",status,sizeof(status)) : -1;
-            auto recording=nlohmann::json::parse(status,nullptr,false);
             const auto generation=++monitorGeneration;
-            if(length>0 && length<=sizeof(status) && recording.is_object() && recording.value("enabled",false)) {
+            // Watch worker health in ordinary monitoring too, not just disk quota.
+            if(query) {
                 try {
                     std::thread([query,generation]() {
                         for(;;) {
@@ -210,7 +209,7 @@ int CMitmControl::QueryProtocol(const char* request, char* output, size_t capaci
                     }).detach();
                 } catch (...) {
                     query("{\"type\":\"analysis_stop\"}",status,sizeof(status));
-                    if(output&&capacity)_snprintf_s(output,capacity,_TRUNCATE,"Cannot start recording capacity monitor.");
+                    if(output&&capacity)_snprintf_s(output,capacity,_TRUNCATE,"Cannot start monitoring health watchdog.");
                     return -1;
                 }
             }

@@ -15,9 +15,10 @@ struct MitmJob {
     std::atomic<bool> done;
     int result;
     bool needsCA;
+    bool failureReported;
     std::string recordingDirectory;
     char text[8192];
-    MitmJob() : done(false), result(-1), needsCA(false) { text[0] = 0; }
+    MitmJob() : done(false), result(-1), needsCA(false), failureReported(false) { text[0] = 0; }
 };
 static std::shared_ptr<MitmJob> StartMitmJob(IProxyTlsControl* tls, unsigned action)
 {
@@ -679,7 +680,7 @@ void CPage4::OnTimer(UINT_PTR id)
     if (m_stopJob && m_stopJob->done.load()) {
         auto job = m_stopJob; m_stopJob.reset();
         SetMonitorControls(false);
-        if (job->result < 0) MessageBox(Utf8(job->text), Localization::Get(L"page4.title"), MB_ICONERROR);
+        if (job->result < 0 && !job->failureReported) MessageBox(Utf8(job->text), Localization::Get(L"page4.title"), MB_ICONERROR);
         else if(!job->recordingDirectory.empty()) {
             CString path=Utf8(job->recordingDirectory.c_str());
             if(path.Left(8)==L"\\\\?\\UNC\\")path=L"\\\\"+path.Mid(8);
@@ -733,10 +734,11 @@ void CPage4::OnTimer(UINT_PTR id)
             if(value.is_object() && value.value("stopped",false)) {
                 // The host watchdog already stops interception without touching active sockets.
                 m_monitor.SetCheck(BST_UNCHECKED);UpdateMonitorStatus();
+                if(m_stopJob) m_stopJob->failureReported=true;
                 CString reason=Utf8(value.value("reason",std::string("Recording stopped")).c_str());
                 CString directory=Utf8(value.value("directory",std::string()).c_str());
                 MessageBox(Localization::Get(L"recording.stopped")+L"\r\n\r\n"+reason+L"\r\n\r\n"+directory,
-                    Localization::Get(L"recording.options"),MB_ICONWARNING);
+                    Localization::Get(value.value("enabled",false)?L"recording.options":L"page4.title"),MB_ICONWARNING);
             }
         }
     }

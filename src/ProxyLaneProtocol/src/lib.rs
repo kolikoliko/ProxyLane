@@ -1,6 +1,7 @@
 //! Passive HTTP reconstruction from ordered, decrypted application bytes.
 //! Optional bounded temporary payload storage; no TLS or socket interception.
 pub mod cache;
+pub mod worker_failure;
 pub mod recording;
 pub mod recording_view;
 mod recording_hot;

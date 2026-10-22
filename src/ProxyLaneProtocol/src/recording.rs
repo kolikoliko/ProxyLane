@@ -86,6 +86,13 @@ impl State {
         if stored.is_none() { *stored = Some(reason.chars().take(512).collect()); }
         self.stopped.store(true, Ordering::Release);
     }
+    pub fn fail_worker(&self, reason:&str) {
+        // A disconnected producer can report "worker unavailable" while the
+        // worker unwinds. Retain the actual cause and mark uncertain capture.
+        self.gaps.fetch_add(1,Ordering::AcqRel);
+        *self.reason.lock().unwrap_or_else(|e|e.into_inner())=Some(reason.chars().take(512).collect());
+        self.stopped.store(true,Ordering::Release);
+    }
     pub fn reason(&self) -> Option<String> { self.reason.lock().unwrap_or_else(|e| e.into_inner()).clone() }
     pub fn status(&self, path: &Path) -> Value {
         json!({"enabled":true,"directory":path,"stopped":self.stopped.load(Ordering::Acquire),
@@ -149,6 +156,8 @@ pub(crate) struct Journal {
     list_sequence: u64,
     list_recent: crate::recording_index::Recent,
     list_failed: bool,
+    // At most one committed detail awaits its list row when a quota stops us.
+    list_pending: Option<Vec<u8>>,
     list_lock: Option<File>,
     hot: crate::recording_hot::HotFiles,
     payload_sizes: std::collections::BTreeMap<(u64,usize),Option<u64>>,
@@ -203,7 +212,7 @@ impl Journal {
             started:now_ms(),manifest_size:0,dirty:false,finalized:false,
             free_credit,
             space_checked:Instant::now(),bytes_since_space_check:0,
-            list_file,list_sequence:0,list_recent:Default::default(),list_failed:false,list_lock:Some(list_lock),
+            list_file,list_sequence:0,list_recent:Default::default(),list_failed:false,list_pending:None,list_lock:Some(list_lock),
             hot:Default::default(),payload_sizes:Default::default(),
             #[cfg(test)] list_disk_full:false};
         journal.list_write(json!({"format":"ProxyLaneListIndex","version":1}))?;
@@ -234,12 +243,17 @@ impl Journal {
     }
     pub fn event(&mut self, mut value: Value) -> Result<(),String> {
         if self.finalized { return Ok(()); }
+        if self.state.stopped.load(Ordering::Acquire) {return Err(self.state.reason().unwrap_or_else(||"recording stopped".into()));}
         let next_sequence=self.sequence+1;
         value["sequence"]=next_sequence.into(); value["timestamp_unix_ms"]=now_ms().into();
         value["recording_id"]=self.root.file_name().unwrap().to_string_lossy().to_string().into();
         let started=Instant::now();let projected=crate::recording_view::project(self,&mut value);
         self.measure(Stage::Projection,started);
-        if let Err(e)=projected {self.list_failed=true;return Err(e);}
+        if let Err(e)=projected {
+            // A quota rejection occurs before a write. Actual projection/index
+            // corruption must still require an explicit rebuild on opening.
+            if !Self::quota_stop(&e) {self.list_failed=true;} return Err(e);
+        }
         let mut line=serde_json::to_vec(&value).map_err(|e|e.to_string())?;line.push(b'\n');
         self.charge(line.len() as u64)?;
         if self.volume_bytes>0 && self.volume_bytes+line.len() as u64>VOLUME {
@@ -290,14 +304,24 @@ impl Journal {
     }
     fn list_write(&mut self,value:Value)->Result<(),String> {
         let bytes=crate::recording_index::line(self.list_sequence,value)?;
-        self.charge(bytes.len() as u64)?;
+        if let Err(e)=self.charge(bytes.len() as u64) {
+            // The detail JSON is already committed. Preserve its final row,
+            // bounded by the preallocated finish budget, instead of hiding it.
+            if Self::quota_stop(&e) && self.list_pending.is_none() && bytes.len() as u64<=RESERVE-8192-1024 {
+                self.list_pending=Some(bytes);
+            } else {self.list_failed=true;}
+            return Err(e);
+        }
+        self.list_append(&bytes)
+    }
+    fn list_append(&mut self,bytes:&[u8])->Result<(),String> {
         #[cfg(test)]
         if self.list_disk_full {
             // Fault injection: a partially written row followed by ERROR_DISK_FULL.
             self.list_file.write_all(&bytes[..bytes.len()/2]).unwrap();self.list_failed=true;
             return Err(format!("recording list index write failed: {}",std::io::Error::from_raw_os_error(112)));
         }
-        if let Err(e)=self.list_file.write_all(&bytes){self.list_failed=true;return Err(format!("recording list index write failed: {e}"));}
+        if let Err(e)=self.list_file.write_all(bytes){self.list_failed=true;return Err(format!("recording list index write failed: {e}"));}
         self.list_sequence+=1;self.dirty=true;Ok(())
     }
     pub(crate) fn list_snapshot(&mut self,value:&Value)->Result<(),String> {
@@ -394,12 +418,24 @@ impl Journal {
     pub fn finish(&mut self) -> Result<(),String> {
         if self.finalized {return Ok(());}
         if !self.state.stopped.load(Ordering::Acquire) {if let Err(e)=self.issues() {self.state.stop(&e);}}
-        if !self.list_failed && !self.state.stopped.load(Ordering::Acquire) {
-            if let Err(e)=self.list_write(json!({"end":self.list_sequence})) {self.list_failed=true;self.state.stop(&e);}
+        // This budget was already charged and physically allocated at start.
+        // Final rows must not use charge(), which rejects every stopped writer.
+        match fs::remove_file(self.root.join("finish.reserve")) {
+            Ok(())=>{self.state.used.fetch_sub(RESERVE,Ordering::AcqRel);},
+            Err(e)=>{self.list_failed=true;self.state.stop(&format!("cannot release recording finish reserve: {e}"));},
+        }
+        if !self.list_failed {
+            let result=(|| {
+                if let Some(bytes)=self.list_pending.take() {
+                    self.list_append(&bytes)?;self.state.used.fetch_add(bytes.len() as u64,Ordering::AcqRel);
+                }
+                let end=crate::recording_index::line(self.list_sequence,json!({"end":self.list_sequence}))?;
+                self.list_append(&end)?;self.state.used.fetch_add(end.len() as u64,Ordering::AcqRel);
+                Ok::<_,String>(())
+            })();
+            if let Err(e)=result {self.list_failed=true;self.state.stop(&e);}
         }
         self.finalized=true;self.state.ended.store(true,Ordering::Release);
-        // Release real allocated space for the final manifest even after disk exhaustion.
-        if fs::remove_file(self.root.join("finish.reserve")).is_ok() {self.state.used.fetch_sub(RESERVE,Ordering::AcqRel);}
         let started=Instant::now();
         let sync=self.sync_files().map_err(|e|format!("recording index sync failed: {e}"));
         self.measure(Stage::IndexSync,started);
@@ -407,6 +443,14 @@ impl Journal {
         let manifest=self.manifest(if self.state.stopped.load(Ordering::Acquire) {"stopped"}else{"completed"},self.state.reason());
         self.list_lock.take();manifest?;
         sync
+    }
+    fn quota_stop(reason:&str)->bool {matches!(reason,"recording capacity reached"|"recording disk reserve reached")}
+    pub(crate) fn worker_panicked(&mut self, reason:&str) {
+        // We cannot know which write/projection unwound. Do not seal an index
+        // whose correspondence to its detail files is now uncertain.
+        self.list_failed=true;
+        self.finalized=false; // Also retry the terminal manifest if finish unwound.
+        self.state.fail_worker(reason);
     }
 }
 
@@ -423,6 +467,48 @@ pub(crate) fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quota_stops_seal_valid_indexes_without_rebuild() {
+        for disk in [false,true] {
+            let path=std::env::temp_dir().join(format!("proxylane-index-stop-{}-{}-{disk}",std::process::id(),now_ms()));
+            fs::create_dir_all(&path).unwrap();File::create(path.join("owner.lock")).unwrap();
+            let state=Arc::new(State::default());
+            let mut j=Journal::new(&path,RecordingConfig{total_bytes:1024*1024,min_free_bytes:0},state.clone()).unwrap();
+            j.event(json!({"type":"observation","record":{"type":"connection","connection":{"id":"1"},"status":"Closed"}})).unwrap();
+            if disk {j.config.min_free_bytes=u64::MAX;j.free_credit=0;}
+            else {j.config.total_bytes=state.used.load(Ordering::Acquire)+8192;}
+            // The second detail is rejected before writing; index 1 remains usable.
+            assert!(j.event(json!({"type":"observation","record":{"type":"connection","connection":{"id":"2"}}})).is_err());
+            j.finish().unwrap();j.finish().unwrap();drop(j);
+            let mut reader=crate::recording_reader::Reader::open(&path).unwrap();
+            assert_eq!(reader.query(&json!({"type":"recording_page"})).unwrap()["total"],1);
+            let manifest:Value=serde_json::from_slice(&fs::read(path.join("manifest.json")).unwrap()).unwrap();
+            assert_eq!(manifest["status"],"stopped");
+            assert_eq!(manifest["stop_reason"],if disk {"recording disk reserve reached"}else{"recording capacity reached"});
+            assert!(!path.join("finish.reserve").exists());
+        }
+    }
+    #[test]
+    fn quota_after_detail_commit_flushes_one_pending_index_row() {
+        let path=std::env::temp_dir().join(format!("proxylane-index-pending-{}-{}",std::process::id(),now_ms()));
+        fs::create_dir_all(&path).unwrap();File::create(path.join("owner.lock")).unwrap();
+        let state=Arc::new(State::default());
+        let mut j=Journal::new(&path,RecordingConfig{total_bytes:1024*1024,min_free_bytes:0},state.clone()).unwrap();
+        let record=json!({"type":"connection","connection":{"id":"quic-1"},"status":"Closed"});
+        let mut saved=record.clone();saved["format"]="ProxyLaneSession".into();saved["version"]=2.into();saved["first_observed_unix_ms"]=100.into();
+        j.config.total_bytes=state.used.load(Ordering::Acquire)+8192+serde_json::to_vec_pretty(&saved).unwrap().len() as u64;
+        let limit=j.config.total_bytes;
+        assert_eq!(j.event(json!({"type":"observation","observed_unix_ms":100,"record":record})).unwrap_err(),"recording capacity reached");
+        assert!(path.join("connections/quic-1.json").is_file());assert!(j.list_pending.is_some());
+        j.finish().unwrap();drop(j);
+        let mut reader=crate::recording_reader::Reader::open(&path).unwrap();
+        assert_eq!(reader.query(&json!({"type":"recording_page"})).unwrap()["total"],1);
+        let manifest:Value=serde_json::from_slice(&fs::read(path.join("manifest.json")).unwrap()).unwrap();
+        assert!(manifest["used_bytes"].as_u64().unwrap()<=limit);
+        let size:u64=fs::read_dir(&path).unwrap().map(|e|e.unwrap()).filter(|e|e.file_type().unwrap().is_file())
+            .map(|e|e.metadata().unwrap().len()).sum::<u64>()+fs::metadata(path.join("connections/quic-1.json")).unwrap().len();
+        assert_eq!(manifest["used_bytes"],size);
+    }
     #[test]
     fn list_index_disk_full_preserves_details_and_requires_rebuild() {
         let path=std::env::temp_dir().join(format!("proxylane-list-full-{}-{}",std::process::id(),now_ms()));fs::create_dir_all(&path).unwrap();

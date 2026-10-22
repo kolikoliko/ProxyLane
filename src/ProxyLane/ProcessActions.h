@@ -26,7 +26,11 @@ namespace ProcessActions
 			0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, FALSE, pid);
 		if (!process) return NULL;
 		DWORD error = ERROR_SUCCESS;
-		if (CreationTime(process) != expectedCreationTime) error = ERROR_INVALID_DATA;
+		SetLastError(ERROR_SUCCESS);
+		const ULONGLONG actualCreationTime = CreationTime(process);
+		if (!actualCreationTime) error = GetLastError() ? GetLastError() : ERROR_INVALID_DATA;
+		// The captured lifetime is gone. Never terminate the new owner of its PID.
+		else if (actualCreationTime != expectedCreationTime) error = ERROR_NOT_FOUND;
 		else if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0) error = ERROR_NOT_FOUND;
 		else
 		{

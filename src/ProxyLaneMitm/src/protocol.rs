@@ -69,6 +69,8 @@ fn eof_reason(ticket:&Ticket,side:usize,clean:bool)->String {
     })
 }
 enum Event {
+    #[cfg(test)]
+    Panic,
     Timed(u64,Box<Event>),
     #[cfg(test)]
     Pause(mpsc::Receiver<()>,mpsc::Sender<()>),
@@ -135,6 +137,7 @@ fn record_metadata(mut value:Value)->Value {
 }
 
 pub struct Runtime {
+    failure: Arc<proxylane_protocol::worker_failure::WorkerFailure>,
     published:Arc<Mutex<PublishedResults>>,
     stop_progress:Mutex<StopProgress>,
     space: Arc<tokio::sync::Notify>,
@@ -157,8 +160,17 @@ pub struct Runtime {
     pub run_id: String,
 }
 impl Runtime {
-    pub fn recording_status(&self)->Value {self.cache.as_ref().map_or(json!({"enabled":false}),PayloadCache::recording_status)}
-    pub fn recording_failed(&self)->bool {self.cache.as_ref().is_some_and(PayloadCache::recording_failed)}
+    pub(crate) fn worker_error(&self)->Option<String> {
+        self.failure.reason().or_else(||self.cache.as_ref().and_then(PayloadCache::worker_error))
+    }
+    pub fn recording_status(&self)->Value {
+        let mut status=self.cache.as_ref().map_or(json!({"enabled":false}),PayloadCache::recording_status);
+        if let Some(reason)=self.worker_error() {status["stopped"]=true.into();status["worker_failed"]=true.into();status["reason"]=reason.into();}
+        status
+    }
+    pub fn recording_failed(&self)->bool {
+        self.failure.failed() || self.cache.as_ref().is_some_and(|c|c.worker_failed() || c.recording_failed())
+    }
     pub fn is_recording(&self)->bool {self.cache.as_ref().is_some_and(PayloadCache::is_recording)}
     fn fail_recording(&self, reason:&str) {if let Some(cache)=&self.cache {cache.fail_recording(reason);}}
     fn issue(&self, gap:bool, reason:&str, context:Value) {
@@ -226,13 +238,15 @@ impl Runtime {
         // before the disk-worker finish barrier. No network locks are held.
         self.drain_process_events();
         let (tx, rx) = mpsc::channel();
-        self.sender.send(Event::StopCapture(tx).timed()).map_err(|_| "analysis worker unavailable")?;
-        rx.recv().map_err(|_| "analysis worker unavailable")?;
+        let analysis=self.sender.send(Event::StopCapture(tx).timed()).map_err(|_| "analysis worker unavailable")
+            .and_then(|_|rx.recv().map_err(|_| "analysis worker unavailable"));
         // stats is a FIFO disk-worker barrier, retaining all existing payloads.
         lock(&self.stop_progress).advance("writing");
-        if let Some(cache) = &self.cache { cache.stats()?; }
+        let writing=self.cache.as_ref().map(PayloadCache::stats).transpose();
         lock(&self.stop_progress).advance("finalizing");
-        if let Some(cache) = &self.cache { cache.finish_recording()?; }
+        let finalizing=self.cache.as_ref().map(PayloadCache::finish_recording).transpose();
+        if let Some(reason)=self.worker_error() {return Err(reason);}
+        analysis?;writing?;finalizing?;
         Ok(())
     }
     pub fn configured() -> Result<Arc<Self>, String> {
@@ -290,21 +304,34 @@ impl Runtime {
         let worker_active = active.clone();
         let worker_parsers = parsers.clone();
         let worker_cache = cache.clone();
+        let failure=Arc::new(proxylane_protocol::worker_failure::WorkerFailure::default());
+        let worker_failure=failure.clone();
         let worker = thread::Builder::new()
             .name("protocol-analysis".into())
             .spawn(move || {
+                let outcome=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 Worker {
                     options: worker_options,
                     connections: BTreeMap::new(),
-                    cache: worker_cache,
+                    cache: worker_cache.clone(),
                     results: worker_results,
                     active: worker_active,
                     parsers: worker_parsers,
                 }
-                .run_notifying(receiver,worker_space);
+                .run_notifying(receiver,worker_space.clone());
+                }));
+                if let Err(payload)=outcome {
+                    let reason=proxylane_protocol::worker_failure::panic_reason("protocol-analysis",payload.as_ref());
+                    if let Some(cache)=&worker_cache {
+                        cache.analysis_worker_failed(&reason);
+                    }
+                    worker_failure.set(&reason);
+                    worker_space.notify_waiters();
+                }
             })
             .map_err(|e| e.to_string())?;
         Ok(Arc::new(Self {
+            failure,
             published,
             stop_progress:Mutex::new(StopProgress::default()),
             space,
@@ -334,6 +361,12 @@ impl Runtime {
     pub(crate) fn pause_worker(&self)->mpsc::Sender<()> {
         let (resume,wait)=mpsc::channel();let (entered,ready)=mpsc::channel();
         self.sender.send(Event::Pause(wait,entered)).unwrap();ready.recv().unwrap();resume
+    }
+    #[cfg(test)]
+    pub(crate) fn panic_worker(&self) {
+        self.sender.send(Event::Panic).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(3);
+        while self.worker_error().is_none() {assert!(Instant::now()<deadline);thread::yield_now();}
     }
     #[cfg(test)]
     pub(crate) fn fill_paused_queue(&self) {
@@ -419,6 +452,7 @@ impl Runtime {
         // tiny snapshot even while an analysis/disk barrier is waiting.
         if request["type"]=="monitor_stop_status" {return Ok(lock(&self.stop_progress).snapshot());}
         if request["type"]=="recording_status" {return Ok(self.recording_status());}
+        if let Some(reason)=self.worker_error() {return Err(reason);}
         if self.stopping.load(Ordering::Acquire) {
             return Err("analysis stopped".into());
         }
@@ -968,6 +1002,8 @@ impl Worker {
             let _time=proxylane_protocol::recording::observation_time(time);
             space.notify_waiters();
             match event {
+                #[cfg(test)]
+                Ok(Event::Panic)=>panic!("injected analysis panic"),
                 Ok(Event::Timed(..))=>unreachable!("nested capture timestamp"),
                 #[cfg(test)]
                 Ok(Event::Pause(wait,entered))=>{let _=entered.send(());let _=wait.recv();},
@@ -1368,6 +1404,7 @@ mod tests {
             recording:Some(proxylane_protocol::recording::RecordingConfig {total_bytes:1024*1024,min_free_bytes:0}),..Default::default()}).unwrap();
         let published=Arc::new(Mutex::new(PublishedResults::default()));
         let r = Arc::new(Runtime {
+            failure: Default::default(),
             published:published.clone(),
             stop_progress:Mutex::new(StopProgress::default()),
             space:Arc::new(tokio::sync::Notify::new()),
@@ -1652,6 +1689,29 @@ mod recording_tests {
         Runtime::with_options(CacheConfig {root:std::env::temp_dir().join("proxylane-runtime-recordings"),queue_chunks:1024,
             recording:Some(proxylane_protocol::recording::RecordingConfig {total_bytes:32*1024*1024,min_free_bytes:0}),..Default::default()},
             crate::options::Options {udp_packets:16,..Default::default()}).unwrap()
+    }
+    #[test]
+    fn analysis_panic_stops_capture_explicitly_and_preserves_prior_recording() {
+        for retained in [false,true] {
+            let r=if retained {runtime()}else{Runtime::new(CacheConfig{root:std::env::temp_dir().join("proxylane-analysis-panic-tests"),..Default::default()}).unwrap()};
+            let path=r.cache.as_ref().unwrap().directory().to_owned();
+            let mut tap=r.tap_transport(Connection{id:"panic-test".into(),transport:"tcp".into(),..Default::default()},Some(b"opaque".to_vec()),false).unwrap();
+            tap.data(0,b"before panic");r.query(&json!({"type":"stats"})).unwrap();
+            r.sender.send(Event::Panic).unwrap();
+            let deadline=Instant::now()+Duration::from_secs(3);
+            while r.worker_error().is_none() {assert!(Instant::now()<deadline);thread::yield_now();}
+            assert_eq!(r.recording_status()["stopped"],true);
+            assert_eq!(r.recording_status()["worker_failed"],true);
+            tap.data(0,b"after panic");assert!(!tap.is_capturing());
+            assert!(r.tap(Default::default(),None).is_none());
+            assert!(r.stop_capture().unwrap_err().contains("injected analysis panic"));
+            r.shutdown().unwrap();
+            if retained {
+                let manifest:Value=serde_json::from_slice(&fs::read(path.join("manifest.json")).unwrap()).unwrap();
+                assert_eq!(manifest["status"],"stopped");assert_eq!(manifest["quality"]["capture_incomplete"],true);
+                assert!(manifest["stop_reason"].as_str().unwrap().contains("injected analysis panic"));
+            }
+        }
     }
     #[test]
     fn process_notifications_drain_on_stop_without_holding_capture_gate() {
