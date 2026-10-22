@@ -1,7 +1,8 @@
 <h1 align="center">ProxyLane</h1>
 
 <p align="center">
-  <strong>Transparent per-process proxy for Windows · No TUN required · Separate proxy settings · Automatic child-process inheritance</strong>
+  <strong>Transparent per-process proxy for Windows · HTTPS / QUIC traffic decryption</strong><br>
+  No TUN required · Separate proxy settings · Automatic child-process inheritance · Traffic recording and offline playback
 </p>
 
 <p align="center">
@@ -13,6 +14,10 @@
 ---
 
 ProxyLane is an application-level transparent proxy for Windows. It uses process injection and network API hooks to route selected applications through a separately configured proxy without changing the system-wide proxy settings.
+
+**Inspect encrypted application traffic:** decrypt HTTPS and QUIC v1, view HTTP/1.1, HTTP/2 and HTTP/3 requests, responses and bodies, and record, filter and replay sessions by process. Select `NOPROXY` to monitor and decrypt traffic without an external proxy.
+
+Decryption requires the **64-bit host**, enabling the relevant options and installing a local CA. See [Traffic Monitoring and Decryption](#traffic-monitoring-and-decryption) for setup and application compatibility.
 
 ## Usage Demo
 
@@ -36,11 +41,14 @@ python script.py
 ## Features
 
 - Transparent proxying for selected applications and processes
+- HTTPS and QUIC v1 decryption with HTTP/1.1, HTTP/2 and HTTP/3 request, response and body inspection (64-bit host)
+- Network sessions by process, DNS queries and responses, and Raw/Hex inspection
+- Traffic recording and offline playback for troubleshooting and analysis
 - Proxy profile management and connection testing
 - HTTP and SOCKS5 support for TCP and UDP traffic
 - Child-process and destination filtering rules
 - Launch and proxy applications by dropping programs or shortcuts into the window
-- Runtime logs and proxied connection data monitoring
+- Runtime logs and connection traffic statistics
 - Win32 and x64 builds
 - Compatible with Windows XP through Windows 11
 
