@@ -2,6 +2,7 @@
 
 
 #include "structinfo.h"
+#include "HookFailureDiagnostics.h"
 #include "TSSTL.h"
 #include "PRCPipeClient.h"
 #include "DnsRedirectPolicy.h"
@@ -656,6 +657,8 @@ public:
 	BOOL HookWinsock();
 
 	BOOL ApplyHooks(bool attach);
+	BOOL SetHookFailure(DWORD error, const char* stage, const char* module, const char* api);
+	BOOL ReportHookFailure(CPRCPipeClient* client);
 	BOOL HookAPI(eHOOKMODUDLE ehm, eHOOKFUN ehf, char *exportfunc, LPVOID myfuncaddr, PVOID* original);
 
 	BOOL IsHostNameReserved(const char *name);
@@ -790,6 +793,10 @@ private:
 
 	MODULENAME   m_ModuleName[HOOKMODULE_COUNT];
 	HOOKSTRUCT m_HookedInfo[HOOKAPI_COUNT];
+	const char* m_HookModules[HOOKAPI_COUNT];
+	const char* m_HookApis[HOOKAPI_COUNT];
+	HookFailureDiagnostics m_hookFailure;
+	DWORD m_tlsError;
 
 
 

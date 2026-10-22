@@ -317,6 +317,10 @@ CHookWinsock::CHookWinsock(void)
 	InitializeCriticalSection(&m_RequestPipeLock);
 	InitializeCriticalSection(&m_PRCPipeNameLock);
 	m_ProcessCreationTls = TlsAlloc();
+	m_tlsError = m_ProcessCreationTls == TLS_OUT_OF_INDEXES ? ::GetLastError() : 0;
+	m_hookFailure.Set(0, NULL, NULL, NULL);
+	ZeroMemory(m_HookModules, sizeof(m_HookModules));
+	ZeroMemory(m_HookApis, sizeof(m_HookApis));
 	ZeroMemory(m_HookedInfo, sizeof(m_HookedInfo));
 	ZeroMemory(&m_psi, sizeof(m_psi));
 	ZeroMemory(&m_appLauncherHost, sizeof(m_appLauncherHost));
@@ -424,18 +428,30 @@ BOOL CHookWinsock::EnableHook()
 	CPRCPipeClient PRCPipeClient;
 
 	if (!PRCPipeClient.Connect(m_szPRCPipeName))
-		return FALSE;
+	{
+		SetHookFailure(::GetLastError(), "connect-control-pipe", "kernel32.dll", "CreateFile/WaitNamedPipe");
+		return ReportHookFailure(NULL);
+	}
 
 	if (!PRCPipeClient.PRCGetProxySettingsInfo(&m_psi))
 	{
-		return FALSE;
+		SetHookFailure(::GetLastError(), "read-proxy-settings", "PRC", "PRCGetProxySettingsInfo");
+		// A failed exchange can leave unread bytes. Report on a fresh connection.
+		PRCPipeClient.Disconnect();
+		PRCPipeClient.Connect(m_szPRCPipeName);
+		return ReportHookFailure(&PRCPipeClient);
 	}
 
 	PRCINFO startupInfo;
 	bool quicPolicy=false;
 	AppLauncherHostInfo launcher = {};
 	if (!PRCPipeClient.GetPRCStartupInfo(&startupInfo, &quicPolicy, &launcher))
-		return FALSE;
+	{
+		SetHookFailure(::GetLastError(), "read-startup-info", "PRC", "GetPRCStartupInfo");
+		PRCPipeClient.Disconnect();
+		PRCPipeClient.Connect(m_szPRCPipeName);
+		return ReportHookFailure(&PRCPipeClient);
+	}
 	{ CScopedCriticalSection lock(&m_PRCPipeNameLock); m_appLauncherHost=launcher; }
 
 	DWORD localDnsHostNameLength = _countof(m_LocalDnsHostName);
@@ -480,12 +496,44 @@ BOOL CHookWinsock::EnableHook()
 		m_ChildGuardInstalled = FALSE;
 	}
 
-	PRCPipeClient.PRCNotifyHookWSockResult(
-		bOK ? 0 : 1, GetCurrentProcessCreateTimeValue());
+	if (!bOK)
+		ReportHookFailure(&PRCPipeClient);
+	else
+		PRCPipeClient.PRCNotifyHookWSockResult(0, GetCurrentProcessCreateTimeValue());
 
 	PRCPipeClient.Disconnect();
 
+	if (!bOK) ::SetLastError(m_hookFailure.error);
 	return bOK;
+}
+
+BOOL CHookWinsock::SetHookFailure(DWORD error, const char* stage, const char* module, const char* api)
+{
+	m_hookFailure.Set(error, stage, module, api);
+	m_szLastError.Format(_T("%hs: %hs!%hs, error %lu"), stage,
+		module ? module : "n/a", api ? api : "n/a", error);
+	::SetLastError(error);
+	return FALSE;
+}
+
+BOOL CHookWinsock::ReportHookFailure(CPRCPipeClient* client)
+{
+	WCHAR path[MAX_PATH] = {}, message[1536] = {};
+	GetModuleFileNameW(NULL, path, _countof(path));
+	path[_countof(path) - 1] = L'\0';
+	m_hookFailure.Format(message, _countof(message), path, GetCurrentProcessId());
+	// Still observable under a debugger if the control pipe itself is unavailable.
+	OutputDebugStringW(message);
+	if (client && client->IsConnected())
+	{
+		// Keep the original protocol, including compatibility with older PL hosts.
+		client->PRCLogtext(message);
+		client->PRCNotifyHookWSockResult(m_hookFailure.error ? m_hookFailure.error : ERROR_GEN_FAILURE,
+			GetCurrentProcessCreateTimeValue());
+	}
+	if (client) client->Disconnect();
+	::SetLastError(m_hookFailure.error);
+	return FALSE;
 }
 
 BOOL CHookWinsock::SetPRCPipeName(LPCSTR lpszPipeName)
@@ -545,17 +593,19 @@ BOOL CHookWinsock::DisableHook()
 BOOL CHookWinsock::ApplyHooks(bool attach)
 {
 	DetourHookBinding bindings[HOOKAPI_COUNT];
+	int indices[HOOKAPI_COUNT];
 	size_t count = 0;
 	for (int i = 0; i < HOOKAPI_COUNT; ++i)
-		if (m_HookedInfo[i].original) bindings[count++] = m_HookedInfo[i];
-	LONG error = attach ? InstallDetourHooks(bindings, count)
-	                    : RemoveDetourHooks(bindings, count);
+		if (m_HookedInfo[i].original) { indices[count] = i; bindings[count++] = m_HookedInfo[i]; }
+	DetourHookFailure failure = {};
+	LONG error = attach ? InstallDetourHooks(bindings, count, &failure)
+	                    : RemoveDetourHooks(bindings, count, &failure);
 	if (error != NO_ERROR)
 	{
-		m_szLastError.Format(_T("Detours %s failed: %ld"),
-			attach ? _T("attach") : _T("detach"), error);
-		::SetLastError(error);
-		return FALSE;
+		const int index = failure.bindingIndex < count ? indices[failure.bindingIndex] : -1;
+		return SetHookFailure(error, failure.stage,
+			index >= 0 ? m_HookModules[index] : NULL,
+			index >= 0 ? m_HookApis[index] : NULL);
 	}
 	m_bHookEnabled = attach ? TRUE : FALSE;
 	return TRUE;
@@ -566,15 +616,18 @@ BOOL CHookWinsock::HookAPI(eHOOKMODUDLE ehm, eHOOKFUN ehf, char *exportfunc,
 	LPVOID myfuncaddr, PVOID* original)
 {
 	HMODULE module = GetModuleHandleA(m_ModuleName[ehm]);
+	if (!module)
+		return SetHookFailure(::GetLastError(), "resolve-module", m_ModuleName[ehm], exportfunc);
 	PVOID target = module ? reinterpret_cast<PVOID>(GetProcAddress(module, exportfunc)) : NULL;
 	if (!target)
 	{
-		m_szLastError.Format(_T("Unable to resolve hook export: %hs"), exportfunc);
-		return FALSE;
+		return SetHookFailure(::GetLastError(), "GetProcAddress", m_ModuleName[ehm], exportfunc);
 	}
 	*original = target;
 	m_HookedInfo[ehf].original = original;
 	m_HookedInfo[ehf].replacement = myfuncaddr;
+	m_HookModules[ehf] = m_ModuleName[ehm];
+	m_HookApis[ehf] = exportfunc;
 	return TRUE;
 }
 
@@ -2602,14 +2655,13 @@ MyDetourProc(has_Return, int, WSAAPI, WSASend, (SOCKET s,LPWSABUF buffers,DWORD 
 BOOL CHookWinsock::HookWinsock()
 {
 	if (m_ProcessCreationTls == TLS_OUT_OF_INDEXES)
-		return FALSE;
+		return SetHookFailure(m_tlsError, "allocate-tls", "kernel32.dll", "TlsAlloc");
 	int i;
 	for (i = 0; i < HOOKMODULE_COUNT; i++)
 	{
 		if (!GetModuleHandleA(m_ModuleName[i]) && !LoadLibraryA(m_ModuleName[i]))
 		{
-			m_szLastError = _T("Failed to initialize HookWinsock: LoadLibrary");
-			return FALSE;
+			return SetHookFailure(::GetLastError(), "LoadLibraryA", m_ModuleName[i], "LoadLibraryA");
 		}
 	}
 

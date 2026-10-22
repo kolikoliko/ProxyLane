@@ -44,6 +44,32 @@ namespace
 		}
 		return endpoint;
 	}
+
+	CString HookResultProcessName(const HookWSockResult& result)
+	{
+		// Best effort for legacy result messages. The detailed diagnostic carries
+		// the sender's own name even if the process has already exited.
+		WCHAR path[MAX_PATH] = {};
+		typedef BOOL (WINAPI *QueryImageName)(HANDLE, DWORD, LPWSTR, PDWORD);
+		QueryImageName query = reinterpret_cast<QueryImageName>(GetProcAddress(
+			GetModuleHandleW(L"kernel32.dll"), "QueryFullProcessImageNameW"));
+		HANDLE process = query ? OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */,
+			FALSE, result.dwProcessId) : NULL;
+		if (process)
+		{
+			FILETIME created, exited, kernel, user;
+			if (GetProcessTimes(process, &created, &exited, &kernel, &user) &&
+				(!result.processCreateTime || result.processCreateTime ==
+				((static_cast<ULONGLONG>(created.dwHighDateTime) << 32) | created.dwLowDateTime)))
+			{
+				DWORD length = _countof(path);
+				if (!query(process, 0, path, &length)) path[0] = L'\0';
+			}
+			CloseHandle(process);
+		}
+		path[_countof(path) - 1] = L'\0';
+		return LogProcessName(CString(path));
+	}
 }
 
 
@@ -424,7 +450,7 @@ void CPage2::OnHookWsock(LPHookWSockResult res)
 		CString str;
 
 		str = Localization::Format(_T("log.hook_failed"),
-			static_cast<LPCTSTR>(LogProcessName(NULL)), res->dwProcessId, res->err);
+			static_cast<LPCTSTR>(HookResultProcessName(*res)), res->dwProcessId, res->err);
 
 		AddLogText(str);
 	}

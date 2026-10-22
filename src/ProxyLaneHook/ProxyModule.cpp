@@ -190,11 +190,32 @@ BOOL WINAPI gp_HookWinsock(LPCSTR lpszPRCPipeName)
 		GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
 		reinterpret_cast<LPCWSTR>(&gp_HookWinsock), &pinned))
 	{
+		const DWORD error = GetLastError();
+		HookFailureDiagnostics failure;
+		failure.Set(error, "pin-hook-module", "kernel32.dll", "GetModuleHandleExW");
+		WCHAR path[MAX_PATH] = {}, message[1536] = {};
+		GetModuleFileNameW(NULL, path, _countof(path));
+		path[_countof(path) - 1] = L'\0';
+		failure.Format(message, _countof(message), path, GetCurrentProcessId());
+		OutputDebugStringW(message);
+		CPRCPipeClient client;
+		if (client.Connect(CString(lpszPRCPipeName)))
+		{
+			client.PRCLogtext(message);
+			FILETIME created, exited, kernel, user;
+			ULONGLONG createdAt = 0;
+			if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user))
+				createdAt = (static_cast<ULONGLONG>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+			client.PRCNotifyHookWSockResult(error ? error : ERROR_GEN_FAILURE, createdAt);
+		}
+		client.Disconnect();
+		SetLastError(error);
 		return FALSE;
 	}
 	g_pPMHookWs = new CHookWinsock;
 	g_pPMHookWs->SetPRCPipeName(lpszPRCPipeName);
 	const BOOL result = g_pPMHookWs->EnableHook();
+	const DWORD hookError = GetLastError();
 	// Only failed installation may destroy this object; installed callbacks keep using it.
 	if (!result && !g_pPMHookWs->IsHookEnabled())
 	{
@@ -202,6 +223,7 @@ BOOL WINAPI gp_HookWinsock(LPCSTR lpszPRCPipeName)
 		g_pPMHookWs = NULL;
 	}
 	DeferredMitigationPolicy::RestoreCigPolicy();
+	if (!result) SetLastError(hookError);
 	return result;
 }
 

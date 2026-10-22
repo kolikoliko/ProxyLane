@@ -91,7 +91,8 @@ BOOL CPRCPipeClient::WritePipe(LPCVOID lpBuf, int size)
 	if(!WriteFile(m_hPipe, lpBuf, size, &nWritten, NULL))
 		return FALSE;
 
-	return nWritten == (DWORD)size;
+	if (nWritten != (DWORD)size) { ::SetLastError(ERROR_WRITE_FAULT); return FALSE; }
+	return TRUE;
 }
 
 BOOL CPRCPipeClient::ReadPipe(LPVOID lpBuf, int size)
@@ -102,7 +103,8 @@ BOOL CPRCPipeClient::ReadPipe(LPVOID lpBuf, int size)
 	if(!ReadFile(m_hPipe, lpBuf, size, &nRead, NULL))
 		return FALSE;
 
-	return nRead == (DWORD)size;
+	if (nRead != (DWORD)size) { ::SetLastError(ERROR_INVALID_DATA); return FALSE; }
+	return TRUE;
 }
 
 
@@ -117,7 +119,9 @@ BOOL CPRCPipeClient::GetPRCStartupInfo(LPPRCINFO lpStartupInfo, bool* quicPolicy
     if(hdr.action!=PRCPD_REPLY||hdr.flag!=1 ||
         (hdr.dataSize!=sizeof(*lpStartupInfo)&&
         (!(quicPolicy||launcher)||hdr.dataSize!=sizeof(*lpStartupInfo)+sizeof(DWORD))&&
-        (!launcher||hdr.dataSize!=sizeof(*lpStartupInfo)+sizeof(DWORD)+sizeof(*launcher))))return FALSE;
+        (!launcher||hdr.dataSize!=sizeof(*lpStartupInfo)+sizeof(DWORD)+sizeof(*launcher)))) {
+        ::SetLastError(ERROR_INVALID_DATA); return FALSE;
+    }
     if(!ReadPipe(lpStartupInfo,sizeof(*lpStartupInfo)))return FALSE;
     if(hdr.dataSize>sizeof(*lpStartupInfo)) {DWORD flags=0;if(!ReadPipe(&flags,sizeof(flags)))return FALSE;if(quicPolicy)*quicPolicy=(flags&1)!=0;}
     if(launcher && hdr.dataSize==sizeof(*lpStartupInfo)+sizeof(DWORD)+sizeof(*launcher)) {
@@ -246,7 +250,7 @@ BOOL CPRCPipeClient::PRCGetProxySettingsInfo(LPProxySettingsInfo lpPSI)
 		return FALSE;
 
 	if(hdr.action != PRCPD_REPLY || hdr.flag != 1 || hdr.dataSize != sizeof(*lpPSI))
-		return FALSE;
+	{ ::SetLastError(ERROR_INVALID_DATA); return FALSE; }
 
 	if(!ReadPipe(lpPSI, sizeof(*lpPSI)))
 		return FALSE;

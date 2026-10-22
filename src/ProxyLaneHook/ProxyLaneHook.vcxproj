@@ -367,6 +367,7 @@
     <ClInclude Include="InjectDll.h" />
     <ClInclude Include="HookDispatch.h" />
     <ClInclude Include="DetourHooks.h" />
+    <ClInclude Include="HookFailureDiagnostics.h" />
     <ClInclude Include="MySocket.h" />
     <ClInclude Include="PRCPipeClient.h" />
     <ClInclude Include="PRCPipeServer.h" />
