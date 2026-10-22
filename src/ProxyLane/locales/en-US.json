@@ -22,6 +22,7 @@
   "log.stage_attach": "Attach connection",
   "log.unknown_process": "Unknown process",
   "log.process_injected": "[Process] %s (%lu) · Injection succeeded\r\n",
+  "log.app_launch_success": "[Launch] %s (%lu) → %s (%lu) · Launched and hooked\r\n",
   "log.process_injection_failed": "[Failed] %s (%lu) · Injection failed\r\n",
   "log.process_skipped": "[Skipped] %s (%lu) · Matched filter rule\r\n",
   "log.hook_failed": "[Failed] %s (%lu) · Network hook failed (error %lu)\r\n",

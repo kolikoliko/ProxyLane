@@ -36,4 +36,4 @@ void LogConnectionEvent(IProxyLog::ConnectionEvent event, const LPPRCClient clie
 	LPCWSTR processName);
 void LogUdpFirstDatagram(CProxyReceptionCentre *receptionCentre,
 	const LPPRCClient lpC, const LPProxyInfo lpPI);
-void LogDnsRedirect(const LPPRCClient lpC);
+void LogDnsRedirect(const LPPRCClient lpC, LPCWSTR processName);

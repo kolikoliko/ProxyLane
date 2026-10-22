@@ -2279,6 +2279,10 @@ bool CHookWinsock::TryCreateAppLauncher(
 		message.Format(L"AppsFolder helper: %s; flags=0x%08lX, token=%u, tokenOut=%u, host=%lu/v%lu, helper=%lu, error=%lu, image=%s",
 			reason, dwCreationFlags, hToken != NULL, hNewToken != NULL,
 			host.processId, host.version, pid, error, lpApplicationName ? lpApplicationName : L"(command line)");
+		ATLTRACE(L"%s\r\n", static_cast<LPCWSTR>(message));
+		// Successful creation is an intermediate step. The host logs the final
+		// activation/Hook result; retain failures and skips in the run log.
+		if (!pid || error)
 		{
 			CScopedCriticalSection lock(&m_RequestPipeLock);
 			if (EnsureRequestPipe() && !m_RequestPipe.PRCLogtext(message)) m_RequestPipe.Disconnect();

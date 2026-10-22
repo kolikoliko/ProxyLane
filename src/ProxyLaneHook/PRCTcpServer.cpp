@@ -254,7 +254,7 @@ void CPRCTcpServer::OnAccept(int nErrorCode)
 
 	LogConnectionEvent(pisetting.GetProxyType() == PROXYTYPE_NOPROXY
 		? IProxyLog::ROUTE_DIRECT : IProxyLog::ROUTE_PROXY, &PRCC, ppszName);
-	LogDnsRedirect(&PRCC);
+	LogDnsRedirect(&PRCC, ppszName);
 
 
 }

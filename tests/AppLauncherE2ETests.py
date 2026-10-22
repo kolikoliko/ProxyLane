@@ -33,8 +33,10 @@ def launcher_log(owner):
         return True
     USER.EnumChildWindows(main, visit, 0)
     assert len(edits) == 1 and edits[0], edits
-    return wait_for(lambda: window_text(edits[0]) if 'AppsFolder helper:' in window_text(edits[0]) else None,
-                    'AppsFolder routing diagnostic')
+    def completed_log():
+        value = window_text(edits[0])
+        return value if any(marker in value for marker in ('[Launch]', '[启动]', 'AppsFolder activation:')) else None
+    return wait_for(completed_log, 'AppsFolder launch result')
 
 
 def transact(pipe_name, action, flag=0, payload=b''):
@@ -134,6 +136,7 @@ def protocol_cases(root, package, family, observations):
             assert helper.returncode == invalid[0], (executable, helper.returncode, invalid)
         assert len((package / 'app.activations').read_text().splitlines()) == 1
         (package / 'app.go').write_text('go')
+        assert '!Missing' in launcher_log(owner), 'Activation failures must remain in the run log'
         deadline = time.monotonic() + 30
         while not (package / 'app.done').exists() and time.monotonic() < deadline:
             time.sleep(.05)
@@ -164,6 +167,7 @@ def png(path, size):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bin', type=Path, required=True)
+    parser.add_argument('--language', choices=('en-US', 'zh-CN'), default='en-US')
     parser.add_argument('--case', choices=('shell', 'bare', 'newconsole', 'token'), help='Run one launcher variant on x86 and x64')
     args = parser.parse_args()
     root = Path('build/qa/app-launcher-' + uuid.uuid4().hex[:8]).resolve()
@@ -212,7 +216,7 @@ def main():
             threading.Thread(target=serve, args=(listener, observations), daemon=True).start()
             (root / 'ProxyLane.ini').write_text('''[options]
 lastselected=AppsFolderTest
-language=en-US
+language=%s
 [proxy_AppsFolderTest]
 HookChildProcess=1
 HookTCP=1
@@ -227,7 +231,7 @@ Type=SOCKS5
 Host=127.0.0.1
 Port=%d
 Transport=PLAIN
-''' % listener.getsockname()[1], encoding='utf-8')
+''' % (args.language, listener.getsockname()[1]), encoding='utf-8')
             cases = [(32, args.case), (64, args.case)] if args.case else [
                 (32, 'suspended'), (64, 'normal'), (64, 'close'),
                 (32, 'shell'), (64, 'shell'), (32, 'bare'), (64, 'bare'),
@@ -250,7 +254,10 @@ Transport=PLAIN
                 logs = launcher_log(owner)
                 (root / ('launcher-%d-%s.log' % (bits, mode))).write_text(logs, encoding='utf-8')
                 assert text.startswith('PASS'), text
-                assert 'AppsFolder helper: created;' in logs, logs
+                marker = '[启动]' if args.language == 'zh-CN' else '[Launch]'
+                lines = [line for line in logs.splitlines() if marker in line]
+                assert len(lines) == 1 and ('probe%d.exe (' % bits) in lines[0] and 'probe64.exe (' in lines[0], logs
+                assert 'AppsFolder helper: created;' not in logs and 'AppsFolder activation:' not in logs, logs
                 for filename in ('app.done', 'child32.done', 'child64.done'):
                     assert (package / filename).read_text(encoding='utf-8-sig').startswith('PASS'), filename
                 assert observations[before:] == [('203.0.113.10', 39093)] * 3, observations[before:]

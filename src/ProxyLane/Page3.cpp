@@ -3093,6 +3093,23 @@ BOOL CPage3::LaunchAppFromShell(const AppLauncherRequest& request, AppLauncherRe
     CString message;
     message.Format(L"AppsFolder activation: %s, requester PID %lu, target PID %lu, launch error 0x%08lX, Hook error %lu.\r\n",
         request.aumid,request.parentPid,result.processId,result.error,result.hookError);
+    ATLTRACE(L"%s", static_cast<LPCWSTR>(message));
+    if (!result.error && !result.hookError && g_GlobalProxy)
+    {
+        auto processName = [&](DWORD pid, ULONGLONG creationTime, LPCWSTR fallback) {
+            HookProcessIdentityInfo identity = {};
+            if (!g_GlobalProxy->GetProcessRegistry()->Get(pid, creationTime, &identity) || !identity.szAppPath[0])
+                return CString(fallback);
+            CString path(identity.szAppPath);
+            return path.Mid(path.ReverseFind(L'\\') + 1);
+        };
+        CString source = processName(request.parentPid, request.parentCreationTime,
+            Localization::Get(_T("log.unknown_process")));
+        CString target = processName(result.processId, 0, request.aumid);
+        message = Localization::Format(_T("log.app_launch_success"),
+            static_cast<LPCTSTR>(source), request.parentPid,
+            static_cast<LPCTSTR>(target), result.processId);
+    }
     if(g_GlobalProxy) g_GlobalProxy->GetLogInstance()->LogText(message);
     return TRUE;
 }

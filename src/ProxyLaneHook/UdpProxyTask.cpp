@@ -303,7 +303,7 @@ VOID CUdpProxyTask::OnServerReady(CPRCUdpPeer *pPeer)
 	m_pTaskmgr->ReportUdpAssociationReady(&m_ProxyInfo);
 	m_serverReconnectDelay = 250;
 	m_lastServerError = 0;
-	PrintText(_T("UDP SOCKS5 association ready; local route %d.\r\n"),
+	ATLTRACE(_T("UDP SOCKS5 association ready; local route %d.\r\n"),
 		m_LocalProxyUdpPort);
 	OnServerWritable();
 }

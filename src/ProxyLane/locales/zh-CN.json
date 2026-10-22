@@ -22,6 +22,7 @@
   "log.stage_attach": "接管连接",
   "log.unknown_process": "未知进程",
   "log.process_injected": "[进程] %s (%lu) · 注入成功\r\n",
+  "log.app_launch_success": "[启动] %s (%lu) → %s (%lu) · 启动并接管成功\r\n",
   "log.process_injection_failed": "[失败] %s (%lu) · 注入失败\r\n",
   "log.process_skipped": "[跳过] %s (%lu) · 命中过滤规则\r\n",
   "log.hook_failed": "[失败] %s (%lu) · 网络接管失败（错误 %lu）\r\n",

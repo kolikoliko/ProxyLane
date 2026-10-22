@@ -179,7 +179,7 @@ void LogUdpFirstDatagram(CProxyReceptionCentre *receptionCentre,
 		processPath, _countof(processPath));
 	LogConnectionEvent(lpPI->GetProxyType() == PROXYTYPE_NOPROXY
 		? IProxyLog::ROUTE_DIRECT : IProxyLog::ROUTE_PROXY, lpC, processName);
-	LogDnsRedirect(lpC);
+	LogDnsRedirect(lpC, processName);
 }
 
 static CString FormatDnsEndpoint(const _SockAddr& address)
@@ -204,12 +204,13 @@ static CString FormatDnsEndpoint(const _SockAddr& address)
 	return endpoint;
 }
 
-void LogDnsRedirect(const LPPRCClient lpC)
+void LogDnsRedirect(const LPPRCClient lpC, LPCWSTR processName)
 {
 	if (!lpC || !lpC->HasProxyDestination())
 		return;
 	CString original = FormatDnsEndpoint(lpC->dstAddr);
 	CString effective = FormatDnsEndpoint(lpC->proxyDstAddr);
-	PrintText(_T("DNS target redirected: PID %d, %s -> %s.\r\n"),
-		lpC->dwPid, (LPCTSTR)original, (LPCTSTR)effective);
+	CString name(processName && processName[0] ? processName : L"Unknown");
+	PrintText(_T("[DNS] %s (%lu) \x00b7 %s \x2192 %s\r\n"),
+		(LPCTSTR)name, lpC->dwPid, (LPCTSTR)original, (LPCTSTR)effective);
 }
