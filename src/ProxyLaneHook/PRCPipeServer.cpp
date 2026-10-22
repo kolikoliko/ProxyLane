@@ -91,12 +91,14 @@ CPRCPipeServer::CPRCPipeServer(CProxyReceptionCentre *pPRC)
 	m_hMainThread = NULL;
 	m_dwThreadCount = 0;
 	m_hNoThreadEvent = NULL;
+	InitializeCriticalSection(&m_launchExecutionLock);
 }
 
 CPRCPipeServer::~CPRCPipeServer(void)
 {
 	ShutdownServer();
     BrowserQuicPolicy::Forget(m_pPRC);
+    DeleteCriticalSection(&m_launchExecutionLock);
 }
 
 
@@ -405,7 +407,10 @@ DWORD WINAPI CPRCPipeServer::_InstanceThread(HANDLE hPipe, HANDLE hThread)
         }
 		case PRCPD_GETSTARTUPINFO:
 			{
-				const bool extended=hdr.flag==2;
+				const bool launcherExtended=hdr.flag==3;
+				const bool extended=hdr.flag==2 || launcherExtended;
+				AppLauncherHostInfo launcher = {};
+				if(launcherExtended) m_pPRC->m_pGlobalProxy->GetLogInstance()->GetAppLauncherHostInfo(&launcher);
 				PRCINFO info;
 				if (!m_pPRC->GetStartupInfo(&info))
 					goto SEC_ERROR;
@@ -413,7 +418,7 @@ DWORD WINAPI CPRCPipeServer::_InstanceThread(HANDLE hPipe, HANDLE hThread)
 				//先写协议头
 				hdr.action = PRCPD_REPLY;
 				hdr.flag = 1;// means true
-				hdr.dataSize = sizeof(info)+(extended?sizeof(DWORD):0); // versioned startup extension
+				hdr.dataSize = sizeof(info)+(extended?sizeof(DWORD):0)+(launcherExtended?sizeof(launcher):0);
 				if (! WritePipe(hPipe, &hdr, sizeof(hdr)))
 					goto SEC_ERROR;
 				//写数据
@@ -424,6 +429,7 @@ DWORD WINAPI CPRCPipeServer::_InstanceThread(HANDLE hPipe, HANDLE hThread)
                     DWORD policy=BrowserQuicPolicy::Preference()&&settings.bHookUDP&&!settings.bBlockUDP?1:0;
                     if(!WritePipe(hPipe,&policy,sizeof(policy)))goto SEC_ERROR;
                 }
+                if(launcherExtended && !WritePipe(hPipe,&launcher,sizeof(launcher)))goto SEC_ERROR;
 
 			}
 			break;
@@ -563,6 +569,15 @@ DWORD WINAPI CPRCPipeServer::_InstanceThread(HANDLE hPipe, HANDLE hThread)
 			}
 			break;
 
+		case PRCPD_LAUNCH_PACKAGED_APP:
+            {
+                AppLauncherRequest request = {};
+                if(hdr.dataSize!=sizeof(request) || !ReadPipe(hPipe,&request,sizeof(request)))goto SEC_ERROR;
+                AppLauncherResult result = HandleAppLaunch(request,pipeClientPid);
+                hdr.action=PRCPD_REPLY; hdr.flag=1; hdr.dataSize=sizeof(result);
+                if(!WritePipe(hPipe,&hdr,sizeof(hdr)) || !WritePipe(hPipe,&result,sizeof(result)))goto SEC_ERROR;
+            }
+            break;
 		case PRCPD_SHOULD_INJECT_NEW_PROCESS:
 			{
 				HookProcessCreationNotice notice;
@@ -829,6 +844,67 @@ BOOL CPRCPipeServer::WritePipe(HANDLE hPipe, LPVOID lpBuf, int size)
 		return FALSE;
 
 	return nWritten == (DWORD)size;
+}
+
+static bool SameLaunchUser(DWORD clientPid)
+{
+    DWORD clientSession=0, ownSession=0;
+    if(!clientPid || !ProcessIdToSessionId(clientPid,&clientSession) ||
+        !ProcessIdToSessionId(GetCurrentProcessId(),&ownSession) || clientSession!=ownSession) return false;
+    HANDLE process=OpenProcess(0x1000,FALSE,clientPid);
+    if(!process) process=OpenProcess(PROCESS_QUERY_INFORMATION,FALSE,clientPid);
+    HANDLE client=NULL, own=NULL; bool same=false;
+    if(process && OpenProcessToken(process,TOKEN_QUERY,&client) && OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&own)) {
+        BYTE a[1024]={},b[1024]={}; DWORD needed=0;
+        if(GetTokenInformation(client,TokenUser,a,sizeof(a),&needed) && GetTokenInformation(own,TokenUser,b,sizeof(b),&needed))
+            same=EqualSid(((TOKEN_USER*)a)->User.Sid,((TOKEN_USER*)b)->User.Sid)!=FALSE;
+    }
+    if(client)CloseHandle(client); if(own)CloseHandle(own); if(process)CloseHandle(process);
+    return same;
+}
+
+CPRCPipeServer::LaunchHistory& CPRCPipeServer::GetLaunchHistory()
+{
+    static LaunchHistory history;
+    return history;
+}
+
+AppLauncherResult CPRCPipeServer::HandleAppLaunch(const AppLauncherRequest& request, DWORD clientPid)
+{
+    // PRC may restart with the same pipe name inside this PL process. Retain
+    // completed IDs across that restart so an uncertain retry cannot activate twice.
+    LaunchHistory& history=GetLaunchHistory();
+    AppLauncherResult result = {ERROR_INVALID_PARAMETER,0,0};
+    const ULONGLONG now=AppLauncherProtocol::Now();
+    // Win8+ only: the actual pipe client PID is available on all supported activation hosts.
+    if(!AppLauncherProtocol::ValidId(request.id) || !AppLauncherProtocol::ValidAumid(request.aumid) ||
+        request.hostPid!=GetCurrentProcessId() || request.hostCreationTime!=AppLauncherProtocol::ProcessTime(GetCurrentProcess()) ||
+        request.submittedTime>now || now-request.submittedTime>120ULL*10000000 || !SameLaunchUser(clientPid)) return result;
+    EnterCriticalSection(&history.lock);
+    for(auto it=history.requests.begin();it!=history.requests.end();) {
+        if(it->second.result.error!=ERROR_IO_PENDING && now-it->second.request.submittedTime>300ULL*10000000)
+            it=history.requests.erase(it); else ++it;
+    }
+    auto found=history.requests.find(request.id);
+    if(found!=history.requests.end()) {
+        if(memcmp(&found->second.request,&request,sizeof(request))==0) result=found->second.result;
+        LeaveCriticalSection(&history.lock); return result;
+    }
+    if(history.requests.size()>=128) { LeaveCriticalSection(&history.lock); result.error=ERROR_BUSY; return result; }
+    LaunchRecord record={}; record.request=request; record.result.error=ERROR_IO_PENDING;
+    history.requests[request.id]=record;
+    LeaveCriticalSection(&history.lock);
+    // This pipe instance already runs on its own worker. Other pipe instances,
+    // including Hook initialization reports and retry queries, remain responsive.
+    EnterCriticalSection(&m_launchExecutionLock);
+    result.error=ERROR_NOT_SUPPORTED;
+    try {
+        if(!m_bExitThread) m_pPRC->m_pGlobalProxy->GetLogInstance()->LaunchAppFromShell(request,result);
+        else result.error=ERROR_OPERATION_ABORTED;
+    } catch(...) { result.error=ERROR_UNHANDLED_EXCEPTION; }
+    LeaveCriticalSection(&m_launchExecutionLock);
+    EnterCriticalSection(&history.lock); history.requests[request.id].result=result; LeaveCriticalSection(&history.lock);
+    return result;
 }
 
 BOOL CPRCPipeServer::ReadPipe(HANDLE hPipe, LPVOID lpBuf, int size)

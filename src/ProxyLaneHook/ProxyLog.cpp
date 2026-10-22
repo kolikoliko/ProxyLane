@@ -8,6 +8,20 @@
 
 CProxyLog *g_pProxyLog = NULL;
 
+BOOL CProxyLog::GetAppLauncherHostInfo(AppLauncherHostInfo* info)
+{
+    for (IProxyLog* p = m_pNext; p; p = p->m_pNext)
+        if (p->GetAppLauncherHostInfo(info)) return TRUE;
+    return FALSE;
+}
+
+BOOL CProxyLog::LaunchAppFromShell(const AppLauncherRequest& request, AppLauncherResult& result)
+{
+    for (IProxyLog* p = m_pNext; p; p = p->m_pNext)
+        if (p->LaunchAppFromShell(request, result)) return TRUE;
+    return FALSE;
+}
+
 CProxyLog::CProxyLog(void)
 {
 	ATLASSERT(g_pProxyLog == NULL);

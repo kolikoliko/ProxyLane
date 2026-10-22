@@ -1,4 +1,4 @@
-/************************************************************************/
+﻿/************************************************************************/
 /*                                                                      */
 /*                                                                      */
 /************************************************************************/
@@ -319,6 +319,7 @@ CHookWinsock::CHookWinsock(void)
 	m_ProcessCreationTls = TlsAlloc();
 	ZeroMemory(m_HookedInfo, sizeof(m_HookedInfo));
 	ZeroMemory(&m_psi, sizeof(m_psi));
+	ZeroMemory(&m_appLauncherHost, sizeof(m_appLauncherHost));
 	ZeroMemory(m_LocalDnsHostName, sizeof(m_LocalDnsHostName));
 	ZeroMemory(m_ChildGuardName, sizeof(m_ChildGuardName));
 	m_ChildGuardInstalled = FALSE;
@@ -432,8 +433,10 @@ BOOL CHookWinsock::EnableHook()
 
 	PRCINFO startupInfo;
 	bool quicPolicy=false;
-	if (!PRCPipeClient.GetPRCStartupInfo(&startupInfo, &quicPolicy))
+	AppLauncherHostInfo launcher = {};
+	if (!PRCPipeClient.GetPRCStartupInfo(&startupInfo, &quicPolicy, &launcher))
 		return FALSE;
+	{ CScopedCriticalSection lock(&m_PRCPipeNameLock); m_appLauncherHost=launcher; }
 
 	DWORD localDnsHostNameLength = _countof(m_LocalDnsHostName);
 	if (!GetComputerNameExA(ComputerNameDnsHostname, m_LocalDnsHostName,
@@ -500,7 +503,8 @@ BOOL CHookWinsock::RebindPRC(LPCSTR lpszPipeName)
 	CString nextPipe(lpszPipeName);
 	CPRCPipeClient client;
 	PRCINFO startupInfo;
-	if (!client.Connect(nextPipe) || !client.GetPRCStartupInfo(&startupInfo) ||
+	AppLauncherHostInfo launcher = {};
+	if (!client.Connect(nextPipe) || !client.GetPRCStartupInfo(&startupInfo, NULL, &launcher) ||
 		!RegisterCurrentProcessIdentity(client))
 		return FALSE; // Keep the previous endpoint and cached connection on failure.
 	{
@@ -511,6 +515,7 @@ BOOL CHookWinsock::RebindPRC(LPCSTR lpszPipeName)
 		m_RequestPipe.Disconnect();
 		CScopedCriticalSection nameLock(&m_PRCPipeNameLock);
 		m_szPRCPipeName = nextPipe;
+		m_appLauncherHost = launcher;
 	}
 	// Report the surviving host to the new GUI too. A failed notification does
 	// not undo an already published binding; retrying the request is safe.
@@ -2232,12 +2237,122 @@ private:
 	BOOL m_armed;
 };
 
-BOOL WINAPI CHookWinsock::inhook_CreateProcessInternalW(HANDLE hToken, LPCWSTR lpApplicationName, LPWSTR lpCommandLine, LPSECURITY_ATTRIBUTES lpProcessAttributes, LPSECURITY_ATTRIBUTES lpThreadAttributes, BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation, PHANDLE hNewToken)
+static BOOL IsSameUserLauncherToken(HANDLE token)
+{
+	if (!token) return TRUE;
+	HANDLE currentToken = NULL;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &currentToken)) return FALSE;
+	BYTE targetUser[1024] = {}, currentUser[1024] = {};
+	DWORD needed = 0;
+	BOOL same = GetTokenInformation(token, TokenUser, targetUser, sizeof(targetUser), &needed) &&
+		GetTokenInformation(currentToken, TokenUser, currentUser, sizeof(currentUser), &needed) &&
+		EqualSid(reinterpret_cast<TOKEN_USER*>(targetUser)->User.Sid,
+			reinterpret_cast<TOKEN_USER*>(currentUser)->User.Sid);
+	CloseHandle(currentToken);
+	return same;
+}
+
+bool CHookWinsock::TryCreateAppLauncher(
+	HANDLE hToken, LPCWSTR lpApplicationName, LPCWSTR lpCommandLine,
+	LPSECURITY_ATTRIBUTES lpProcessAttributes, LPSECURITY_ATTRIBUTES lpThreadAttributes,
+	BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
+	LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo,
+	LPPROCESS_INFORMATION lpProcessInformation, PHANDLE hNewToken, BOOL& created)
+{
+	// A real, short-lived PL process replaces only the simple AppsFolder launcher.
+	// Its original suspension belongs to the caller; do not activate the app here.
+	CString launchCommand(lpCommandLine ? lpCommandLine : L"");
+	launchCommand.MakeLower();
+	if (launchCommand.Find(L"shell:appsfolder\\") < 0)
+		return false;
+
+	AppLauncherHostInfo host = {};
+	CString pipe;
+	{
+		CScopedCriticalSection lock(&m_PRCPipeNameLock);
+		host = m_appLauncherHost;
+		pipe = m_szPRCPipeName;
+	}
+	auto logLauncher = [&](LPCWSTR reason, DWORD pid, DWORD error) {
+		const DWORD savedError = ::GetLastError();
+		CString message;
+		message.Format(L"AppsFolder helper: %s; flags=0x%08lX, token=%u, tokenOut=%u, host=%lu/v%lu, helper=%lu, error=%lu, image=%s",
+			reason, dwCreationFlags, hToken != NULL, hNewToken != NULL,
+			host.processId, host.version, pid, error, lpApplicationName ? lpApplicationName : L"(command line)");
+		{
+			CScopedCriticalSection lock(&m_RequestPipeLock);
+			if (EnsureRequestPipe() && !m_RequestPipe.PRCLogtext(message)) m_RequestPipe.Disconnect();
+		}
+		::SetLastError(savedError);
+	};
+
+	std::wstring appAumid;
+	LPCWSTR skipped = NULL;
+	if (!AppLauncherProtocol::ParseExplorerLaunch(lpApplicationName, lpCommandLine, appAumid)) skipped = L"skipped: command/image mismatch";
+	else if (!lpStartupInfo || !lpProcessInformation) skipped = L"skipped: missing startup/output";
+	// Replacing a debuggee changes the caller's debug event stream. All
+	// other flags are forwarded unchanged and validated by Windows.
+	else if (dwCreationFlags & (DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS)) skipped = L"skipped: debugger launch";
+	else if (!IsWin8OrLater()) skipped = L"skipped: unsupported OS";
+	else if (host.version != 1 || !host.executable[0]) skipped = L"skipped: host capability unavailable";
+	else if (!IsSameUserLauncherToken(hToken)) skipped = L"skipped: different user or unreadable token";
+	if (skipped)
+	{
+		logLauncher(skipped, 0, ::GetLastError());
+		return false;
+	}
+
+	GUID id;
+	WCHAR idText[40] = {};
+	if (FAILED(CoCreateGuid(&id)) || !StringFromGUID2(id, idText, _countof(idText)))
+	{
+		logLauncher(L"skipped: request ID creation failed", 0, ::GetLastError());
+		return false;
+	}
+	CString command;
+	command.Format(L"\"%s\" --internal-launch-app \"%s\" \"%s\" \"%s\" %lu %I64u %lu %I64u",
+		host.executable, (LPCWSTR)pipe, idText, appAumid.c_str(), host.processId,
+		host.creationTime, GetCurrentProcessId(), AppLauncherProtocol::ProcessTime(GetCurrentProcess()));
+
+	std::vector<BYTE> environment;
+	if (m_ChildGuardInstalled && !BuildChildEnvironment(
+		lpEnvironment, dwCreationFlags, FALSE, m_ChildGuardName, 0, environment))
+	{
+		logLauncher(L"skipped: environment preparation failed", 0, ::GetLastError());
+		return false;
+	}
+	LPVOID helperEnvironment = m_ChildGuardInstalled ? &environment[0] : lpEnvironment;
+	// Forward the token, output token, flags and complete STARTUPINFOEX unchanged.
+	created = CallTrampoline(CreateProcessInternalW)(hToken, host.executable, command.GetBuffer(),
+		lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, helperEnvironment,
+		lpCurrentDirectory, lpStartupInfo, lpProcessInformation, hNewToken);
+	const DWORD error = ::GetLastError();
+	command.ReleaseBuffer();
+	logLauncher(created ? L"created" : L"creation failed",
+		created ? lpProcessInformation->dwProcessId : 0, created ? 0 : error);
+	::SetLastError(error);
+	return true; // A failed helper creation must not fall through and launch Explorer.
+}
+
+BOOL WINAPI CHookWinsock::inhook_CreateProcessInternalW(
+	HANDLE hToken, LPCWSTR lpApplicationName, LPWSTR lpCommandLine,
+	LPSECURITY_ATTRIBUTES lpProcessAttributes, LPSECURITY_ATTRIBUTES lpThreadAttributes,
+	BOOL bInheritHandles, DWORD dwCreationFlags, LPVOID lpEnvironment,
+	LPCWSTR lpCurrentDirectory, LPSTARTUPINFOW lpStartupInfo,
+	LPPROCESS_INFORMATION lpProcessInformation, PHANDLE hNewToken)
 {
 	if (!m_psi.bHookCreateProcess || TlsGetValue(m_ProcessCreationTls))
 	{
-		return CallTrampoline(CreateProcessInternalW)(hToken, lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo, lpProcessInformation, hNewToken);
+		return CallTrampoline(CreateProcessInternalW)(hToken, lpApplicationName, lpCommandLine,
+			lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+			lpCurrentDirectory, lpStartupInfo, lpProcessInformation, hNewToken);
 	}
+
+	BOOL helperCreated = FALSE;
+	if (TryCreateAppLauncher(hToken, lpApplicationName, lpCommandLine,
+		lpProcessAttributes, lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+		lpCurrentDirectory, lpStartupInfo, lpProcessInformation, hNewToken, helperCreated))
+		return helperCreated;
 
 	const DWORD originalCreationFlags = dwCreationFlags;
 	//如果没标志挂起主线程， 则修改之

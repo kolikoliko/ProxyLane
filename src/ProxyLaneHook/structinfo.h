@@ -3,6 +3,7 @@
 #include <ws2tcpip.h>
 #include "InetCompat.h"
 #include "ProcessIdentity.h"
+#include "AppLauncherProtocol.h"
 
 #pragma pack(push, 1)
 
@@ -440,6 +441,7 @@ typedef struct _tagHookLogtext
 #define PRCPD_QUIC_LOCATE 16 // retired: no remote locator
 #define PRCPD_QUIC_STATUS 17
 #define PRCPD_BLOCKED_UDP 18
+#define PRCPD_LAUNCH_PACKAGED_APP 19
 
 #pragma pack(pop)
 

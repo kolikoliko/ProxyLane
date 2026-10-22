@@ -18,7 +18,7 @@ public:
 	BOOL WritePipe(LPCVOID lpBuf, int size);
 	BOOL ReadPipe(LPVOID lpBuf, int size);
 
-	BOOL GetPRCStartupInfo(LPPRCINFO lpStartupInfo, bool* quicPolicy = NULL);
+	BOOL GetPRCStartupInfo(LPPRCINFO lpStartupInfo, bool* quicPolicy = NULL, AppLauncherHostInfo* launcher = NULL);
 	BOOL PRCReportQuicStatus(const BrowserQuicPolicy::Report& report);
 
 	BOOL PRCRegisterClient(LPPRCClient lpClientInfo);

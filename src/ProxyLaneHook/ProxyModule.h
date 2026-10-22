@@ -222,6 +222,9 @@ public:
 	{
 		OnConnectionEvent(TASK_FAILED, client, processName);
 	}
+	// Optional GUI host capabilities; non-GUI/older hosts do not advertise them.
+	virtual BOOL GetAppLauncherHostInfo(AppLauncherHostInfo*) { return FALSE; }
+	virtual BOOL LaunchAppFromShell(const AppLauncherRequest&, AppLauncherResult&) { return FALSE; }
 };
 
 

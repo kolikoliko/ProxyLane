@@ -21,6 +21,8 @@ public:
 		ConnectionStage stage, DWORD error);
 	void OnConnectionEvent(ConnectionEvent event, const LPPRCClient client,
 		LPCWSTR processName);
+	BOOL GetAppLauncherHostInfo(AppLauncherHostInfo* info);
+	BOOL LaunchAppFromShell(const AppLauncherRequest& request, AppLauncherResult& result);
 
 private:
 

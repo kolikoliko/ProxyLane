@@ -8,6 +8,7 @@
 #include "AutomationOptions.h"
 #include "Localization.h"
 #include "AppVersion.h"
+#include "AppLauncher.h"
 
 #ifdef _DEBUG
 #define new DEBUG_NEW
@@ -132,6 +133,13 @@ CProxyLaneApp theApp;
 
 BOOL CProxyLaneApp::InitInstance()
 {
+	// A real process for callers to wait/resume, without UI, configuration writes,
+	// profile forwarding, or the normal x86-to-x64 bootstrap.
+	DWORD launcherExitCode=0;
+	if (RunInternalAppLauncher(GetCommandLineW(),launcherExitCode)) {
+		m_automationExitCode=static_cast<int>(launcherExitCode);
+		return FALSE;
+	}
 	// 如果一个运行在 Windows XP 上的应用程序清单指定要
 	// 使用 ComCtl32.dll 版本 6 或更高版本来启用可视化方式，
 	//则需要 InitCommonControlsEx()。否则，将无法创建窗口。

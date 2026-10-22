@@ -192,7 +192,9 @@ public:
 		AppLaunchElevationMode elevationMode = APP_LAUNCH_ELEVATION_AUTO,
 		const CString& initialArguments = CString(),
 		const CString& initialWorkingDirectory = CString());
-	AppLaunchResult LaunchPackagedAppById(LPCTSTR aumid, const CString& arguments);
+	AppLaunchResult LaunchPackagedAppById(LPCTSTR aumid, const CString& arguments, AppLauncherResult* outcome = NULL);
+	BOOL GetAppLauncherHostInfo(AppLauncherHostInfo* info) override;
+	BOOL LaunchAppFromShell(const AppLauncherRequest& request, AppLauncherResult& result) override;
 	AppLaunchResult LaunchInteractiveApplication(const InstalledApplications::Application& app,
 		AppLaunchElevationMode elevationMode = APP_LAUNCH_ELEVATION_AUTO,
 		const RecentApplications::Entry* saved = NULL);

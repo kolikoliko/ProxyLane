@@ -1,4 +1,4 @@
-// Page3.cpp : 实现文件
+﻿// Page3.cpp : 实现文件
 //
 
 #include "stdafx.h"
@@ -2939,8 +2939,9 @@ AppLaunchResult CPage3::LaunchPackagedAppAndProxy(
 	return LaunchPackagedAppById(aumid, arguments);
 }
 
-AppLaunchResult CPage3::LaunchPackagedAppById(LPCTSTR aumid, const CString& arguments)
+AppLaunchResult CPage3::LaunchPackagedAppById(LPCTSTR aumid, const CString& arguments, AppLauncherResult* outcome)
 {
+	if (outcome) { ZeroMemory(outcome,sizeof(*outcome)); outcome->error=ERROR_GEN_FAILURE; }
 	if (!aumid || !aumid[0]) return APP_LAUNCH_INVALID_TARGET;
 	TCHAR szModulePath[MAX_PATH] = { 0 };
 	if (GetModuleFileName(NULL, szModulePath, _countof(szModulePath)))
@@ -2958,24 +2959,18 @@ AppLaunchResult CPage3::LaunchPackagedAppById(LPCTSTR aumid, const CString& argu
 		return APP_LAUNCH_CREATE_PROCESS_FAILED;
 	}
 
-	// 预先解析并静态缓存 ntdll 进程挂起与恢复函数，避免进程创建后耗费时间查找
+	// 激活前解析函数；局部变量允许界面与 PRC 工作线程并发调用。
 	typedef LONG (NTAPI *pfnNtSuspendProcess)(HANDLE ProcessHandle);
 	typedef LONG (NTAPI *pfnNtResumeProcess)(HANDLE ProcessHandle);
-	static pfnNtSuspendProcess s_pfnNtSuspendProcess = NULL;
-	static pfnNtResumeProcess s_pfnNtResumeProcess = NULL;
-	static BOOL s_ntApisResolved = FALSE;
-
-	if (!s_ntApisResolved)
+	pfnNtSuspendProcess s_pfnNtSuspendProcess = NULL;
+	pfnNtResumeProcess s_pfnNtResumeProcess = NULL;
+	HMODULE hNtdll = GetModuleHandle(_T("ntdll.dll"));
+	if (hNtdll)
 	{
-		HMODULE hNtdll = GetModuleHandle(_T("ntdll.dll"));
-		if (hNtdll)
-		{
-			s_pfnNtSuspendProcess = reinterpret_cast<pfnNtSuspendProcess>(
-				GetProcAddress(hNtdll, "NtSuspendProcess"));
-			s_pfnNtResumeProcess = reinterpret_cast<pfnNtResumeProcess>(
-				GetProcAddress(hNtdll, "NtResumeProcess"));
-		}
-		s_ntApisResolved = TRUE;
+		s_pfnNtSuspendProcess = reinterpret_cast<pfnNtSuspendProcess>(
+			GetProcAddress(hNtdll, "NtSuspendProcess"));
+		s_pfnNtResumeProcess = reinterpret_cast<pfnNtResumeProcess>(
+			GetProcAddress(hNtdll, "NtResumeProcess"));
 	}
 
 	DWORD processId = 0;
@@ -2986,16 +2981,27 @@ AppLaunchResult CPage3::LaunchPackagedAppById(LPCTSTR aumid, const CString& argu
 
 	if (FAILED(hr) || processId == 0)
 	{
+		if(outcome) outcome->error=FAILED(hr)?static_cast<DWORD>(hr):ERROR_GEN_FAILURE;
 		return APP_LAUNCH_CREATE_PROCESS_FAILED;
 	}
+	if(outcome) { outcome->error=0; outcome->processId=processId; outcome->hookError=ERROR_GEN_FAILURE; }
 
 	HANDLE hTargetProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processId);
 	if (!hTargetProc)
 	{
-		RefreshLaunchedProcess(processId);
+		if (outcome) outcome->hookError=GetLastError();
+		if (!outcome) RefreshLaunchedProcess(processId);
 		return APP_LAUNCH_PACKAGED_INJECTION_FAILED;
 	}
 	const ULONGLONG creationTime = ProcessActions::CreationTime(hTargetProc);
+    if(outcome) {
+        HookProcessIdentityInfo identity={};
+        if(g_GlobalProxy->GetProcessRegistry()->Get(processId,creationTime,&identity) &&
+            identity.hookState==PROCESS_HOOK_STATE_SUCCEEDED) {
+            outcome->hookError=0; CloseHandle(hTargetProc); return APP_LAUNCH_SUCCESS;
+        }
+    }
+
     // Activation can return an existing process; do not invent a creation event.
     HookNewProcessInfo activated = {};
     activated.dwProcessId = processId;
@@ -3009,15 +3015,21 @@ AppLaunchResult CPage3::LaunchPackagedAppById(LPCTSTR aumid, const CString& argu
 	{
 		const DWORD error = GetLastError();
 		CloseHandle(hTargetProc);
+		if (outcome) outcome->hookError=error;
 		CString text;
 		text.Format(_T("Packaged app pipe authorization failed: PID %lu, error %lu.\r\n"), processId, error);
 		g_GlobalProxy->GetLogInstance()->LogText(text);
-		RefreshLaunchedProcess(processId, NULL, creationTime);
+		if (!outcome) RefreshLaunchedProcess(processId, NULL, creationTime);
 		return APP_LAUNCH_PACKAGED_INJECTION_FAILED;
 	}
+    if(outcome && !ShouldProxyChildProcess(&activated)) {
+        outcome->hookError=ERROR_ACCESS_DISABLED_BY_POLICY;
+        CloseHandle(hTargetProc); return APP_LAUNCH_PACKAGED_INJECTION_FAILED;
+    }
 	CScopedProcessSuspension suspension(hTargetProc, s_pfnNtSuspendProcess, s_pfnNtResumeProcess);
 
-	// 消除先发延迟：第 0 毫秒立即发起 HookProcess，仅在失败时密集快速重试（前 3 次仅等待 5ms）
+	// This is post-activation attachment: minimize delay, but do not claim that
+	// the application could not execute or send traffic before this point.
 	BOOL injected = FALSE;
 	const int maxAttempts = 15;
 	for (int attempt = 0; attempt < maxAttempts; ++attempt)
@@ -3040,7 +3052,19 @@ AppLaunchResult CPage3::LaunchPackagedAppById(LPCTSTR aumid, const CString& argu
 		injected = FALSE;
 	}
 
-	RefreshLaunchedProcess(processId, NULL, creationTime);
+    if(outcome && injected) {
+        // Wait only after resuming original threads: they may hold the loader lock.
+        injected=FALSE; DWORD started=GetTickCount(); outcome->hookError=WAIT_TIMEOUT;
+        while(GetTickCount()-started<10000) {
+            HookProcessIdentityInfo identity={};
+            if(g_GlobalProxy->GetProcessRegistry()->Get(processId,creationTime,&identity)) {
+                if(identity.hookState==PROCESS_HOOK_STATE_SUCCEEDED) { injected=TRUE; outcome->hookError=0; break; }
+                if(identity.hookState==PROCESS_HOOK_STATE_FAILED) { outcome->hookError=identity.hookError; break; }
+            }
+            if(WaitForSingleObject(hTargetProc,25)==WAIT_OBJECT_0) { outcome->hookError=ERROR_PROCESS_ABORTED; break; }
+        }
+    }
+	if (!outcome) RefreshLaunchedProcess(processId, NULL, creationTime);
 	if (!injected)
 	{
 		return APP_LAUNCH_PACKAGED_INJECTION_FAILED;
@@ -3049,3 +3073,26 @@ AppLaunchResult CPage3::LaunchPackagedAppById(LPCTSTR aumid, const CString& argu
 	return APP_LAUNCH_SUCCESS;
 }
 
+
+BOOL CPage3::GetAppLauncherHostInfo(AppLauncherHostInfo* info)
+{
+    OSVERSIONINFO version={sizeof(version)};
+    if(!info || !GetVersionEx(&version) || version.dwMajorVersion<6 ||
+        (version.dwMajorVersion==6 && version.dwMinorVersion<2)) return FALSE;
+    ZeroMemory(info,sizeof(*info));
+    DWORD length=GetModuleFileNameW(NULL,info->executable,MAX_PATH);
+    if(!length || length>=MAX_PATH) { ZeroMemory(info,sizeof(*info)); return FALSE; }
+    info->version=1; info->processId=GetCurrentProcessId();
+    info->creationTime=AppLauncherProtocol::ProcessTime(GetCurrentProcess());
+    return info->creationTime!=0;
+}
+
+BOOL CPage3::LaunchAppFromShell(const AppLauncherRequest& request, AppLauncherResult& result)
+{
+    LaunchPackagedAppById(request.aumid,CString(),&result);
+    CString message;
+    message.Format(L"AppsFolder activation: %s, requester PID %lu, target PID %lu, launch error 0x%08lX, Hook error %lu.\r\n",
+        request.aumid,request.parentPid,result.processId,result.error,result.hookError);
+    if(g_GlobalProxy) g_GlobalProxy->GetLogInstance()->LogText(message);
+    return TRUE;
+}

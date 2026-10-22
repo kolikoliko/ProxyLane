@@ -106,17 +106,25 @@ BOOL CPRCPipeClient::ReadPipe(LPVOID lpBuf, int size)
 }
 
 
-BOOL CPRCPipeClient::GetPRCStartupInfo(LPPRCINFO lpStartupInfo, bool* quicPolicy)
+BOOL CPRCPipeClient::GetPRCStartupInfo(LPPRCINFO lpStartupInfo, bool* quicPolicy, AppLauncherHostInfo* launcher)
 {
     PRCPipeDataHead hdr={};hdr.action=PRCPD_GETSTARTUPINFO;
     // Opt-in extension: old hosts ignore the flag and return the original size;
     // old clients receive the original layout from new hosts.
-    hdr.flag=quicPolicy?2:0;if(quicPolicy)*quicPolicy=false;
+    hdr.flag=launcher?3:(quicPolicy?2:0);if(quicPolicy)*quicPolicy=false;
+    if(launcher) ZeroMemory(launcher,sizeof(*launcher));
     if(!WritePipe(&hdr,sizeof(hdr))||!ReadPipe(&hdr,sizeof(hdr)))return FALSE;
     if(hdr.action!=PRCPD_REPLY||hdr.flag!=1 ||
-        (hdr.dataSize!=sizeof(*lpStartupInfo)&&(!quicPolicy||hdr.dataSize!=sizeof(*lpStartupInfo)+sizeof(DWORD))))return FALSE;
+        (hdr.dataSize!=sizeof(*lpStartupInfo)&&
+        (!(quicPolicy||launcher)||hdr.dataSize!=sizeof(*lpStartupInfo)+sizeof(DWORD))&&
+        (!launcher||hdr.dataSize!=sizeof(*lpStartupInfo)+sizeof(DWORD)+sizeof(*launcher))))return FALSE;
     if(!ReadPipe(lpStartupInfo,sizeof(*lpStartupInfo)))return FALSE;
-    if(hdr.dataSize>sizeof(*lpStartupInfo)) {DWORD flags=0;if(!ReadPipe(&flags,sizeof(flags)))return FALSE;*quicPolicy=(flags&1)!=0;}
+    if(hdr.dataSize>sizeof(*lpStartupInfo)) {DWORD flags=0;if(!ReadPipe(&flags,sizeof(flags)))return FALSE;if(quicPolicy)*quicPolicy=(flags&1)!=0;}
+    if(launcher && hdr.dataSize==sizeof(*lpStartupInfo)+sizeof(DWORD)+sizeof(*launcher)) {
+        if(!ReadPipe(launcher,sizeof(*launcher)))return FALSE;
+        if(launcher->version!=1 || !launcher->processId || !launcher->creationTime ||
+            !launcher->executable[0] || launcher->executable[MAX_PATH-1]) ZeroMemory(launcher,sizeof(*launcher));
+    }
     return TRUE;
 }
 BOOL CPRCPipeClient::PRCReportQuicStatus(const BrowserQuicPolicy::Report& report)

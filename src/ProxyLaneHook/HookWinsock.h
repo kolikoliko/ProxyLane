@@ -773,6 +773,13 @@ public:
 private:
 	ProxySettingsInfo m_psi;
 	DWORD m_ProcessCreationTls;
+	// True means the helper creation was attempted; created and GetLastError
+	// are its API result. False means continue with the original process path.
+	bool TryCreateAppLauncher(HANDLE token, LPCWSTR applicationName, LPCWSTR commandLine,
+		LPSECURITY_ATTRIBUTES processAttributes, LPSECURITY_ATTRIBUTES threadAttributes,
+		BOOL inheritHandles, DWORD creationFlags, LPVOID environment,
+		LPCWSTR currentDirectory, LPSTARTUPINFOW startup,
+		LPPROCESS_INFORMATION process, PHANDLE newToken, BOOL& created);
 	void FinishChildCreation(LPPROCESS_INFORMATION process, BOOL ownsSuspension,
 		LPCWSTR applicationName, LPCWSTR commandLine);
 
@@ -788,6 +795,7 @@ private:
 
 	CString m_szLastError;
 	CString m_szPRCPipeName;
+	AppLauncherHostInfo m_appLauncherHost;
 	// Protect name snapshots separately from potentially blocking pipe I/O.
 	CRITICAL_SECTION m_PRCPipeNameLock;
 	CHAR m_LocalDnsHostName[256];
