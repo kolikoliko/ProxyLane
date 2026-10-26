@@ -1,6 +1,7 @@
 #pragma once
 #include <windows.h>
 #include <vector>
+#include "../ProxyLaneHook/ProcessIdentity.h"
 
 namespace ProcessActions
 {
@@ -24,7 +25,17 @@ namespace ProcessActions
 			PROCESS_QUERY_INFORMATION, FALSE, pid);
 		if (!process) process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE |
 			0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, FALSE, pid);
-		if (!process) return NULL;
+		if (!process)
+		{
+			const DWORD error = GetLastError();
+			HookProcessIdentityInfo identity = { 0 };
+			identity.dwProcessId = pid;
+			identity.processCreateTime = expectedCreationTime;
+			// Opening with terminate rights can fail for an already exited
+			// object. Recheck without those rights before reporting a failure.
+			SetLastError(ProxyProcessIdentity::HasExited(identity) ? ERROR_NOT_FOUND : error);
+			return NULL;
+		}
 		DWORD error = ERROR_SUCCESS;
 		SetLastError(ERROR_SUCCESS);
 		const ULONGLONG actualCreationTime = CreationTime(process);

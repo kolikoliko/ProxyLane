@@ -54,6 +54,39 @@ int ProcessActionsTestsMain()
 	WaitForSingleObject(child.hProcess, 5000);
 	CloseHandle(child.hThread);
 	CloseHandle(child.hProcess);
+	// A live access-denied process must still fail, but its exited kernel
+	// object must not produce error 5 merely because we retain a handle.
+	ACL acl;
+	SECURITY_DESCRIPTOR descriptor;
+	if (!InitializeAcl(&acl, sizeof(acl), ACL_REVISION) ||
+		!InitializeSecurityDescriptor(&descriptor, SECURITY_DESCRIPTOR_REVISION) ||
+		!SetSecurityDescriptorDacl(&descriptor, TRUE, &acl, FALSE)) return 1;
+	SECURITY_ATTRIBUTES attributes = { sizeof(attributes), &descriptor, FALSE };
+	WCHAR command[] = L"cmd.exe /d /c exit 0";
+	if (!CreateProcessW(executable.c_str(), command, &attributes, NULL, FALSE,
+		CREATE_SUSPENDED | CREATE_NO_WINDOW, NULL, NULL, &startup, &child)) return 1;
+	targets.clear();
+	ProcessActions::TerminationTarget protectedTarget = {
+		child.dwProcessId, ProcessActions::CreationTime(child.hProcess) };
+	targets.push_back(protectedTarget);
+	const std::vector<DWORD> denied = ProcessActions::TerminateExactProcesses(targets);
+	if (denied[0] != ERROR_ACCESS_DENIED ||
+		WaitForSingleObject(child.hProcess, 0) != WAIT_TIMEOUT) ++failures;
+	ResumeThread(child.hThread);
+	if (WaitForSingleObject(child.hProcess, 10000) != WAIT_OBJECT_0)
+	{
+		++failures;
+		TerminateProcess(child.hProcess, 1);
+		WaitForSingleObject(child.hProcess, 5000);
+	}
+	const std::vector<DWORD> exitedDenied = ProcessActions::TerminateExactProcesses(targets);
+	if (exitedDenied[0])
+	{
+		std::cerr << "Exited access-denied object error: " << exitedDenied[0] << std::endl;
+		++failures;
+	}
+	CloseHandle(child.hThread);
+	CloseHandle(child.hProcess);
 	std::cout << "ProcessActions tests " << (failures ? "FAILED" : "passed") << std::endl;
 	return failures ? 1 : 0;
 }

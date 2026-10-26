@@ -147,9 +147,13 @@ int ProcessRegistryTestsMain()
 		WaitForSingleObject(child.hProcess, 10000);
 		passed = false;
 	}
+	// Keep the exited object alive through its original handles. Query access
+	// is still denied, but it must no longer block ProxyLane's exit warning.
+	protectedRegistry.PruneExited();
+	if (protectedRegistry.Get(child.dwProcessId, protectedTime, &result))
+	{ std::cerr << "Exited protected identity with retained handles was not pruned" << std::endl; passed = false; }
 	CloseHandle(child.hThread); CloseHandle(child.hProcess);
-	// Windows may briefly retain the exited process object after its handles
-	// close. Until its PID disappears, denied queries remain inconclusive.
+	// Removal remains stable after the retained handles are closed.
 	for (int i = 0; i < 100 && protectedRegistry.Get(child.dwProcessId, protectedTime, &result); ++i)
 	{
 		protectedRegistry.PruneExited();

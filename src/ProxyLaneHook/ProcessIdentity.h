@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include <tlhelp32.h>
 
 #pragma pack(push, 1)
 typedef struct _HookProcessIdentityInfo
@@ -18,6 +19,33 @@ typedef struct _HookProcessIdentityInfo
 
 namespace ProxyProcessIdentity
 {
+	// An exited process object can still exist while another process holds a
+	// handle to it. Its DACL can deny OpenProcess even though it has already
+	// disappeared from the system process list. Only a complete enumeration
+	// proves absence; a failed snapshot/query must remain inconclusive.
+	inline BOOL IsAbsentFromSnapshot(DWORD pid)
+	{
+		HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+		if (snapshot == INVALID_HANDLE_VALUE) return FALSE;
+		PROCESSENTRY32W entry = { sizeof(entry) };
+		if (!Process32FirstW(snapshot, &entry))
+		{
+			CloseHandle(snapshot);
+			return FALSE;
+		}
+		do
+		{
+			if (entry.th32ProcessID == pid)
+			{
+				CloseHandle(snapshot);
+				return FALSE;
+			}
+		} while (Process32NextW(snapshot, &entry));
+		const BOOL complete = GetLastError() == ERROR_NO_MORE_FILES;
+		CloseHandle(snapshot);
+		return complete;
+	}
+
 	// Only positive evidence removes a registered lifetime. Access denial or
 	// a failed query must not hide a possibly running hooked application.
 	inline BOOL HasExited(const HookProcessIdentityInfo& identity)
@@ -27,7 +55,8 @@ namespace ProxyProcessIdentity
 		if (!process)
 			process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_INFORMATION, FALSE, identity.dwProcessId);
 		if (!process)
-			return GetLastError() == ERROR_INVALID_PARAMETER;
+			return GetLastError() == ERROR_INVALID_PARAMETER ||
+				IsAbsentFromSnapshot(identity.dwProcessId);
 		BOOL exited = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
 		FILETIME created, ended, kernel, user;
 		if (!exited && GetProcessTimes(process, &created, &ended, &kernel, &user))
