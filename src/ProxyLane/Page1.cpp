@@ -1,4 +1,4 @@
-﻿// Page1.cpp : 实现文件
+// Page1.cpp : 实现文件
 //
 
 #include "stdafx.h"
@@ -144,7 +144,7 @@ void CPage1::DoDataExchange(CDataExchange* pDX)
 	DDX_Control(pDX, IDC_STATIC_TestProxy, m_staticTestProxy);
 	DDX_Control(pDX, IDC_COMBO_CFGS, m_cfgls);
 	DDX_Control(pDX, IDC_BUTTON_SAVE_PROFILE, m_btnSaveProfile);
-	DDX_Control(pDX, IDC_BUTTON_DELETE_PROFILE, m_btnDeleteProfile);
+	DDX_Control(pDX, IDC_BUTTON_PROFILE_MENU, m_btnProfileMenu);
 }
 
 
@@ -156,6 +156,9 @@ BEGIN_MESSAGE_MAP(CPage1, CModernDialog)
 	ON_WM_DESTROY()
 	ON_BN_CLICKED(IDC_TestProxy, &CPage1::OnBnClickedTestproxy)
 	ON_BN_CLICKED(IDC_BUTTON_SAVE_PROFILE, &CPage1::OnCfgoptSave)
+	ON_BN_CLICKED(IDC_BUTTON_PROFILE_MENU, &CPage1::OnProfileMenu)
+	ON_COMMAND(IDC_BUTTON_COPY_PROFILE, &CPage1::OnCopyProfile)
+	ON_COMMAND(IDC_BUTTON_PASTE_PROFILE, &CPage1::OnPasteProfile)
 	ON_EN_CHANGE(IDC_EDIT_ADDR, &CPage1::OnEnChangeEditAddr)
 	ON_EN_CHANGE(IDC_EDIT_PORT, &CPage1::OnProfileFieldChanged)
 	ON_EN_CHANGE(IDC_EDIT_USER, &CPage1::OnProfileFieldChanged)
@@ -178,8 +181,9 @@ BEGIN_MESSAGE_MAP(CPage1, CModernDialog)
 	ON_BN_CLICKED(IDC_RADIO_CHILDFILTER_INCLUDE, &CPage1::OnProfileFieldChanged)
 	ON_BN_CLICKED(IDC_RADIO_TARGETFILTER_BYPASS, &CPage1::OnProfileFieldChanged)
 	ON_BN_CLICKED(IDC_RADIO_TARGETFILTER_PROXY, &CPage1::OnProfileFieldChanged)
-	ON_BN_CLICKED(IDC_BUTTON_DELETE_PROFILE, &CPage1::OnCfgoptDelete)
+	ON_COMMAND(IDC_BUTTON_DELETE_PROFILE, &CPage1::OnCfgoptDelete)
 	ON_CBN_SELCHANGE(IDC_COMBO_CFGS, &CPage1::OnCbnSelchangeComboCfgs)
+	ON_CBN_DROPDOWN(IDC_COMBO_CFGS, &CPage1::OnCbnDropdownComboCfgs)
 	ON_BN_CLICKED(IDC_CHECK_HOOKCHILDPROCESS, &CPage1::OnBnClickedHookChildProcess)
 	ON_BN_CLICKED(IDC_RADIO_TAB_BASIC, &CPage1::OnBnClickedTabBasic)
 	ON_BN_CLICKED(IDC_RADIO_TAB_CHILD, &CPage1::OnBnClickedTabChild)
@@ -199,7 +203,7 @@ BOOL CPage1::OnInitDialog()
 	m_Cancel.SetVisualStyle(CModernButton::STYLE_DANGER);
 	m_btnTest.SetVisualStyle(CModernButton::STYLE_SECONDARY);
 	m_btnSaveProfile.SetVisualStyle(CModernButton::STYLE_SECONDARY);
-	m_btnDeleteProfile.SetVisualStyle(CModernButton::STYLE_DANGER);
+	m_btnProfileMenu.SetVisualStyle(CModernButton::STYLE_SECONDARY);
 	CreateWorkflowCard();
 	UpdateProxyStateUi();
 
@@ -845,8 +849,6 @@ void CPage1::GetSavedProfileNames(std::vector<CString>& names)
 void CPage1::SetProfileDirty(BOOL dirty)
 {
 	m_profileDirty = dirty;
-	if (m_btnDeleteProfile.GetSafeHwnd())
-		m_btnDeleteProfile.EnableWindow(m_cfgls.GetCurSel() != CB_ERR);
 	if (m_OK.GetSafeHwnd())
 		UpdateProxyStateUi();
 	else if (m_btnSaveProfile.GetSafeHwnd())
@@ -1663,6 +1665,10 @@ void CPage1::OnProxyTesterCallback(IProxyTester *pTester, int nErrorCode, WPARAM
 }
 void CPage1::OnEnChangeEditAddr()
 {
+	// Loading a full profile already supplies a separate port. Do not interpret
+	// an IPv6 address as the interactive host:port shorthand while filling it.
+	if (m_loadingProfile)
+		return;
 	CString strHost;
 	m_edit_HostName.GetWindowText(strHost);
 
@@ -1682,21 +1688,9 @@ void CPage1::OnEnChangeEditAddr()
 
 void CPage1::OnCfgoptLoad()
 {
-	CfgProxyItem item;
-	CString previousDraftName = m_draftProfileName;
-	m_cfgls.GetWindowText(item.strName);
-	if (!ConfirmDiscardUnsavedChanges())
-	{
-		m_draftProfileName = previousDraftName;
-		RestoreProfileSelection();
-		return;
-	}
-
-	if (m_profileStore.Load(item))
-	{
-		m_profileStore.SetLastSelected(item.strName);
-		UILoadCfg(&item);
-	}
+	CString name;
+	m_cfgls.GetWindowText(name);
+	SelectProfileFromDisk(name);
 }
 
 void CPage1::OnCfgoptSave()
@@ -1950,9 +1944,64 @@ void CPage1::OnBnClickedWorkflowNext()
 
 void CPage1::OnCbnSelchangeComboCfgs()
 {
+	if (m_loadingProfile || m_cfgls.GetCurSel() == CB_ERR)
+		return;
+	CString name;
+	m_cfgls.GetLBText(m_cfgls.GetCurSel(), name);
+	SelectProfileFromDisk(name);
+}
+
+BOOL CPage1::RefreshProfileNames()
+{
+	std::vector<CString> names;
+	if (!m_profileStore.ListNames(names))
+	{
+		ShowProfileNotice(Localization::Get(_T("profile.refresh_failed")), NULL, CStatusLabel::TONE_WARNING);
+		return FALSE;
+	}
+	CString draft;
+	m_cfgls.GetWindowText(draft);
+	const BOOL selected = m_cfgls.GetCurSel() != CB_ERR;
+	m_loadingProfile = TRUE;
+	m_cfgls.ResetContent();
+	for (const CString& name : names)
+		m_cfgls.AddString(name);
+	const BOOL removed = !m_loadedProfileName.IsEmpty() &&
+		m_cfgls.FindStringExact(-1, m_loadedProfileName) == CB_ERR;
+	m_cfgls.SetCurSel(selected ? m_cfgls.FindStringExact(-1, draft) : -1);
+	m_cfgls.SetWindowText(draft);
+	m_loadingProfile = FALSE;
+	if (removed)
+	{
+		m_loadedProfileName.Empty();
+		m_draftProfileName = draft;
+		SetProfileDirty(TRUE);
+		ShowProfileNotice(Localization::Get(_T("profile.removed_elsewhere")),
+			Localization::Get(_T("profile.draft_preserved")), CStatusLabel::TONE_WARNING);
+	}
+	else
+		SetProfileDirty(m_profileDirty);
+	return TRUE;
+}
+
+void CPage1::OnCbnDropdownComboCfgs()
+{
+	RefreshProfileNames();
+}
+
+void CPage1::SelectProfileFromDisk(const CString& name)
+{
 	CfgProxyItem item;
+	item.strName = name;
 	CString previousDraftName = m_draftProfileName;
-	m_cfgls.GetLBText(m_cfgls.GetCurSel(), item.strName);
+	if (!m_profileStore.Load(item))
+	{
+		RestoreProfileSelection();
+		RefreshProfileNames();
+		MessageBox(Localization::Get(_T("profile.load_failed")),
+			Localization::Get(_T("status.invalid_config")), MB_ICONWARNING);
+		return;
+	}
 	if (!ConfirmDiscardUnsavedChanges())
 	{
 		m_draftProfileName = previousDraftName;
@@ -1960,10 +2009,22 @@ void CPage1::OnCbnSelchangeComboCfgs()
 		return;
 	}
 
+	// The prompt may have saved a profile, or another instance may have changed it.
 	if (m_profileStore.Load(item))
 	{
+		m_loadingProfile = TRUE;
+		m_cfgls.SetCurSel(m_cfgls.FindStringExact(-1, item.strName));
+		m_cfgls.SetWindowText(item.strName);
+		m_loadingProfile = FALSE;
 		m_profileStore.SetLastSelected(item.strName);
 		UILoadCfg(&item);
+	}
+	else
+	{
+		RestoreProfileSelection();
+		RefreshProfileNames();
+		MessageBox(Localization::Get(_T("profile.load_failed")),
+			Localization::Get(_T("status.invalid_config")), MB_ICONWARNING);
 	}
 }
 

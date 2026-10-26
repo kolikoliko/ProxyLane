@@ -3,6 +3,7 @@
 #include "IniFile.h"
 #include "..\ProxyLaneHook\ProxyModule.h"
 #include <list>
+#include <vector>
 
 #define CHILDFILTER_MODE_EXCLUDE  0
 #define CHILDFILTER_MODE_INCLUDE  1
@@ -36,6 +37,7 @@ public:
 
 	BOOL Load(CfgProxyItem& item) const;
 	int LoadAll(std::list<CfgProxyItem>& items, CString& lastSelectedName) const;
+	BOOL ListNames(std::vector<CString>& names) const;
 	void Save(CfgProxyItem& item);
 	BOOL Delete(LPCTSTR name);
 	void SetLastSelected(LPCTSTR name);

@@ -83,6 +83,14 @@ Secure transport runs in the 64-bit host through `ProxyLaneSecureTransport64.dll
 powershell -ExecutionPolicy Bypass -File .\scripts\build-secure-transport.ps1
 ```
 
+## Sharing Proxy Profiles
+
+Choose **Actions ▾ → Copy full profile** on the proxy settings page to copy the current settings, including unsaved edits, username, password, PSK, network options, child-process rules and target rules. The result is a single `proxylane://profile/v1/…` line. Base64URL is encoding, not encryption: anyone holding the code can read its credentials.
+
+The recipient copies the complete line and chooses **Actions ▾ → Paste profile** to fill all profile fields. Imported profiles remain unsaved, and duplicate names receive an “(imported)” suffix. Existing unsaved edits prompt before replacement. While a proxy is running, pasted settings take effect only after **Save & Apply**. Global options, decryption settings, CA material, recordings and recent applications are not included.
+
+Opening the profile dropdown refreshes its names from disk, including additions and deletions made by other instances. Selecting a profile reads its latest settings. Refreshing the list preserves current edits; a profile deleted by another instance is retained in the editor as an unsaved draft.
+
 ## Interface Languages
 
 ProxyLane includes Simplified Chinese and English. By default, it follows the Windows UI language: Chinese systems use Simplified Chinese, while all other systems use English. You can also select a language on the **About & Language** page; the change takes effect the next time ProxyLane starts.

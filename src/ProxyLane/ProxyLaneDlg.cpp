@@ -1162,7 +1162,9 @@ void CProxyLaneDlg::OnSize(UINT nType, int cx, int cy)
 void CProxyLaneDlg::OnGetMinMaxInfo(MINMAXINFO* minMaxInfo)
 {
 	CModernDialog::OnGetMinMaxInfo(minMaxInfo);
-	minMaxInfo->ptMinTrackSize.x = UiTheme::ScaleForWindow(m_hWnd, 640);
+	// English navigation is 34 logical pixels wider; keep the settings column visible.
+	const int minimumWidth = Localization::CurrentLanguage().CompareNoCase(_T("en-US")) == 0 ? 674 : 640;
+	minMaxInfo->ptMinTrackSize.x = UiTheme::ScaleForWindow(m_hWnd, minimumWidth);
 	minMaxInfo->ptMinTrackSize.y = UiTheme::ScaleForWindow(m_hWnd, 488);
 }
 

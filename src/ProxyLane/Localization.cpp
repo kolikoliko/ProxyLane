@@ -217,7 +217,7 @@ void Localization::ApplyDialog(CWnd* dialog, UINT dialogId)
 	static const ControlTranslation page1[] = {
 		{ IDC_STATIC_PAGE_TITLE, _T("page1.title") }, { IDC_STATIC_PAGE_SUBTITLE, _T("page1.subtitle") },
 		{ IDC_STATIC_PROXY_GROUP, _T("page1.proxy_group") }, { IDC_STATIC_CONFIG_LABEL, _T("common.config") },
-		{ IDC_BUTTON_SAVE_PROFILE, _T("common.save_profile") }, { IDC_BUTTON_DELETE_PROFILE, _T("common.delete") },
+		{ IDC_BUTTON_SAVE_PROFILE, _T("common.save_profile") }, { IDC_BUTTON_PROFILE_MENU, _T("profile.actions") },
 		{ IDC_STATIC_TYPE_LABEL, _T("common.type") }, { IDC_STATIC_HOST_LABEL, _T("common.host") },
 		{ IDC_STATIC_PORT_LABEL, _T("common.port") }, { IDC_STATIC_USER_LABEL, _T("common.username") },
 		{ IDC_STATIC_PASSWORD_LABEL, _T("common.password") }, { IDC_STATIC_TestProxy, _T("status.test_not_run") },

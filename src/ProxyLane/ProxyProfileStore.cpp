@@ -113,6 +113,22 @@ int CProxyProfileStore::LoadAll(std::list<CfgProxyItem>& items, CString& lastSel
 	return (int)items.size();
 }
 
+BOOL CProxyProfileStore::ListNames(std::vector<CString>& names) const
+{
+	std::list<CString> sections;
+	if (m_ini.GetSectionList(sections) < 0)
+		return FALSE;
+	std::vector<CString> loaded;
+	for (const CString& section : sections)
+	{
+		if (section.Left(kProfilePrefixLength).CompareNoCase(kProfilePrefix) == 0 &&
+			section.GetLength() > kProfilePrefixLength)
+			loaded.push_back(section.Mid(kProfilePrefixLength));
+	}
+	names.swap(loaded);
+	return TRUE;
+}
+
 void CProxyProfileStore::Save(CfgProxyItem& item)
 {
 	CString section = kProfilePrefix + item.strName;

@@ -38,7 +38,7 @@ public:
 	CModernButton m_OK;
 	CModernButton m_Cancel;
 	CModernButton m_btnSaveProfile;
-	CModernButton m_btnDeleteProfile;
+	CModernButton m_btnProfileMenu;
 
 private:
 	enum ProxyTestPhase
@@ -116,6 +116,9 @@ private:
 	CString GetCurrentProfileName();
 	BOOL SaveCurrentProfile(LPCTSTR profileName = NULL);
 	void RestoreProfileSelection();
+	void ShowProfileNotice(LPCTSTR primary, LPCTSTR secondary, CStatusLabel::Tone tone);
+	BOOL RefreshProfileNames();
+	void SelectProfileFromDisk(const CString& name);
 	BOOL StartProxyTestPhase(const PRCClient& client, int phase,
 		LPCTSTR statusKey);
 	BOOL StartIpv6ProxyTest();
@@ -185,9 +188,13 @@ public:
 	afx_msg void OnCfgoptLoad();
 	afx_msg void OnCfgoptSave();
 	afx_msg void OnCfgoptDelete();
+	afx_msg void OnProfileMenu();
+	afx_msg void OnCopyProfile();
+	afx_msg void OnPasteProfile();
 	void UILoadCfg(CfgProxyItem *item);
 	void UIGetCfg(CfgProxyItem *item);
 	afx_msg void OnCbnSelchangeComboCfgs();
+	afx_msg void OnCbnDropdownComboCfgs();
 	afx_msg void OnBnClickedHookChildProcess();
 	void UpdateChildFilterEnable();
 	void UpdateDnsRedirectEnable();
