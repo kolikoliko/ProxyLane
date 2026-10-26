@@ -13,6 +13,7 @@
 #include "PackagedAppSupport.h"
 #include "ApplicationPicker.h"
 #include "ProcessActions.h"
+#include "ProcessImagePath.h"
 #include "../ProxyLaneHook/ProcessCreationRecording.h"
 #include "../ProxyLaneHook/ProcessCreationSnapshot.h"
 #include "ScopedProcessSuspension.h"
@@ -395,150 +396,70 @@ static BOOL SetProcessStartTime(ULONGLONG startTimeValue, _myPROCESSINFO& proces
 	return TRUE;
 }
 
-// 读取单个已打开进程的创建时间，作为旧系统和异常情况下的回退路径。
-static BOOL GetProcessStartTime(HANDLE hProcess, _myPROCESSINFO& processInfo)
-{
-	FILETIME creationTime;
-	FILETIME exitTime;
-	FILETIME kernelTime;
-	FILETIME userTime;
-	if (!GetProcessTimes(hProcess, &creationTime, &exitTime, &kernelTime, &userTime))
-		return FALSE;
-
-	ULARGE_INTEGER timeValue;
-	timeValue.LowPart = creationTime.dwLowDateTime;
-	timeValue.HighPart = creationTime.dwHighDateTime;
-	return SetProcessStartTime(timeValue.QuadPart, processInfo);
-}
-
-// SYSTEM_PROCESS_INFORMATION 的固定前缀。创建时间位于偏移 32，父 PID 紧随进程 PID。
-// 这里只读取 XP 至今保持稳定的字段，不依赖较新 SDK 中不断扩展的后续成员。
-struct ProcessSnapshotEntryPrefix
-{
-	ULONG nextEntryOffset;
-	BYTE reservedBeforeImageName[52];
-	PVOID reservedImageNameAndPriority[3];
-	HANDLE processId;
-	PVOID parentProcessId;
-};
-
-static BOOL GetSnapshotProcessStartTimes(std::map<DWORD, ULONGLONG>& startTimes)
-{
-	typedef LONG (WINAPI* NtQuerySystemInformationProc)(
-		ULONG systemInformationClass,
-		PVOID systemInformation,
-		ULONG systemInformationLength,
-		PULONG returnLength);
-
-	HMODULE ntdll = GetModuleHandle(_T("ntdll.dll"));
-	NtQuerySystemInformationProc querySystemInformation = ntdll
-		? reinterpret_cast<NtQuerySystemInformationProc>(
-			GetProcAddress(ntdll, "NtQuerySystemInformation"))
-		: NULL;
-	if (!querySystemInformation)
-		return FALSE;
-
-	const ULONG systemProcessInformation = 5;
-	const LONG statusInfoLengthMismatch = static_cast<LONG>(0xC0000004L);
-	ULONG bufferSize = 64 * 1024;
-	std::vector<BYTE> buffer;
-	LONG status = statusInfoLengthMismatch;
-	for (int attempt = 0; attempt < 8 && status == statusInfoLengthMismatch; ++attempt)
-	{
-		buffer.resize(bufferSize);
-		ULONG requiredSize = 0;
-		status = querySystemInformation(
-			systemProcessInformation,
-			&buffer[0],
-			bufferSize,
-			&requiredSize);
-		if (status == statusInfoLengthMismatch)
-		{
-			bufferSize = requiredSize > bufferSize
-				? requiredSize + 64 * 1024
-				: bufferSize * 2;
-		}
-	}
-	if (status < 0 || buffer.empty())
-		return FALSE;
-
-	BYTE* entryAddress = &buffer[0];
-	for (;;)
-	{
-		ProcessSnapshotEntryPrefix* entry =
-			reinterpret_cast<ProcessSnapshotEntryPrefix*>(entryAddress);
-		DWORD pid = static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(entry->processId));
-		LARGE_INTEGER* creationTime = reinterpret_cast<LARGE_INTEGER*>(entryAddress + 32);
-		if (pid != 0 && creationTime->QuadPart > 0)
-			startTimes[pid] = static_cast<ULONGLONG>(creationTime->QuadPart);
-
-		if (entry->nextEntryOffset == 0)
-			break;
-		entryAddress += entry->nextEntryOffset;
-	}
-	return !startTimes.empty();
-}
-
 int GetProcessList(list<_myPROCESSINFO> &ls)
 {
-	int nCount = 0;
-	PROCESSENTRY32 pe;
-	DWORD dwRet;
-	_myPROCESSINFO mypi;
-	std::map<DWORD, ULONGLONG> snapshotStartTimes;
-	GetSnapshotProcessStartTimes(snapshotStartTimes);
-
-	//
-	// 通过 TOOHLP32 函数枚举进程
-	//
-
-	HANDLE hSP = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (hSP != INVALID_HANDLE_VALUE)
+	ProxyProcessIdentity::Snapshot snapshot;
+	if (!ProxyProcessIdentity::QuerySnapshot(snapshot)) return -1;
+	const BOOL queryByPid = IsVistaOrLater();
+	ProcessImagePath::Resolver pathResolver;
+	if (queryByPid) pathResolver.Refresh();
+	list<_myPROCESSINFO> rows;
+	int count = 0;
+	for (size_t i = 0; i < snapshot.processes.size(); ++i)
 	{
-		pe.dwSize = sizeof(pe);
+		const ProxyProcessIdentity::Process& process = snapshot.processes[i];
+		_myPROCESSINFO info = {};
+		info.pid = process.pid;
+		info.parentPid = process.parentPid;
+		// Keep the previous insertion-at-head order using the native snapshot.
+		info.defaultOrder = -count;
+		info.treeOrder = -1;
+		const CString name = !process.name.empty() ? CString(process.name.c_str()) :
+			(process.pid == 0 ? CString(_T("[System Process]")) : Localization::Get(_T("page3.unknown_process")));
+		_tcsncpy_s(info.proname, _countof(info.proname), name, _TRUNCATE);
+		if (process.creationTime) SetProcessStartTime(process.creationTime, info);
 
-		for (dwRet = Process32First(hSP, &pe);
-			dwRet;
-			dwRet = Process32Next(hSP, &pe))
+		if (queryByPid)
 		{
-			ZeroMemory(&mypi, sizeof(mypi));
-
-			mypi.pid = pe.th32ProcessID;
-			mypi.parentPid = pe.th32ParentProcessID;
-			// 保持原界面逐项插入到列表首行时形成的默认顺序。
-			mypi.defaultOrder = -nCount;
-			mypi.treeOrder = -1;
-			_tcsncpy(mypi.proname, pe.szExeFile, MAX_PATH);
-			mypi.proname[MAX_PATH - 1] = _T('\0');
-			std::map<DWORD, ULONGLONG>::const_iterator snapshotTime =
-				snapshotStartTimes.find(mypi.pid);
-			if (snapshotTime != snapshotStartTimes.end())
-				SetProcessStartTime(snapshotTime->second, mypi);
-
-			HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pe.th32ProcessID);
-			if (!hProcess)
+			std::wstring nativePath;
+			if (process.creationTime && ProcessImagePath::Query(process.pid, nativePath))
 			{
-				// Vista+ 的路径 API 以及启动时间只需要进程查询权限。
-				hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe.th32ProcessID);
+				const CString path(pathResolver.Convert(nativePath).c_str());
+				// Do not expose a truncated path as an actionable executable path.
+				if (path.GetLength() < _countof(info.propath))
+					_tcscpy_s(info.propath, _countof(info.propath), path);
 			}
-			if (hProcess)
-			{
-				// 新系统优先 QueryFullProcessImageName；XP 自动回退到 PSAPI。
-				GetProcessFullPath(hProcess, mypi.propath, MAX_PATH);
-				if (!mypi.hasStartTime)
-					GetProcessStartTime(hProcess, mypi);
-				CloseHandle(hProcess);
-			}
-
-			ls.push_back(mypi);
-
-			nCount++;
 		}
-
-		::CloseHandle(hSP);
+		else
+		{
+			// XP/Server 2003 compatibility only. Modern path queries never open a process.
+			HANDLE handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, process.pid);
+			if (!handle) handle = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, process.pid);
+			if (handle)
+			{
+				if (process.creationTime && ProcessActions::CreationTime(handle) == process.creationTime)
+					GetProcessFullPath(handle, info.propath, MAX_PATH);
+				CloseHandle(handle);
+			}
+		}
+		rows.push_back(info);
+		++count;
 	}
-
-	return nCount;
+	if (queryByPid)
+	{
+		// One batch recheck after all PID-only queries, not a snapshot per row.
+		// A failed recheck leaves names/times available but discards unverified paths.
+		ProxyProcessIdentity::Snapshot after;
+		ProxyProcessIdentity::QuerySnapshot(after);
+		for (auto row = rows.begin(); row != rows.end(); ++row)
+		{
+			const auto found = after.creationTimes.find(row->pid);
+			if (!after.complete || !row->startTimeValue || found == after.creationTimes.end() ||
+				found->second != row->startTimeValue) row->propath[0] = _T('\0');
+		}
+	}
+	ls.splice(ls.end(), rows);
+	return count;
 }
 
 void CPage3::OnHookWsock(LPHookWSockResult)
@@ -567,10 +488,12 @@ BOOL CPage3::GetRunningHookedProcesses(std::vector<_myPROCESSINFO>& processes)
 		identities.resize(static_cast<size_t>(count) + 64);
 	}
 	if (!complete) return FALSE;
+	ProxyProcessIdentity::Snapshot snapshot;
+	if (!identities.empty() && !ProxyProcessIdentity::QuerySnapshot(snapshot)) return FALSE;
 	for (size_t i = 0; i < identities.size(); ++i)
 	{
 		const HookProcessIdentityInfo& identity = identities[i];
-		if (ProxyProcessIdentity::HasExited(identity)) continue;
+		if (snapshot.HasExited(identity)) continue;
 		_myPROCESSINFO process = {};
 		process.pid = identity.dwProcessId;
 		process.hasStartTime = TRUE;
@@ -1889,6 +1812,12 @@ int CPage3::UpdatePslist(BOOL bRefresh)
 
 	//查询当前所有进程
 	int nPsCount = GetProcessList(psls);
+	if (nPsCount < 0) return 0; // Keep the previous list when the snapshot fails.
+	if (bRefresh)
+	{
+		m_ListCtrl.DeleteAllItems();
+		m_displayedStartTimes.clear();
+	}
 
 	// 保存本次快照，排序比较时直接使用原始数据，避免按显示文本错误排序。
 	m_processSortData.clear();
@@ -2401,8 +2330,6 @@ void CPage3::OnNMCustomdrawProcessList(NMHDR* notifyHeader, LRESULT* result)
 void CPage3::OnBnClickedRefresh()
 {
 	// TODO: 在此添加控件通知处理程序代码
-	m_ListCtrl.DeleteAllItems();
-	m_displayedStartTimes.clear();
 	UpdatePslist(TRUE);
 }
 

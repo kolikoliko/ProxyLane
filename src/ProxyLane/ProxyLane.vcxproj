@@ -323,6 +323,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)..\scripts\bu
     <ClInclude Include="ApplicationCatalogCache.h" />
     <ClInclude Include="RecentApplications.h" />
     <ClInclude Include="ProcessActions.h" />
+    <ClInclude Include="ProcessImagePath.h" />
     <ClInclude Include="ScopedProcessSuspension.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="TrafficRateSampler.h" />

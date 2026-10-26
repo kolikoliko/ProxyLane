@@ -72,6 +72,15 @@ int ProcessActionsTestsMain()
 	const std::vector<DWORD> denied = ProcessActions::TerminateExactProcesses(targets);
 	if (denied[0] != ERROR_ACCESS_DENIED ||
 		WaitForSingleObject(child.hProcess, 0) != WAIT_TIMEOUT) ++failures;
+	// A different lifetime at the same inaccessible PID is not our target.
+	targets[0].creationTime = protectedTarget.creationTime - 1;
+	const std::vector<DWORD> reusedDenied = ProcessActions::TerminateExactProcesses(targets);
+	if (reusedDenied[0] || WaitForSingleObject(child.hProcess, 0) != WAIT_TIMEOUT)
+	{
+		std::cerr << "Reused inaccessible PID error: " << reusedDenied[0] << std::endl;
+		++failures;
+	}
+	targets[0] = protectedTarget;
 	ResumeThread(child.hThread);
 	if (WaitForSingleObject(child.hProcess, 10000) != WAIT_OBJECT_0)
 	{

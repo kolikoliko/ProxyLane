@@ -67,9 +67,12 @@ public:
 			ScopedLock lock(m_lock);
 			snapshot = m_processes;
 		}
+		if (snapshot.empty()) return;
+		ProxyProcessIdentity::Snapshot processes;
+		if (!ProxyProcessIdentity::QuerySnapshot(processes)) return;
 		for (Records::const_iterator it = snapshot.begin(); it != snapshot.end(); ++it)
 		{
-			if (!ProxyProcessIdentity::HasExited(it->second)) continue;
+			if (!processes.HasExited(it->second)) continue;
 			ScopedLock lock(m_lock);
 			Records::iterator current = m_processes.find(it->first);
 			// A concurrent registration of a reused PID must survive this scan.

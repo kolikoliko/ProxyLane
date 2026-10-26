@@ -32,7 +32,7 @@ namespace ProcessActions
 			identity.dwProcessId = pid;
 			identity.processCreateTime = expectedCreationTime;
 			// Opening with terminate rights can fail for an already exited
-			// object. Recheck without those rights before reporting a failure.
+			// object. Recheck its lifetime in the system snapshot before reporting a failure.
 			SetLastError(ProxyProcessIdentity::HasExited(identity) ? ERROR_NOT_FOUND : error);
 			return NULL;
 		}

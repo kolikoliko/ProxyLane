@@ -1,6 +1,8 @@
 #pragma once
 #include <windows.h>
-#include <tlhelp32.h>
+#include <map>
+#include <vector>
+#include <string>
 
 #pragma pack(push, 1)
 typedef struct _HookProcessIdentityInfo
@@ -19,51 +21,132 @@ typedef struct _HookProcessIdentityInfo
 
 namespace ProxyProcessIdentity
 {
-	// An exited process object can still exist while another process holds a
-	// handle to it. Its DACL can deny OpenProcess even though it has already
-	// disappeared from the system process list. Only a complete enumeration
-	// proves absence; a failed snapshot/query must remain inconclusive.
-	inline BOOL IsAbsentFromSnapshot(DWORD pid)
+	// Fixed prefix of SystemProcessInformation, also used by the process list
+	// and child guard. Resolve the native API dynamically for older Windows.
+	// Never use this snapshot alone to authorize a kill.
+	struct SystemProcessPrefix
 	{
-		HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-		if (snapshot == INVALID_HANDLE_VALUE) return FALSE;
-		PROCESSENTRY32W entry = { sizeof(entry) };
-		if (!Process32FirstW(snapshot, &entry))
+		ULONG nextEntryOffset;
+		BYTE reserved[28];
+		LARGE_INTEGER createTime;
+		BYTE times[16];
+		USHORT imageLength, imageMaximumLength;
+		PWSTR imageBuffer;
+		LONG basePriority;
+		HANDLE processId;
+		HANDLE parentProcessId;
+	};
+	static_assert(FIELD_OFFSET(SystemProcessPrefix, createTime) == 32, "Creation time offset");
+#ifdef _WIN64
+	static_assert(FIELD_OFFSET(SystemProcessPrefix, processId) == 80, "64-bit PID offset");
+	static_assert(FIELD_OFFSET(SystemProcessPrefix, parentProcessId) == 88, "64-bit parent PID offset");
+#else
+	static_assert(FIELD_OFFSET(SystemProcessPrefix, processId) == 68, "32-bit PID offset");
+	static_assert(FIELD_OFFSET(SystemProcessPrefix, parentProcessId) == 72, "32-bit parent PID offset");
+#endif
+
+	struct Process
+	{
+		DWORD pid, parentPid;
+		ULONGLONG creationTime;
+		std::wstring name;
+	};
+
+	struct Snapshot
+	{
+		BOOL complete = FALSE;
+		// Preserve system enumeration order for the process list; the map is
+		// an index for batch lifetime checks against this same snapshot.
+		std::vector<Process> processes;
+		std::map<DWORD, ULONGLONG> creationTimes;
+
+		BOOL HasExited(const HookProcessIdentityInfo& identity) const
 		{
-			CloseHandle(snapshot);
-			return FALSE;
+			if (!complete || !identity.dwProcessId || !identity.processCreateTime) return FALSE;
+			const auto found = creationTimes.find(identity.dwProcessId);
+			return found == creationTimes.end() ||
+				(found->second && found->second != identity.processCreateTime);
 		}
-		do
+	};
+
+	inline BOOL ReadSnapshot(const BYTE* buffer, size_t length, Snapshot& snapshot)
+	{
+		snapshot.complete = FALSE;
+		snapshot.processes.clear();
+		snapshot.creationTimes.clear();
+		if (!buffer) return FALSE;
+		std::map<DWORD, ULONGLONG> times;
+		std::vector<Process> processes;
+		size_t offset = 0;
+		for (;;)
 		{
-			if (entry.th32ProcessID == pid)
-			{
-				CloseHandle(snapshot);
+			if (length - offset < sizeof(SystemProcessPrefix)) return FALSE;
+			SystemProcessPrefix entry;
+			CopyMemory(&entry, buffer + offset, sizeof(entry));
+			const ULONG_PTR pid = reinterpret_cast<ULONG_PTR>(entry.processId);
+			const ULONG_PTR parentPid = reinterpret_cast<ULONG_PTR>(entry.parentProcessId);
+			if (pid > MAXDWORD || parentPid > MAXDWORD) return FALSE;
+			// A present PID with an unavailable time remains unknown, not gone.
+			const ULONGLONG time = entry.createTime.QuadPart > 0 ? entry.createTime.QuadPart : 0;
+			if (!times.insert(std::make_pair(static_cast<DWORD>(pid), time)).second) return FALSE;
+			Process process = { static_cast<DWORD>(pid), static_cast<DWORD>(parentPid), time, L"" };
+			if (entry.imageLength % sizeof(WCHAR) || entry.imageLength > entry.imageMaximumLength)
 				return FALSE;
+			if (entry.imageLength)
+			{
+				// UNICODE_STRING is length-delimited and points into the returned
+				// buffer. Copy it before that buffer is released; do not use wcslen.
+				const ULONG_PTR name = reinterpret_cast<ULONG_PTR>(entry.imageBuffer);
+				const ULONG_PTR base = reinterpret_cast<ULONG_PTR>(buffer);
+				if (name < base || name - base > length || entry.imageLength > length - (name - base))
+					return FALSE;
+				process.name.resize(entry.imageLength / sizeof(WCHAR));
+				CopyMemory(&process.name[0], entry.imageBuffer, entry.imageLength);
 			}
-		} while (Process32NextW(snapshot, &entry));
-		const BOOL complete = GetLastError() == ERROR_NO_MORE_FILES;
-		CloseHandle(snapshot);
-		return complete;
+			processes.push_back(process);
+			if (!entry.nextEntryOffset) break;
+			if (entry.nextEntryOffset < sizeof(entry) || entry.nextEntryOffset > length - offset)
+				return FALSE;
+			offset += entry.nextEntryOffset;
+		}
+		snapshot.creationTimes.swap(times);
+		snapshot.processes.swap(processes);
+		snapshot.complete = TRUE;
+		return TRUE;
 	}
 
-	// Only positive evidence removes a registered lifetime. Access denial or
-	// a failed query must not hide a possibly running hooked application.
+	// One complete system snapshot per scan; no per-process handles or fallback
+	// enumeration. Failure leaves the snapshot unknown, never an empty success.
+	inline BOOL QuerySnapshot(Snapshot& snapshot)
+	{
+		snapshot.complete = FALSE;
+		snapshot.processes.clear();
+		snapshot.creationTimes.clear();
+		typedef LONG (WINAPI *QuerySystemInformation)(ULONG, PVOID, ULONG, PULONG);
+		HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+		QuerySystemInformation query = ntdll ? reinterpret_cast<QuerySystemInformation>(
+			GetProcAddress(ntdll, "NtQuerySystemInformation")) : NULL;
+		if (!query) return FALSE;
+		const ULONG maxSize = 64 * 1024 * 1024;
+		ULONG size = 64 * 1024;
+		std::vector<BYTE> buffer;
+		for (int attempt = 0; attempt < 8 && size <= maxSize; ++attempt)
+		{
+			buffer.resize(size);
+			ULONG returned = 0;
+			const LONG status = query(5 /* SystemProcessInformation */, &buffer[0], size, &returned);
+			if (status != static_cast<LONG>(0xC0000004L) /* STATUS_INFO_LENGTH_MISMATCH */)
+				return status >= 0 && returned <= size && ReadSnapshot(&buffer[0], returned, snapshot);
+			if (returned > maxSize - 64 * 1024) return FALSE;
+			size = returned > size ? returned + 64 * 1024 : size * 2;
+		}
+		return FALSE;
+	}
+
 	inline BOOL HasExited(const HookProcessIdentityInfo& identity)
 	{
-		HANDLE process = OpenProcess(SYNCHRONIZE | 0x1000 /* QUERY_LIMITED_INFORMATION */,
-			FALSE, identity.dwProcessId);
-		if (!process)
-			process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_INFORMATION, FALSE, identity.dwProcessId);
-		if (!process)
-			return GetLastError() == ERROR_INVALID_PARAMETER ||
-				IsAbsentFromSnapshot(identity.dwProcessId);
-		BOOL exited = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
-		FILETIME created, ended, kernel, user;
-		if (!exited && GetProcessTimes(process, &created, &ended, &kernel, &user))
-			exited = (((ULONGLONG)created.dwHighDateTime << 32) | created.dwLowDateTime)
-				!= identity.processCreateTime;
-		CloseHandle(process);
-		return exited;
+		Snapshot snapshot;
+		return QuerySnapshot(snapshot) && snapshot.HasExited(identity);
 	}
 }
 

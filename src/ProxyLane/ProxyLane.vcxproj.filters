@@ -187,6 +187,9 @@
     <ClInclude Include="RecentApplications.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="ProcessImagePath.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="ProcessActions.h">
       <Filter>头文件</Filter>
     </ClInclude>
