@@ -79,6 +79,8 @@ SOCKS5、HTTP10 和 HTTP11 配置都可以在“加密模式”中选择 `gonc T
 
 远端 gonc 默认只启用 SOCKS5。若要让同一个 TLS-PSK 端口同时接受 SOCKS5 和 HTTP，请在内置服务参数中增加 `-http`，例如 `gonc -e ":s5s -u -http" -l -k -psk 123 -tls 1083`。
 
+PL 的 gonc TLS-PSK 传输支持 TLS 1.3，并兼容仅支持 TLS 1.2 的服务端；即使代理主机填写域名，也不会发送 SNI。身份认证仍校验 PSK 派生的公钥。可在 gonc 服务端使用 `-tls13` 限定为 TLS 1.3。
+
 PSK 按初版设计以明文写入所选 profile 的 `PSK=` 字段，请妥善限制 `ProxyLane.ini` 的访问权限。标准（不加密）模式不加载加密组件。
 
 加密传输由 64 位主程序中的 `ProxyLaneSecureTransport64.dll` 提供，也支持代理 32 位应用。32 位主程序保留普通代理功能，不支持加密传输。主程序及 Hook DLL 仍使用 `v141_xp` 构建，未选择加密模式时不会加载此 DLL。构建加密组件需要 Rust MSVC 工具链：

@@ -75,6 +75,8 @@ Open `src/ProxyLane.sln`, select the `Win32` or `x64` platform, and build the so
 
 For a SOCKS5 profile, select `gonc TLS-PSK` under **Transport** and enter the same PSK used by the remote gonc `:s5s` server. Both TCP and UDP use the encrypted SOCKS5 service directly; no local gonc client or standard SOCKS5 bridge is required.
 
+PL's gonc TLS-PSK transport supports TLS 1.3 with TLS 1.2 compatibility. It does not send SNI, even when the proxy host is a domain name; authentication still checks the PSK-derived public key. Use `-tls13` on the gonc server to require TLS 1.3.
+
 In this initial format, the PSK is stored as plaintext in the profile's `PSK=` field. Protect access to `ProxyLane.ini` accordingly. Secure transport is available only for SOCKS5, and plain HTTP/SOCKS5 profiles do not load the secure component.
 
 Secure transport runs in the 64-bit host through `ProxyLaneSecureTransport64.dll` and supports both 32-bit and 64-bit target applications. The 32-bit host retains plain proxy support, without secure transport or data monitoring. The application and Hook DLLs remain built with `v141_xp`, and the secure DLL is not loaded unless the profile selects secure transport. Build them with the Rust MSVC toolchain:
