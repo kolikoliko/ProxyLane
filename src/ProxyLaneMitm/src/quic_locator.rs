@@ -1,8 +1,10 @@
 //! Conservative offline x64 locator. No version list, fixed RVAs or object layouts.
-use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic as M, OpKind, Register as R};
-use serde_json::{json, Value};
+use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic as M};
 use ring::digest::{digest as sha256, SHA256};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+#[path = "quic_locator_flow.rs"]
+mod flow;
 type Result<T> = std::result::Result<T, String>;
 fn u32at(b: &[u8], at: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(
@@ -15,7 +17,11 @@ fn u16at(b: &[u8], at: usize) -> Result<u16> {
     ))
 }
 fn digest(b: &[u8]) -> String {
-    sha256(&SHA256, b).as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    sha256(&SHA256, b)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 fn require(ok: bool, why: &str) -> Result<()> {
     if ok {
@@ -37,7 +43,9 @@ fn decode(b: &[u8], rva: u32) -> Result<Vec<Instruction>> {
 pub fn locate(path: &str) -> Result<Value> {
     locate_bytes(&std::fs::read(path).map_err(|e| e.to_string())?)
 }
-pub fn locate_bytes(raw: &[u8]) -> Result<Value> { locate_image(raw, false) }
+pub fn locate_bytes(raw: &[u8]) -> Result<Value> {
+    locate_image(raw, false)
+}
 // A bounded snapshot of the loaded image, with sections at their virtual RVAs.
 pub fn locate_image(raw: &[u8], mapped: bool) -> Result<Value> {
     require(raw.starts_with(b"MZ"), "not PE")?;
@@ -56,8 +64,16 @@ pub fn locate_image(raw: &[u8], mapped: bool) -> Result<Value> {
         let at = section_at + n * 40;
         sections.push((
             u32at(raw, at + 12)?,
-            if mapped { u32at(raw, at + 8)? } else { u32at(raw, at + 16)? },
-            if mapped { u32at(raw, at + 12)? } else { u32at(raw, at + 20)? },
+            if mapped {
+                u32at(raw, at + 8)?
+            } else {
+                u32at(raw, at + 16)?
+            },
+            if mapped {
+                u32at(raw, at + 12)?
+            } else {
+                u32at(raw, at + 20)?
+            },
             u32at(raw, at + 36)?,
         ));
     }
@@ -109,9 +125,11 @@ pub fn locate_image(raw: &[u8], mapped: bool) -> Result<Value> {
         }
         let code = bytes(start, size)?;
         for op in memchr::memchr_iter(0x8d, code) {
-            if op == 0 || op + 6 > code.len() { continue; }
+            if op == 0 || op + 6 > code.len() {
+                continue;
+            }
             let at = op - 1;
-            let w = &code[at..at+7];
+            let w = &code[at..at + 7];
             if !matches!(w[0], 0x48 | 0x4c) || w[1] != 0x8d || w[2] & 0xc7 != 5 {
                 continue;
             }
@@ -147,96 +165,8 @@ pub fn locate_image(raw: &[u8], mapped: bool) -> Result<Value> {
         "anchor not at instruction boundary",
     )?;
     let mut found = Vec::new();
-    for w in ins.windows(14) {
-        if w.iter().map(Instruction::mnemonic).collect::<Vec<_>>()
-            != [
-                M::Test,
-                M::Jne,
-                M::Mov,
-                M::Xor,
-                M::Cmp,
-                M::Jne,
-                M::Mov,
-                M::Mov,
-                M::Call,
-                M::Xor,
-                M::Test,
-                M::Mov,
-                M::Cmovne,
-                M::Jmp,
-            ]
-        {
-            continue;
-        }
-        let result = w[0].op0_register();
-        let temp = w[2].op0_register();
-        let job = w[6].op1_register();
-        if result == R::None
-            || w[0].op1_register() != result
-            || w[3].op0_register() != result
-            || w[3].op1_register() != result
-            || w[11].op0_register() != result
-            || w[11].op1_kind() != OpKind::Immediate32
-            || w[11].immediate32() != (-380i32 as u32)
-            || w[12].op0_register() != result
-        {
-            continue;
-        }
-        if w[9].op0_register() == R::None
-            || w[9].op0_register() != w[9].op1_register()
-            || w[12].op1_register() != w[9].op0_register()
-            || w[10].op0_register() != R::AL
-            || w[10].op1_register() != R::AL
-        {
-            continue;
-        }
-        if temp == R::None
-            || w[2].op1_kind() != OpKind::Memory
-            || w[2].memory_index() != R::None
-            || w[4].op0_kind() != OpKind::Memory
-            || w[4].memory_base() != temp
-            || w[4].memory_index() != R::None
-            || w[4].memory_size().size() != 1
-            || w[4].op1_kind() != OpKind::Immediate8
-            || w[4].immediate8() != 0
-        {
-            continue;
-        }
-        if w[6].op0_register() != R::RCX
-            || job == R::None
-            || job != w[2].memory_base()
-            || w[7].op0_register() != R::RDX
-            || w[7].op1_register() == R::None
-        {
-            continue;
-        }
-        let join = w[1].near_branch_target();
-        if w[5].near_branch_target() != join
-            || w[13].near_branch_target() != join
-            || !boundaries.contains(&join)
-            || join <= w[13].ip()
-        {
-            continue;
-        }
-        if !ins.iter().take(16).any(|i| {
-            i.mnemonic() == M::Mov && i.op0_register() == result && i.op1_register() == R::EDX
-        }) || !ins.iter().take(16).any(|i| {
-            i.mnemonic() == M::Mov && i.op0_register() == job && i.op1_register() == R::RCX
-        }) {
-            continue;
-        }
-        if ins.iter().any(|i| {
-            (i.is_jcc_short_or_near() || i.is_jmp_short_or_near())
-                && i.near_branch_target() > w[0].ip()
-                && i.near_branch_target() <= w[13].ip()
-                && (i.ip() < w[0].ip() || i.ip() > w[13].ip())
-        }) {
-            continue;
-        }
-        if !w[8].is_call_near() {
-            continue;
-        }
-        let target = w[8].near_branch_target() as u32;
+    for call in flow::guarded_calls(&ins)? {
+        let target = call.near_branch_target() as u32;
         let Some(&stop) = ranges.get(&target) else {
             continue;
         };
@@ -253,14 +183,16 @@ pub fn locate_image(raw: &[u8], mapped: bool) -> Result<Value> {
             continue;
         }
         found.push(json!({"complete_rva":begin,"complete_size":end-begin,"allow_rva":target,"allow_size":size,
-            "caller_return_rva":w[8].next_ip(),"complete_hash":digest(bytes(begin,end-begin)?),"allow_hash":digest(code)}));
+            "caller_return_rva":call.next_ip(),"complete_hash":digest(bytes(begin,end-begin)?),"allow_hash":digest(code)}));
     }
     require(
         found.len() == 1,
         "guarded unknown-root call missing or ambiguous",
     )?;
     let mut result = found.remove(0);
-    if !mapped { result["module_hash"] = digest(raw).into(); }
+    if !mapped {
+        result["module_hash"] = digest(raw).into();
+    }
     result["image_size"] = image_size.into();
     Ok(result)
 }
