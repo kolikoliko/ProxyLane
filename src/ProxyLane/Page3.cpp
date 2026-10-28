@@ -785,6 +785,10 @@ CPage3::CPage3(CWnd* pParent /*=NULL*/)
 	, m_launchedProcessTime(0)
 	, m_launchSelectionTick(0)
 	, m_processRegistry(NULL)
+	, m_recentLoad(NULL)
+	, m_recentConsumed(TRUE)
+	, m_recentReadFailed(FALSE)
+	, m_recentLaunching(FALSE)
 {
 	//m_pEdit = NULL;
 	//m_pEdit = new CMyEdit;
@@ -795,6 +799,8 @@ CPage3::CPage3(CWnd* pParent /*=NULL*/)
 CPage3::~CPage3()
 {
 	ClearWindowFinderHighlight();
+	if (m_recentLoad) m_recentLoad->Release();
+	RecentApplications::ReleaseIcons(m_recentEntries);
 }
 
 void CPage3::DoDataExchange(CDataExchange* pDX)
@@ -831,6 +837,19 @@ BOOL CPage3::OnInitDialog()
 	m_btnTerminate.SetVisualStyle(CModernButton::STYLE_DANGER);
 	m_btnTerminate.EnableWindow(FALSE);
 	RestoreProcessPageSubtitle();
+
+	// The launch panel paints itself; without this the page background erase
+	// would wipe it whenever the page is invalidated after the panel painted.
+	ModifyStyle(0, WS_CLIPCHILDREN);
+	UiTheme::CreateUiFont(m_headingFont, m_hWnd, 11, FW_SEMIBOLD);
+	m_processHeading.Create(Localization::Get(_T("launch.processes")),
+		WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
+		CRect(0, 0, 0, 0), this, IDC_STATIC);
+	m_processHeading.SetFont(&m_headingFont, FALSE);
+	if (m_launchPanel.Create(this, IDC_LAUNCH_PANEL))
+		m_launchPanel.SetWindowPos(&wndBottom, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+	SetTimer(TIMER_LAUNCH_PANEL, 500, NULL);
+	RefreshLaunchPanel();
 	if (m_windowFinderToolTip.Create(this, TTS_ALWAYSTIP | TTS_NOPREFIX))
 	{
 		m_windowFinderToolTip.AddTool(
@@ -1208,6 +1227,8 @@ BEGIN_MESSAGE_MAP(CPage3, CModernDialog)
 	ON_NOTIFY(LVN_ITEMCHANGED, IDC_PSLIST, &CPage3::OnProcessSelectionChanged)
 	ON_NOTIFY(LVN_COLUMNCLICK, IDC_PSLIST, &CPage3::OnLvnColumnClickProcessList)
 	ON_NOTIFY(NM_CUSTOMDRAW, IDC_PSLIST, &CPage3::OnNMCustomdrawProcessList)
+	ON_MESSAGE(WM_LAUNCH_PANEL_TILE, &CPage3::OnLaunchPanelTile)
+	ON_MESSAGE(WM_RECENT_APPLICATIONS_CHANGED, &CPage3::OnRecentApplicationsChanged)
 	ON_MESSAGE(WM_WINDOW_FINDER_BEGIN, &CPage3::OnWindowFinderBegin)
 	ON_MESSAGE(WM_WINDOW_FINDER_UPDATE, &CPage3::OnWindowFinderUpdate)
 	ON_MESSAGE(WM_WINDOW_FINDER_COMPLETE, &CPage3::OnWindowFinderComplete)
@@ -1233,82 +1254,71 @@ void CPage3::LayoutProcessPage()
 	if (rcClient.Width() <= 0 || rcClient.Height() <= 0)
 		return;
 
-	int margin = UiTheme::ScaleForWindow(m_hWnd, 8);
-	int gap = UiTheme::ScaleForWindow(m_hWnd, 6);
-	int finderWidth = UiTheme::ScaleForWindow(m_hWnd, 30);
-	int refreshWidth = UiTheme::ScaleForWindow(m_hWnd, 70);
-	int injectWidth = UiTheme::ScaleForWindow(m_hWnd, 96);
-	if (m_btnInject.GetSafeHwnd())
+	const int margin = UiTheme::ScaleForWindow(m_hWnd, 8);
+	const int gap = UiTheme::ScaleForWindow(m_hWnd, 6);
+	const int buttonHeight = UiTheme::ScaleForWindow(m_hWnd, 30);
+	const int padding = UiTheme::ScaleForWindow(m_hWnd, 16);
+
+	auto textWidth = [this](CModernButton& button, int minimum)
 	{
-		CString buttonText;
-		m_btnInject.GetWindowText(buttonText);
-		CClientDC buttonDC(&m_btnInject);
-		CFont* buttonFont = m_btnInject.GetFont();
-		CFont* oldFont = buttonFont ? buttonDC.SelectObject(buttonFont) : NULL;
-		injectWidth = max(injectWidth, buttonDC.GetTextExtent(buttonText).cx
-			+ UiTheme::ScaleForWindow(m_hWnd, 28));
-		if (oldFont)
-			buttonDC.SelectObject(oldFont);
-	}
-	int buttonHeight = UiTheme::ScaleForWindow(m_hWnd, 30);
-	int selectWidth = UiTheme::ScaleForWindow(m_hWnd, 120);
-	if (m_btnSelectApp.GetSafeHwnd())
-	{
+		if (!button.GetSafeHwnd()) return UiTheme::ScaleForWindow(m_hWnd, minimum);
 		CString text;
-		m_btnSelectApp.GetWindowText(text);
-		CClientDC dc(&m_btnSelectApp);
-		CFont* font = m_btnSelectApp.GetFont();
+		button.GetWindowText(text);
+		CClientDC dc(&button);
+		CFont* font = button.GetFont();
 		CFont* oldFont = font ? dc.SelectObject(font) : NULL;
-		selectWidth = max(selectWidth, dc.GetTextExtent(text).cx
-			+ UiTheme::ScaleForWindow(m_hWnd, 28));
+		const int width = max(UiTheme::ScaleForWindow(m_hWnd, minimum),
+			dc.GetTextExtent(text).cx + UiTheme::ScaleForWindow(m_hWnd, 28));
 		if (oldFont) dc.SelectObject(oldFont);
-	}
-	int buttonTop = UiTheme::ScaleForWindow(m_hWnd, 8);
-	int terminateWidth = UiTheme::ScaleForWindow(m_hWnd, 90);
-	if (m_btnTerminate.GetSafeHwnd())
+		return width;
+	};
+
+	// Launch panel with the primary action inside it.
+	int top = UiTheme::ScaleForWindow(m_hWnd, 58);
+	if (m_launchPanel.GetSafeHwnd())
 	{
-		CString text;
-		m_btnTerminate.GetWindowText(text);
-		CClientDC dc(&m_btnTerminate);
-		CFont* font = m_btnTerminate.GetFont();
-		CFont* oldFont = font ? dc.SelectObject(font) : NULL;
-		terminateWidth = max(terminateWidth, dc.GetTextExtent(text).cx
-			+ UiTheme::ScaleForWindow(m_hWnd, 28));
-		if (oldFont) dc.SelectObject(oldFont);
+		const int panelHeight = m_launchPanel.PreferredHeight();
+		CRect panel(margin, top, rcClient.right - margin, top + panelHeight);
+		m_launchPanel.MoveWindow(&panel);
+		const int actionWidth = textWidth(m_btnSelectApp, 150);
+		m_launchPanel.SetActionWidth(actionWidth);
+		const int actionHeight = UiTheme::ScaleForWindow(m_hWnd, 34);
+		CRect slot = m_launchPanel.ActionSlot(actionWidth, actionHeight);
+		if (m_btnSelectApp.GetSafeHwnd())
+			m_btnSelectApp.MoveWindow(panel.left + slot.left, panel.top + slot.top, actionWidth, actionHeight);
+		top = panel.bottom + UiTheme::ScaleForWindow(m_hWnd, 16);
 	}
-	const int toolbarWidth = selectWidth + finderWidth + refreshWidth + injectWidth + terminateWidth + gap * 4;
-	int toolbarLeft = rcClient.right - margin - toolbarWidth;
-	int listTop = UiTheme::ScaleForWindow(m_hWnd, 58);
-	const BOOL separateRow = toolbarLeft < UiTheme::ScaleForWindow(m_hWnd, 160);
+
+	// Process section: heading on the left, tools on the right.
+	const int finderWidth = UiTheme::ScaleForWindow(m_hWnd, 30);
+	const int refreshWidth = textWidth(m_btnRefresh, 70);
+	const int injectWidth = textWidth(m_btnInject, 96);
+	const int terminateWidth = textWidth(m_btnTerminate, 90);
+	const int toolbarWidth = finderWidth + refreshWidth + injectWidth + terminateWidth + gap * 3;
+	const int headingWidth = UiTheme::ScaleForWindow(m_hWnd, 130);
+	const BOOL separateRow = rcClient.Width() - margin * 2 < toolbarWidth + headingWidth;
+
+	if (m_processHeading.GetSafeHwnd())
+		m_processHeading.MoveWindow(margin + UiTheme::ScaleForWindow(m_hWnd, 2), top,
+			max(0, (separateRow ? rcClient.Width() - margin * 2 : headingWidth)), buttonHeight);
+	int left = separateRow ? margin : rcClient.right - margin - toolbarWidth;
+	int toolbarTop = top;
 	if (separateRow)
-	{
-		buttonTop = listTop;
-		toolbarLeft = margin;
-		listTop += buttonHeight + margin;
-	}
-	if (CWnd* title = GetDlgItem(IDC_STATIC_PAGE_TITLE))
-	{
-		CRect titleRect;
-		title->GetWindowRect(&titleRect);
-		ScreenToClient(&titleRect);
-		title->MoveWindow(titleRect.left, titleRect.top,
-			max(0, (separateRow ? rcClient.right - margin : toolbarLeft - gap) - titleRect.left),
-			titleRect.Height());
-	}
-	CWnd* buttons[] = { &m_btnSelectApp, &m_btnWindowFinder, &m_btnRefresh, &m_btnInject, &m_btnTerminate };
-	const int widths[] = { selectWidth, finderWidth, refreshWidth, injectWidth, terminateWidth };
-	int left = toolbarLeft;
+		toolbarTop = top + buttonHeight + gap;
+	CWnd* buttons[] = { &m_btnWindowFinder, &m_btnRefresh, &m_btnInject, &m_btnTerminate };
+	const int widths[] = { finderWidth, refreshWidth, injectWidth, terminateWidth };
 	for (int i = 0; i < _countof(buttons); ++i)
 	{
 		if (separateRow && left > margin && left + widths[i] > rcClient.right - margin)
 		{
 			left = margin;
-			buttonTop += buttonHeight + gap;
-			listTop = buttonTop + buttonHeight + margin;
+			toolbarTop += buttonHeight + gap;
 		}
-		if (buttons[i]->GetSafeHwnd()) buttons[i]->MoveWindow(left, buttonTop, widths[i], buttonHeight);
+		if (buttons[i]->GetSafeHwnd()) buttons[i]->MoveWindow(left, toolbarTop, widths[i], buttonHeight);
 		left += widths[i] + gap;
 	}
+	const int listTop = toolbarTop + buttonHeight + gap + UiTheme::ScaleForWindow(m_hWnd, 2);
+
 	if (m_ListCtrl.GetSafeHwnd())
 	{
 		CRect rc(margin, listTop, rcClient.right - margin, max(listTop, rcClient.bottom - margin));
@@ -1316,6 +1326,7 @@ void CPage3::LayoutProcessPage()
 		int pathWidth = rc.Width() - UiTheme::ScaleForWindow(m_hWnd, 445);
 		if (pathWidth > UiTheme::ScaleForWindow(m_hWnd, 140)) m_ListCtrl.SetColumnWidth(3, pathWidth);
 	}
+	(void)padding;
 }
 
 void CPage3::OnProcessSelectionChanged(NMHDR*, LRESULT* result)
@@ -1393,8 +1404,118 @@ void CPage3::OnBnClickedTerminateProcess()
 	UpdatePslist(FALSE);
 }
 
+void CPage3::ReloadRecentApplications(BOOL force)
+{
+	// Mirrors the shared cache protocol used by the proxy page: the cache owns
+	// background loading; this page only clones what is ready to show.
+	const CString profile = g_MainTab && g_MainTab->IsProxyRunning() ? g_MainTab->GetRunningProfileName() : CString();
+	const CString identity = g_MainTab ? g_MainTab->GetRunningRecentProfileId() : CString();
+	BOOL changed = force || identity != m_recentProfileId;
+	if (identity != m_recentProfileId)
+	{
+		RecentApplications::ReleaseIcons(m_recentEntries);
+		m_recentEntries.clear();
+		if (m_recentLoad) { m_recentLoad->Release(); m_recentLoad = NULL; }
+		m_recentProfileId = identity;
+		m_recentConsumed = TRUE;
+		m_recentReadFailed = FALSE;
+	}
+	if (!identity.IsEmpty())
+	{
+		RecentApplications::Load* latest = RecentApplications::AcquireLoad(profile, RecentApplications::DefaultPath(), identity);
+		if (latest != m_recentLoad)
+		{
+			RecentApplications::Load* ready = RecentApplications::AcquireReadyLoad(profile, RecentApplications::DefaultPath(), identity);
+			if (ready)
+			{
+				RecentApplications::ReleaseIcons(m_recentEntries);
+				m_recentEntries.clear();
+				RecentApplications::Clone(ready->entries, m_recentEntries, 7);
+				ready->Release();
+			}
+			if (m_recentLoad) m_recentLoad->Release();
+			m_recentLoad = latest;
+			m_recentConsumed = FALSE;
+			changed = TRUE;
+		}
+		else latest->Release();
+		EnterCriticalSection(&m_recentLoad->lock);
+		const BOOL done = m_recentLoad->done;
+		LeaveCriticalSection(&m_recentLoad->lock);
+		if (done && !m_recentConsumed)
+		{
+			m_recentReadFailed = !m_recentLoad->succeeded;
+			if (!m_recentReadFailed)
+			{
+				RecentApplications::ReleaseIcons(m_recentEntries);
+				m_recentEntries.clear();
+				RecentApplications::Clone(m_recentLoad->entries, m_recentEntries, 7);
+			}
+			m_recentConsumed = TRUE;
+			changed = TRUE;
+		}
+	}
+	if (!changed) return;
+
+	std::vector<CLaunchPanel::Tile> tiles;
+	for (size_t i = 0; i < m_recentEntries.size(); ++i)
+	{
+		CLaunchPanel::Tile tile;
+		tile.icon = m_recentEntries[i].app.icon;
+		tile.name = m_recentEntries[i].app.name;
+		tile.tip = RecentApplications::Description(m_recentEntries[i], profile);
+		tiles.push_back(tile);
+	}
+	m_launchPanel.SetTiles(tiles);
+}
+
+void CPage3::RefreshLaunchPanel()
+{
+	if (!m_launchPanel.GetSafeHwnd()) return;
+	const BOOL running = g_MainTab && g_MainTab->IsProxyRunning();
+	ReloadRecentApplications(FALSE);
+	CString empty = Localization::Get(!m_recentConsumed ? L"apps.loading_list" :
+		(m_recentReadFailed ? L"recent.read_failed" : L"recent.empty"));
+	m_launchPanel.SetText(
+		Localization::Get(running ? _T("launch.title_ready") : _T("launch.title_offline")),
+		Localization::Get(running ? _T("launch.body_ready") : _T("launch.body_offline")),
+		Localization::Get(_T("recent.title")), empty);
+	m_launchPanel.SetEnabledState(running);
+
+	const CString actionText = Localization::Get(running ? _T("apps.select") : _T("launch.goto_proxy"));
+	CString current;
+	m_btnSelectApp.GetWindowText(current);
+	if (current != actionText)
+	{
+		m_btnSelectApp.SetWindowText(actionText);
+		LayoutProcessPage();
+	}
+}
+
+LRESULT CPage3::OnLaunchPanelTile(WPARAM index, LPARAM)
+{
+	if (m_recentLaunching || !g_MainTab || !g_MainTab->IsProxyRunning()) return 0;
+	if (index >= m_recentEntries.size()) return 0;
+	const RecentApplications::Entry entry = m_recentEntries[index];
+	m_recentLaunching = TRUE;
+	struct Reset { BOOL& flag; ~Reset() { flag = FALSE; } } reset = { m_recentLaunching };
+	LaunchRecentApplication(entry);
+	return 0;
+}
+
+LRESULT CPage3::OnRecentApplicationsChanged(WPARAM, LPARAM)
+{
+	ReloadRecentApplications(TRUE);
+	return 0;
+}
+
 void CPage3::OnBnClickedSelectApp()
 {
+	if (!g_MainTab || !g_MainTab->IsProxyRunning())
+	{
+		if (g_MainTab) g_MainTab->SelectPage(CMainTab::PAGE_PROXY);
+		return;
+	}
 	CApplicationPicker picker(this);
 	if (picker.DoModal() != IDOK) return;
 	if (!picker.m_selectedRecent.id.IsEmpty())
@@ -1433,6 +1554,7 @@ AppLaunchResult CPage3::LaunchInteractiveApplication(const InstalledApplications
 			g_MainTab->AddLogText(0, text);
 		}
 		g_MainTab->GetPage1()->PostMessage(WM_RECENT_APPLICATIONS_CHANGED);
+		PostMessage(WM_RECENT_APPLICATIONS_CHANGED);
 	}
 	return result;
 }
@@ -2838,6 +2960,11 @@ void CPage3::OnBnClickedInjectdll()
 void CPage3::OnTimer(UINT_PTR nIDEvent)
 {
 	if (nIDEvent == TIMER_BROWSER_LAUNCH) { CheckBrowserLaunches(); return; }
+	if (nIDEvent == TIMER_LAUNCH_PANEL)
+	{
+		if (IsWindowVisible() && !m_recentLaunching) RefreshLaunchPanel();
+		return;
+	}
 	// TODO: 在此添加消息处理程序代码和/或调用默认值
 	switch(nIDEvent)
 	{

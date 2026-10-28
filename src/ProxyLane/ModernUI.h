@@ -13,6 +13,8 @@ namespace UiTheme
 	COLORREF Accent();
 	COLORREF AccentHover();
 	COLORREF AccentSoft();
+	COLORREF AccentSoftBorder();
+	COLORREF Surface();
 	COLORREF Success();
 	COLORREF SuccessSoft();
 	COLORREF Danger();

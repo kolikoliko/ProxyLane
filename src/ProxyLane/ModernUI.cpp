@@ -20,6 +20,8 @@ namespace UiTheme
 	COLORREF Accent()            { return RGB(37, 99, 235); }
 	COLORREF AccentHover()       { return RGB(29, 78, 216); }
 	COLORREF AccentSoft()        { return RGB(232, 239, 254); }
+	COLORREF AccentSoftBorder()  { return RGB(207, 220, 251); }
+	COLORREF Surface()           { return RGB(249, 250, 252); }
 	COLORREF Success()           { return RGB(22, 163, 74); }
 	COLORREF SuccessSoft()       { return RGB(230, 247, 236); }
 	COLORREF Danger()            { return RGB(220, 38, 38); }
