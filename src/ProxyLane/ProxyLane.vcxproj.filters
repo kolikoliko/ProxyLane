@@ -57,6 +57,7 @@
     <ClCompile Include="Page1.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="ConfigImport.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="ProfileSharing.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
@@ -134,6 +135,7 @@
     <ClInclude Include="Page1.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="ConfigImport.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="ProfileShareCodec.h">
       <Filter>头文件</Filter>
     </ClInclude>
@@ -188,6 +190,15 @@
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="ProcessImagePath.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="BrowserLaunchWatch.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="ProcessCommandLine.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="BrowserReuseDialog.h">
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="ProcessActions.h">

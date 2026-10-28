@@ -17,7 +17,7 @@ import time
 import uuid
 
 import psutil
-from HookRebindE2ETests import USER, CALLBACK, attach, owned_pipe
+from HookRebindE2ETests import USER, KERNEL, CALLBACK, attach, owned_pipe
 
 USER.SetProcessDPIAware()  # PrintWindow uses physical pixels.
 USER.EnumChildWindows.argtypes = [wintypes.HWND, CALLBACK, wintypes.LPARAM]
@@ -147,6 +147,8 @@ def capture_dialog(window, destination):
 
 def run(binary_directory, bits, language, capture=False, exit_action='keep', child_exits_first=False,
         new_process=False, during_termination=False, cleanup_scenario=None, live_refresh=False):
+    if KERNEL.GetModuleHandleW('ProxyLaneHook64.dll'):
+        assert ctypes.WinDLL('ProxyLaneHook64.dll').gp_UnhookWinsock()
     directory = Path('build/qa/exit-warning-' + uuid.uuid4().hex[:8]).resolve()
     directory.mkdir(parents=True)
     # The Win32 launcher forwards to the x64 GUI on a 64-bit OS.
@@ -227,7 +229,14 @@ Transport=PLAIN
         assert 'PID %d)' % child.pid in details, details
         assert 'PID %d)' % shell.pid not in details, details
         assert 'PID %d)' % unrelated.pid not in details, details
-        assert USER.SendMessageW(orphan, 0x400, 0, 0) & 0xffff == 2  # DM_GETDEFID
+        assert USER.SendMessageW(orphan, 0x400, 0, 0) & 0xffff == 1135  # DM_GETDEFID
+        dialog_rect = window_rect(orphan)
+        rectangles = [window_rect(USER.GetDlgItem(orphan, control)) for control in (1135, 2, 1, 1112)]
+        for i, rect in enumerate(rectangles):
+            assert dialog_rect[0] <= rect[0] < rect[2] <= dialog_rect[2], rect
+            assert dialog_rect[1] <= rect[1] < rect[3] <= dialog_rect[3], rect
+            for other in rectangles[:i]:
+                assert rect[0] >= other[2] or rect[2] <= other[0] or rect[1] >= other[3] or rect[3] <= other[1]
         record.update(parent_pid=shell.pid, orphan_pid=child.pid, processes=details)
         if capture:
             capture_dialog(orphan, directory / 'exit-warning.png')
@@ -272,7 +281,7 @@ Transport=PLAIN
             assert window_rect(progress) == original_rect
             assert [w for w in windows(owner.pid) if USER.GetDlgItem(w, 1111)] == [orphan]
             assert '10' not in text(USER.GetDlgItem(progress, 1110))
-            if cleanup_scenario != 'cancel':
+            if cleanup_scenario not in ('cancel', 'hide'):
                 # More survivors than fit in the initial list must scroll at
                 # timeout, never enlarge or replace the existing dialog.
                 for _ in range(3):
@@ -291,7 +300,7 @@ Transport=PLAIN
                 checks += 1
                 assert USER.GetPropW(progress, 'ExitTestIdentity') == 1
                 assert window_rect(progress) == original_rect
-                if cleanup_scenario == 'cancel':
+                if cleanup_scenario in ('cancel', 'hide'):
                     # Wait until termination was actually requested, then verify
                     # cancellation interrupts the pending wait, not just startup.
                     kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
@@ -305,15 +314,21 @@ Transport=PLAIN
                                  code.value != 259, 'termination request before cancellation')
                     finally:
                         kernel.CloseHandle(query)
-                    dismiss(progress, 2)
+                    dismiss(progress, 1135 if cleanup_scenario == 'hide' else 2)
                     break
                 time.sleep(.1)
             record['responsive_checks'] = checks
-            if cleanup_scenario == 'cancel':
+            if cleanup_scenario in ('cancel', 'hide'):
                 assert owner.poll() is None
                 assert kernel.DebugActiveProcessStop(debugged_pid)
                 debugged_pid = None
                 child.wait(timeout=10)
+                if cleanup_scenario == 'hide':
+                    time.sleep(1.5)
+                    assert owner.poll() is None and owned_pipe(owner.pid) == pipe
+                    assert not USER.IsWindowVisible(main)
+                    USER.PostMessageW(main, 0x8000 + 100, 102, 0x203)
+                    wait_for(lambda: USER.IsWindowVisible(main), 'tray restore after cancelling cleanup')
                 USER.PostMessageW(main, 0x10, 0, 0)
                 owner.wait(timeout=10)
             else:
@@ -358,14 +373,48 @@ Transport=PLAIN
                     for arrival in arrivals:
                         arrival.terminate()
                         arrival.wait(timeout=10)
+                elif cleanup_scenario == 'hide-timeout':
+                    dismiss(timeout, 1135)
+                    assert not USER.IsWindowVisible(main)
+                    assert owner.poll() is None and owned_pipe(owner.pid) == pipe
+                    assert kernel.DebugActiveProcessStop(debugged_pid)
+                    debugged_pid = None
+                    child.wait(timeout=10)
+                    for arrival in arrivals:
+                        arrival.terminate()
+                        arrival.wait(timeout=10)
+                    time.sleep(1.5)
+                    assert owner.poll() is None and owned_pipe(owner.pid) == pipe
+                    USER.PostMessageW(main, 0x10, 0, 0)
                 else:
                     dismiss(timeout, 1)
                 owner.wait(timeout=10)
                 for arrival in arrivals:
-                    if cleanup_scenario in ('continue', 'manual'):
+                    if cleanup_scenario in ('continue', 'manual', 'hide-timeout'):
                         arrival.wait(timeout=10)
                     else:
                         assert arrival.poll() is None, 'Exit only must leave the remaining processes alive'
+        elif exit_action == 'hide':
+            # Enter chooses the safe default; restoring must allow a fresh exit.
+            USER.PostMessageW(orphan, 0x100, 13, 0)
+            wait_for(lambda: not USER.IsWindow(orphan), 'Enter hides to tray')
+            assert not USER.IsWindowVisible(main)
+            assert owner.poll() is None and child.is_running() and owned_pipe(owner.pid) == pipe
+            USER.PostMessageW(main, 0x8000 + 100, 102, 0x203)  # Tray double-click.
+            wait_for(lambda: USER.IsWindowVisible(main), 'tray restore')
+            reopened = warning(owner, main)
+            assert 'PID %d)' % child.pid in text(USER.GetDlgItem(reopened, 1111))
+            dismiss(reopened, 1135)
+            child.terminate()
+            child.wait(timeout=10)
+            time.sleep(1.5)  # More than two empty refreshes: no deferred exit.
+            assert owner.poll() is None and owned_pipe(owner.pid) == pipe
+            assert not USER.IsWindowVisible(main)
+            USER.PostMessageW(main, 0x8000 + 100, 102, 0x203)
+            wait_for(lambda: USER.IsWindowVisible(main), 'tray restore after last child exits')
+            USER.PostMessageW(main, 0x10, 0, 0)
+            owner.wait(timeout=10)
+            record['hide_cancels_automatic_exit'] = True
         elif live_refresh:
             original_rect = window_rect(orphan)
             late = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(180)'],
@@ -508,14 +557,14 @@ if __name__ == '__main__':
     parser.add_argument('--bits', type=int, choices=(32, 64), default=64)
     parser.add_argument('--language', choices=('en-US', 'zh-CN'), default='en-US')
     parser.add_argument('--capture', action='store_true', help='Save the owned dialog (requires Pillow)')
-    parser.add_argument('--exit-action', choices=('keep', 'terminate'), default='keep')
+    parser.add_argument('--exit-action', choices=('keep', 'terminate', 'hide'), default='keep')
     parser.add_argument('--child-exits-first', action='store_true')
     parser.add_argument('--new-process', action='store_true', help='Attach a new process during confirmation')
     parser.add_argument('--during-termination', action='store_true',
                         help='Attach a new process after the first termination batch')
     parser.add_argument('--live-refresh', action='store_true',
                         help='Check live additions/removals and automatic exit after manual closes')
-    parser.add_argument('--cleanup-scenario', choices=('continue', 'exit', 'cancel', 'manual'),
+    parser.add_argument('--cleanup-scenario', choices=('continue', 'exit', 'cancel', 'manual', 'hide', 'hide-timeout'),
                         help='Hold an owned process exit to check timeout choices and UI responsiveness')
     arguments = parser.parse_args()
     run(arguments.bin.resolve(), arguments.bits, arguments.language, arguments.capture,

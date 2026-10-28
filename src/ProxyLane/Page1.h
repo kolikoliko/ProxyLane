@@ -189,6 +189,8 @@ public:
 	afx_msg void OnCfgoptSave();
 	afx_msg void OnCfgoptDelete();
 	afx_msg void OnProfileMenu();
+	afx_msg void OnImportAllConfig();
+	BOOL CanImportAllConfig();
 	afx_msg void OnCopyProfile();
 	afx_msg void OnPasteProfile();
 	void UILoadCfg(CfgProxyItem *item);

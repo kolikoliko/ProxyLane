@@ -17,25 +17,28 @@ protected:
 		SetDlgItemText(IDC_EXIT_WARNING,
 			Localization::Format(_T("exit.processes_warning"), m_count));
 		SetDlgItemText(IDC_EXIT_PROCESSES, m_processes);
+		SetDlgItemText(IDC_EXIT_HIDE_TRAY, Localization::Get(_T("exit.hide_tray")));
 		SetDlgItemText(IDCANCEL, Localization::Get(_T("exit.return")));
 		SetDlgItemText(IDOK, Localization::Get(_T("exit.anyway")));
 		SetDlgItemText(IDC_EXIT_TERMINATE, Localization::Get(_T("exit.terminate")));
 		m_returnButton.SubclassDlgItem(IDCANCEL, this);
+		m_hideButton.SubclassDlgItem(IDC_EXIT_HIDE_TRAY, this);
 		m_exitButton.SubclassDlgItem(IDOK, this);
 		m_terminateButton.SubclassDlgItem(IDC_EXIT_TERMINATE, this);
 		m_terminateButton.SetVisualStyle(CModernButton::STYLE_DANGER);
 		LayoutDialog();
-		SetDefID(IDCANCEL);
-		GetDlgItem(IDCANCEL)->SetFocus();
+		SetDefID(IDC_EXIT_HIDE_TRAY);
+		GetDlgItem(IDC_EXIT_HIDE_TRAY)->SetFocus();
 		return FALSE;
 	}
 	void OnOK() override { EndDialog(IDOK); }
 	void OnCancel() override { EndDialog(IDCANCEL); }
 	BOOL OnCommand(WPARAM wParam, LPARAM lParam) override
 	{
-		if (LOWORD(wParam) == IDC_EXIT_TERMINATE && HIWORD(wParam) == BN_CLICKED)
+		if ((LOWORD(wParam) == IDC_EXIT_TERMINATE || LOWORD(wParam) == IDC_EXIT_HIDE_TRAY) &&
+			HIWORD(wParam) == BN_CLICKED)
 		{
-			EndDialog(IDC_EXIT_TERMINATE);
+			EndDialog(LOWORD(wParam));
 			return TRUE;
 		}
 		return CModernDialog::OnCommand(wParam, lParam);
@@ -88,12 +91,40 @@ private:
 			SystemParametersInfo(SPI_GETWORKAREA, 0, &monitor.rcWork, 0);
 		CRect work(monitor.rcWork), frame(0, 0, 0, 0);
 		AdjustWindowRectEx(&frame, GetStyle(), FALSE, GetExStyle());
-		const int width = min(scale(560), work.Width() - scale(32) - frame.Width());
 		const int margin = scale(12), gap = scale(10), buttonGap = scale(8);
-		const int contentWidth = width - 2 * margin, buttonHeight = scale(30);
-
+		const int buttonHeight = scale(30);
 		CClientDC dc(this);
 		CFont* oldFont = dc.SelectObject(&m_uiFont);
+		CModernButton* buttons[] = {&m_hideButton, &m_returnButton, &m_exitButton, &m_terminateButton};
+		const int buttonCount = _countof(buttons);
+		int buttonWidths[buttonCount], totalButtonWidth = (buttonCount - 1) * buttonGap;
+		for (int i = 0; i < buttonCount; ++i)
+		{
+			CString label;
+			buttons[i]->GetWindowText(label);
+			buttonWidths[i] = max(scale(72), dc.GetTextExtent(label).cx + scale(24));
+			// Reserve space for cleanup captions so controls stay in place.
+			if (i == 1) buttonWidths[i] = max(buttonWidths[i],
+				dc.GetTextExtent(Localization::Get(_T("exit.stop_cleanup"))).cx + scale(24));
+			if (i == 3) buttonWidths[i] = max(buttonWidths[i],
+				dc.GetTextExtent(Localization::Get(_T("exit.continue"))).cx + scale(24));
+			totalButtonWidth += buttonWidths[i];
+		}
+		const int width = min(max(scale(560), totalButtonWidth + 2 * margin),
+			work.Width() - scale(32) - frame.Width());
+		const int contentWidth = width - 2 * margin;
+		// Wrap buttons on narrow screens rather than placing them off-window.
+		int buttonRows[buttonCount] = {}, buttonOffsets[buttonCount] = {}, rowWidths[buttonCount] = {};
+		int row = 0;
+		for (int i = 0; i < buttonCount; ++i)
+		{
+			buttonWidths[i] = min(buttonWidths[i], contentWidth);
+			if (rowWidths[row] && rowWidths[row] + buttonGap + buttonWidths[i] > contentWidth) ++row;
+			buttonRows[i] = row;
+			buttonOffsets[i] = rowWidths[row] ? rowWidths[row] + buttonGap : 0;
+			rowWidths[row] = buttonOffsets[i] + buttonWidths[i];
+		}
+		const int buttonsHeight = (row + 1) * buttonHeight + row * buttonGap;
 		CString warning;
 		GetDlgItemText(IDC_EXIT_WARNING, warning);
 		CRect warningRect(0, 0, contentWidth, 0);
@@ -117,28 +148,12 @@ private:
 		int listHeight = rows * metrics.tmHeight + scale(8)
 			+ (horizontalScroll ? GetSystemMetrics(SM_CYHSCROLL) : 0);
 		listHeight = min(listHeight, work.Height() - scale(32) - frame.Height()
-			- 2 * margin - warningHeight - 2 * gap - buttonHeight);
-
-		CModernButton* buttons[] = {&m_returnButton, &m_exitButton, &m_terminateButton};
-		const int buttonCount = 3;
-		int buttonWidths[3], totalButtonWidth = (buttonCount - 1) * buttonGap;
-		for (int i = 0; i < buttonCount; ++i)
-		{
-			CString label;
-			buttons[i]->GetWindowText(label);
-			buttonWidths[i] = max(scale(72), dc.GetTextExtent(label).cx + scale(24));
-			// Reserve space for later captions now; controls stay in place.
-			if (i == 0) buttonWidths[i] = max(buttonWidths[i],
-				dc.GetTextExtent(Localization::Get(_T("exit.stop_cleanup"))).cx + scale(24));
-			if (i == 2) buttonWidths[i] = max(buttonWidths[i],
-				dc.GetTextExtent(Localization::Get(_T("exit.continue"))).cx + scale(24));
-			totalButtonWidth += buttonWidths[i];
-		}
+			- 2 * margin - warningHeight - 2 * gap - buttonsHeight);
 		dc.SelectObject(oldFont);
 
 		const int listTop = margin + warningHeight + gap;
 		const int buttonTop = listTop + listHeight + gap;
-		const int height = buttonTop + buttonHeight + margin;
+		const int height = buttonTop + buttonsHeight + margin;
 		const int outerWidth = width + frame.Width(), outerHeight = height + frame.Height();
 		const int left = max(work.left, min(owner.CenterPoint().x - outerWidth / 2, work.right - outerWidth));
 		const int top = max(work.top, min(owner.CenterPoint().y - outerHeight / 2, work.bottom - outerHeight));
@@ -148,16 +163,16 @@ private:
 		list->MoveWindow(margin, listTop, contentWidth, listHeight);
 		list->ShowScrollBar(SB_VERT, verticalScroll || listHeight < rows * metrics.tmHeight + scale(8));
 		list->ShowScrollBar(SB_HORZ, horizontalScroll);
-		int buttonLeft = width - margin - totalButtonWidth;
 		for (int i = 0; i < buttonCount; ++i)
 		{
-			buttons[i]->MoveWindow(buttonLeft, buttonTop, buttonWidths[i], buttonHeight);
-			buttonLeft += buttonWidths[i] + buttonGap;
+			buttons[i]->MoveWindow(width - margin - rowWidths[buttonRows[i]] + buttonOffsets[i],
+				buttonTop + buttonRows[i] * (buttonHeight + buttonGap), buttonWidths[i], buttonHeight);
 		}
 	}
 
 	UINT m_count;
 	CString m_processes;
+	CModernButton m_hideButton;
 	CModernButton m_returnButton;
 	CModernButton m_exitButton;
 	CModernButton m_terminateButton;

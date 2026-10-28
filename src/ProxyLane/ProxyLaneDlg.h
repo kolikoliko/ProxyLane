@@ -1,4 +1,4 @@
-﻿// ProxyLaneDlg.h : 头文件
+// ProxyLaneDlg.h : 头文件
 //
 
 #pragma once
@@ -18,6 +18,8 @@ class CProxyLaneDlg : public CModernDialog
 // 构造
 public:
 	CProxyLaneDlg(CWnd* pParent = NULL);	// 标准构造函数
+	BOOL ShowBrowserNotification(const CString& name);
+	void HideBrowserNotification();
 
 // 对话框数据
 	enum { IDD = IDD_PROXYLANE_DIALOG };
@@ -72,6 +74,7 @@ protected:
 public:
 	afx_msg void OnDestroy();
 	afx_msg LRESULT OnPreloadApplications(WPARAM, LPARAM);
+	afx_msg LRESULT OnConfigImportRestart(WPARAM, LPARAM);
 	afx_msg LRESULT OnShellIconNotify( WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnTaskbarRestartNotify( WPARAM wParam, LPARAM lParam);
 	afx_msg LRESULT OnAutomationStart(WPARAM wParam, LPARAM lParam);
@@ -108,13 +111,3 @@ ShellNotifyIcon_Modify(
 	HICON hIcon,
 	PCTSTR szTip,
 	UINT nFlags);
-
-BOOL
-ShellNotifyIcon_AddInfo(
-	HWND hWnd,
-	UINT nID,
-	UINT nCallbackMessage,
-	HICON hIcon,
-	PCTSTR szInfo,
-	UINT nFlags = NIF_MESSAGE|NIF_INFO|NIF_ICON);
-	

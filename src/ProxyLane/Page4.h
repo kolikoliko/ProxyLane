@@ -22,6 +22,7 @@ public:
     enum { IDD = IDD_Page4 };
     void UpdateMonitorStatus(bool offerRecordingDirectory = false);
     bool IsMonitoring() const { return m_recording; }
+    bool IsBusyForConfigImport() const { return m_recording || m_job || m_stopJob || m_reconnectPrepared; }
     void SetQuicUdpWarningProvider(std::function<CString()> provider) { m_quicUdpWarning = provider; }
 protected:
     std::function<CString()> m_quicUdpWarning;

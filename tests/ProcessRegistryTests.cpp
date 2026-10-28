@@ -71,6 +71,7 @@ static bool SnapshotDetailsTests()
 	child.processId = reinterpret_cast<HANDLE>(42);
 	child.parentProcessId = reinterpret_cast<HANDLE>(41);
 	child.createTime.QuadPart = 200;
+	child.sessionId = 7;
 	CopyMemory(buffer.name, L"git.exeX", sizeof(buffer.name)); // No terminator.
 	child.imageBuffer = buffer.name;
 	child.imageLength = child.imageMaximumLength = 7 * sizeof(WCHAR);
@@ -79,7 +80,7 @@ static bool SnapshotDetailsTests()
 	if (!ReadSnapshot(bytes, sizeof(buffer), snapshot) || snapshot.processes.size() != 2) return false;
 	const Process& process = snapshot.processes[1];
 	if (snapshot.processes[0].pid != 41 || process.pid != 42 || process.parentPid != 41 ||
-		process.creationTime != 200 || process.name != L"git.exe") return false;
+		process.creationTime != 200 || process.name != L"git.exe" || process.sessionId != 7) return false;
 	buffer.name[0] = L'X';
 	if (process.name != L"git.exe") return false; // Own the name after the query buffer is gone.
 	const auto invalid = [&]() {

@@ -256,6 +256,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)..\scripts\bu
     <ClCompile Include="ModernUI.cpp" />
     <ClCompile Include="Page1.cpp" />
     <ClCompile Include="ProfileSharing.cpp" />
+    <ClCompile Include="ConfigImport.cpp" />
     <ClCompile Include="Page2.cpp" />
     <ClCompile Include="Page3.cpp" />
     <ClCompile Include="Page4.cpp" />
@@ -296,6 +297,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)..\scripts\bu
     <ClInclude Include="ModernUI.h" />
     <ClInclude Include="Page1.h" />
     <ClInclude Include="ProfileShareCodec.h" />
+    <ClInclude Include="ConfigImport.h" />
     <ClInclude Include="Page2.h" />
     <ClInclude Include="Page3.h" />
     <ClInclude Include="MitmSettings.h" />
@@ -324,6 +326,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$(SolutionDir)..\scripts\bu
     <ClInclude Include="RecentApplications.h" />
     <ClInclude Include="ProcessActions.h" />
     <ClInclude Include="ProcessImagePath.h" />
+    <ClInclude Include="BrowserLaunchWatch.h" />
+    <ClInclude Include="ProcessCommandLine.h" />
+    <ClInclude Include="BrowserReuseDialog.h" />
     <ClInclude Include="ScopedProcessSuspension.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="TrafficRateSampler.h" />

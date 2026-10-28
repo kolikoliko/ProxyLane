@@ -45,6 +45,7 @@
     <ClCompile Include="TrafficStatisticsTests.cpp" />
     <ClCompile Include="ProcessActionsTests.cpp" />
     <ClCompile Include="ProcessRegistryTests.cpp" />
+    <ClCompile Include="BrowserLaunchWatchTests.cpp" />
     <ClCompile Include="UdpBlockLogLimiterTests.cpp" />
     <ClCompile Include="UdpBlockLogProbe.cpp" />
     <ClCompile Include="ExitProcessCleanupTests.cpp" />

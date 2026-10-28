@@ -5,6 +5,7 @@
 #include "ListCtrlEx.h"
 #include "ModernUI.h"
 #include "RecentApplications.h"
+#include "BrowserLaunchWatch.h"
 #include <map>
 #include <set>
 #include <vector>
@@ -102,6 +103,7 @@ class CPage3 : public CModernDialog
 #define TIMER_PSLIST 0x100
 #define TIMER_LAUNCHED_PROCESS 0x101
 #define TIMER_PROCESS_REGISTRY 0x102
+#define TIMER_BROWSER_LAUNCH 0x103
 
 public:
 	CPage3(CWnd* pParent = NULL);   // 标准构造函数
@@ -150,6 +152,16 @@ private:
 	ULONGLONG m_launchedProcessTime;
 	DWORD m_launchSelectionTick;
 	IProxyProcessRegistry* m_processRegistry;
+	std::vector<BrowserLaunchWatch::Observation> m_browserLaunches;
+	std::vector<BrowserLaunchWatch::Observation> m_browserNotifications;
+	BOOL m_browserNotificationActive = FALSE;
+	BOOL m_showingBrowserWarning = FALSE;
+	BOOL IsBrowserCandidateHooked(const BrowserLaunchWatch::Identity& identity) const;
+	BrowserLaunchWatch::Observation CaptureBrowserCandidates(LPCTSTR path);
+	void WatchBrowserLaunch(BrowserLaunchWatch::Observation observation, DWORD pid, ULONGLONG time, DWORD started);
+	void CheckBrowserLaunches();
+	void ApplyBrowserProcessAction(const CString& name,
+		const std::vector<BrowserLaunchWatch::Identity>& targets, BOOL terminate);
 
 	static int CALLBACK CompareProcessItems(LPARAM leftParam, LPARAM rightParam, LPARAM sortParam);
 	void BuildProcessTree();
@@ -183,6 +195,10 @@ public:
 	int UpdatePslist(BOOL bRefresh);
 	BOOL ProxyProcess(DWORD dwPid);
 	BOOL GetRunningHookedProcesses(std::vector<_myPROCESSINFO>& processes);
+	BOOL HasBrowserNotification() const { return m_browserNotificationActive; }
+	void OpenBrowserNotification();
+	void DismissBrowserNotification();
+	void ClearBrowserNotifications();
 
 	void OnDropAppFile(TCHAR *pFileName);
 	AppLaunchResult LaunchAndProxyApp(

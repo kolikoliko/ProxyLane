@@ -65,6 +65,23 @@ protected:
 	}
 	BOOL OnCommand(WPARAM wParam, LPARAM lParam) override
 	{
+		if (LOWORD(wParam) == IDC_EXIT_HIDE_TRAY && HIWORD(wParam) == BN_CLICKED)
+		{
+			// Stop automatic exit before dismissing the confirmation. If cleanup
+			// is active, cancel it asynchronously and let its worker finish first.
+			m_hideRequested = true;
+			KillTimer(2);
+			m_discardRefresh = true;
+			m_emptySnapshot = false;
+			if (!m_worker) EndDialog(IDC_EXIT_HIDE_TRAY);
+			else
+			{
+				SetEvent(m_cancel);
+				GetDlgItem(IDC_EXIT_HIDE_TRAY)->EnableWindow(FALSE);
+				GetDlgItem(IDCANCEL)->EnableWindow(FALSE);
+			}
+			return TRUE;
+		}
 		if (LOWORD(wParam) == IDC_EXIT_TERMINATE && HIWORD(wParam) == BN_CLICKED)
 		{
 			if (!m_worker) StartCleanup();
@@ -106,6 +123,7 @@ protected:
 private:
 	void RefreshProcesses()
 	{
+		if (m_hideRequested) return;
 		// Checking registered processes stays off the UI thread. At most one
 		// refresh runs at a time; read its snapshot only after the thread exits.
 		if (m_refreshWorker)
@@ -203,6 +221,11 @@ private:
 			m_progress.SendMessage(PBM_SETMARQUEE, FALSE, 0);
 			m_progress.ShowWindow(SW_HIDE);
 		}
+		if (m_hideRequested)
+		{
+			EndDialog(IDC_EXIT_HIDE_TRAY);
+			return;
+		}
 		if (result.status == ExitProcessCleanup::TimedOut)
 		{
 			m_timedOut = true;
@@ -212,8 +235,8 @@ private:
 			GetDlgItem(IDOK)->EnableWindow(TRUE);
 			GetDlgItem(IDCANCEL)->EnableWindow(TRUE);
 			GetDlgItem(IDC_EXIT_TERMINATE)->EnableWindow(TRUE);
-			SetDefID(IDCANCEL);
-			GetDlgItem(IDCANCEL)->SetFocus();
+			SetDefID(IDC_EXIT_HIDE_TRAY);
+			GetDlgItem(IDC_EXIT_HIDE_TRAY)->SetFocus();
 			return;
 		}
 		EndDialog(result.status == ExitProcessCleanup::Completed ? IDOK :
@@ -244,6 +267,7 @@ private:
 	bool m_discardRefresh = false;
 	bool m_emptySnapshot = false;
 	bool m_timedOut = false;
+	bool m_hideRequested = false;
 	CWinThread* m_worker = NULL;
 	HANDLE m_cancel = NULL;
 	DWORD m_started = 0;

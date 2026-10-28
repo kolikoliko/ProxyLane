@@ -19,6 +19,7 @@ int DeferredMitigationPolicyTestsMain();
 int AppContainerPipeAccessTestsMain();
 int ProcessActionsTestsMain();
 int ProcessRegistryTestsMain();
+int BrowserLaunchWatchTestsMain();
 int UdpBlockLogLimiterTestsMain();
 int UdpBlockLogProbe(const char* output);
 int ExitProcessCleanupTestsMain();
@@ -71,6 +72,7 @@ int main(int argc, char** argv)
 		return 1;
 	if (ProcessRegistryTestsMain() != 0)
 		return 1;
+	if (BrowserLaunchWatchTestsMain() != 0) return 1;
 	if (UdpBlockLogLimiterTestsMain() != 0)
 		return 1;
 	if (ExitProcessCleanupTestsMain() != 0)

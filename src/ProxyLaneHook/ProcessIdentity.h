@@ -35,14 +35,18 @@ namespace ProxyProcessIdentity
 		LONG basePriority;
 		HANDLE processId;
 		HANDLE parentProcessId;
+		ULONG handleCount;
+		ULONG sessionId;
 	};
 	static_assert(FIELD_OFFSET(SystemProcessPrefix, createTime) == 32, "Creation time offset");
 #ifdef _WIN64
 	static_assert(FIELD_OFFSET(SystemProcessPrefix, processId) == 80, "64-bit PID offset");
 	static_assert(FIELD_OFFSET(SystemProcessPrefix, parentProcessId) == 88, "64-bit parent PID offset");
+	static_assert(FIELD_OFFSET(SystemProcessPrefix, sessionId) == 100, "64-bit session offset");
 #else
 	static_assert(FIELD_OFFSET(SystemProcessPrefix, processId) == 68, "32-bit PID offset");
 	static_assert(FIELD_OFFSET(SystemProcessPrefix, parentProcessId) == 72, "32-bit parent PID offset");
+	static_assert(FIELD_OFFSET(SystemProcessPrefix, sessionId) == 80, "32-bit session offset");
 #endif
 
 	struct Process
@@ -50,6 +54,7 @@ namespace ProxyProcessIdentity
 		DWORD pid, parentPid;
 		ULONGLONG creationTime;
 		std::wstring name;
+		DWORD sessionId;
 	};
 
 	struct Snapshot
@@ -89,7 +94,7 @@ namespace ProxyProcessIdentity
 			// A present PID with an unavailable time remains unknown, not gone.
 			const ULONGLONG time = entry.createTime.QuadPart > 0 ? entry.createTime.QuadPart : 0;
 			if (!times.insert(std::make_pair(static_cast<DWORD>(pid), time)).second) return FALSE;
-			Process process = { static_cast<DWORD>(pid), static_cast<DWORD>(parentPid), time, L"" };
+			Process process = { static_cast<DWORD>(pid), static_cast<DWORD>(parentPid), time, L"", entry.sessionId };
 			if (entry.imageLength % sizeof(WCHAR) || entry.imageLength > entry.imageMaximumLength)
 				return FALSE;
 			if (entry.imageLength)

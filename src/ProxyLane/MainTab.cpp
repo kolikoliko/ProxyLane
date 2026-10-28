@@ -395,6 +395,12 @@ void CMainTab::ShowTransientStatus(LPCTSTR text, CStatusLabel::Tone tone)
 	SetTimer(kTransientStatusTimer, 3200, NULL);
 }
 
+void CMainTab::HideTransientStatus()
+{
+	KillTimer(kTransientStatusTimer);
+	if (m_transientStatus.GetSafeHwnd()) m_transientStatus.ShowWindow(SW_HIDE);
+}
+
 void CMainTab::SetRunningProfile(LPCTSTR profileName, BOOL running)
 {
 	CString name(profileName ? profileName : _T(""));
@@ -457,8 +463,7 @@ void CMainTab::OnTimer(UINT_PTR eventId)
 	}
 	if (eventId == kTransientStatusTimer)
 	{
-		KillTimer(kTransientStatusTimer);
-		m_transientStatus.ShowWindow(SW_HIDE);
+		HideTransientStatus();
 		return;
 	}
 

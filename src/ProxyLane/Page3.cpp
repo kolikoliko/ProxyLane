@@ -1,4 +1,4 @@
-﻿// Page3.cpp : 实现文件
+// Page3.cpp : 实现文件
 //
 
 #include "stdafx.h"
@@ -14,6 +14,9 @@
 #include "ApplicationPicker.h"
 #include "ProcessActions.h"
 #include "ProcessImagePath.h"
+#include "ProcessCommandLine.h"
+#include "BrowserReuseDialog.h"
+#include "ProxyLaneDlg.h"
 #include "../ProxyLaneHook/ProcessCreationRecording.h"
 #include "../ProxyLaneHook/ProcessCreationSnapshot.h"
 #include "ScopedProcessSuspension.h"
@@ -572,7 +575,7 @@ BOOL InjectDll(HANDLE hProc, DWORD dwPid, DWORD dwTid, LPCSTR lpszPipeName)
 #endif
 }
 
-BOOL HookProcess(DWORD pid, LPCSTR pipeName)
+BOOL HookProcess(DWORD pid, LPCSTR pipeName, ULONGLONG expectedCreationTime = 0)
 {
 	BOOL bOK = FALSE;
 	HANDLE hRemoteProcess = NULL;
@@ -588,6 +591,14 @@ BOOL HookProcess(DWORD pid, LPCSTR pipeName)
 
 	do 
 	{
+		// Browser warning actions refer to the displayed lifetime, never a new
+		// process that has since acquired its PID. Hold this handle through injection.
+		if (expectedCreationTime && (ProcessActions::CreationTime(hRemoteProcess) != expectedCreationTime ||
+			WaitForSingleObject(hRemoteProcess, 0) != WAIT_TIMEOUT))
+		{
+			SetLastError(ERROR_NOT_FOUND);
+			break;
+		}
 		if (!InjectDll(hRemoteProcess, pid, 0, pipeName))
 			break;
 
@@ -1309,6 +1320,7 @@ void CPage3::LayoutProcessPage()
 
 void CPage3::OnProcessSelectionChanged(NMHDR*, LRESULT* result)
 {
+	if (m_ListCtrl.GetSelectedCount() > 0 && !m_btnWindowFinder.IsTracking()) RestoreProcessPageSubtitle();
 	if (m_btnTerminate.GetSafeHwnd())
 		m_btnTerminate.EnableWindow(!m_terminating && m_ListCtrl.GetSelectedCount() > 0);
 	*result = 0;
@@ -1520,6 +1532,363 @@ BOOL CPage3::SelectProcessByPid(DWORD processId)
 	if (processId)
 		processIds.push_back(processId);
 	return SelectProcessesByPid(processIds);
+}
+
+BOOL CPage3::IsBrowserCandidateHooked(const BrowserLaunchWatch::Identity& identity) const
+{
+	HookProcessIdentityInfo record = {};
+	return m_processRegistry && m_processRegistry->Get(identity.pid, identity.time, &record) &&
+		record.hookState == PROCESS_HOOK_STATE_SUCCEEDED;
+}
+
+static std::vector<BrowserLaunchWatch::Node> ReadBrowserNodes(
+	const ProxyProcessIdentity::Snapshot& snapshot, const std::wstring& path, DWORD sessionId,
+	unsigned* unreadable = NULL)
+{
+	std::vector<BrowserLaunchWatch::Node> nodes;
+	if (unreadable) *unreadable = 0;
+	if (!snapshot.complete) return nodes;
+	const std::wstring name = path.substr(path.find_last_of(L"\\/") + 1);
+	const BOOL modern = IsVistaOrLater();
+	ProcessImagePath::Resolver resolver;
+	if (modern) resolver.Refresh();
+	for (const auto& process : snapshot.processes)
+	{
+		if (!process.creationTime || process.sessionId != sessionId || _wcsicmp(process.name.c_str(), name.c_str())) continue;
+		std::wstring actualPath;
+		if (modern)
+		{
+			if (!ProcessImagePath::Query(process.pid, actualPath))
+			{
+				if (unreadable) ++*unreadable;
+				continue;
+			}
+			actualPath = resolver.Convert(actualPath);
+		}
+		else
+		{
+			ProcessCommandLine::Handle handle(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, process.pid));
+			TCHAR buffer[MAX_PATH] = {};
+			if (!handle.value || !ProcessCommandLine::SameLifetime(handle.value, process.creationTime) ||
+				!GetProcessFullPath(handle.value, buffer, _countof(buffer)))
+			{
+				if (unreadable) ++*unreadable;
+				continue;
+			}
+			actualPath = buffer;
+		}
+		if (_wcsicmp(actualPath.c_str(), path.c_str())) continue;
+		std::wstring commandLine;
+		const auto role = ProcessCommandLine::Query(process.pid, process.creationTime, commandLine) ?
+			BrowserLaunchWatch::Classify(commandLine) : BrowserLaunchWatch::Unknown;
+		nodes.push_back({ {process.pid, process.creationTime}, process.parentPid, process.sessionId, actualPath, role });
+	}
+	// Path queries use a PID. Discard exited/reused identities after enrichment.
+	ProxyProcessIdentity::Snapshot after;
+	ProxyProcessIdentity::QuerySnapshot(after);
+	nodes.erase(std::remove_if(nodes.begin(), nodes.end(), [&](const BrowserLaunchWatch::Node& node) {
+		return !BrowserLaunchWatch::Matches(after, node.identity);
+	}), nodes.end());
+	return nodes;
+}
+
+BrowserLaunchWatch::Observation CPage3::CaptureBrowserCandidates(LPCTSTR path)
+{
+	BrowserLaunchWatch::Observation observation;
+	if (!BrowserLaunchWatch::Supported(path) || !m_processRegistry ||
+		theApp.GetAutomationOptions().enabled || !g_MainTab || !g_MainTab->IsProxyRunning()) return observation;
+	TCHAR fullPath[MAX_PATH];
+	const DWORD length = GetFullPathName(path, _countof(fullPath), fullPath, NULL);
+	if (!length || length >= _countof(fullPath)) return observation;
+	ProxyProcessIdentity::Snapshot snapshot;
+	if (!ProxyProcessIdentity::QuerySnapshot(snapshot))
+	{
+		g_MainTab->AddLogText(0, Localization::Get(_T("browser_reuse.log_scan_failed")));
+		return observation;
+	}
+	bool foundSession = false;
+	for (const auto& process : snapshot.processes)
+	{
+		if (process.pid != GetCurrentProcessId()) continue;
+		observation.sessionId = process.sessionId;
+		foundSession = true;
+		break;
+	}
+	if (!foundSession) return observation;
+	observation.path = fullPath;
+	// Keep already-hooked roots too: their existing/restarted network service may not be hooked.
+	unsigned unreadable = 0;
+	for (const auto& instance : BrowserLaunchWatch::Instances(ReadBrowserNodes(snapshot, observation.path, observation.sessionId, &unreadable)))
+		observation.candidates.push_back(instance.main.identity);
+	g_MainTab->AddLogText(0, Localization::Format(_T("browser_reuse.log_candidates"),
+		fullPath, static_cast<unsigned>(observation.candidates.size()), unreadable));
+	return observation;
+}
+
+void CPage3::WatchBrowserLaunch(BrowserLaunchWatch::Observation observation,
+	DWORD pid, ULONGLONG time, DWORD started)
+{
+	if (!pid || !time || observation.candidates.empty()) return;
+	observation.launched = { pid, time };
+	observation.started = started;
+	m_browserLaunches.push_back(observation);
+	SetTimer(TIMER_BROWSER_LAUNCH, 250, NULL);
+}
+
+void CPage3::CheckBrowserLaunches()
+{
+	if (m_showingBrowserWarning) return;
+	if (!g_MainTab || !g_MainTab->IsProxyRunning())
+	{
+		ClearBrowserNotifications();
+		KillTimer(TIMER_BROWSER_LAUNCH);
+		return;
+	}
+	if (!m_browserLaunches.empty())
+	{
+		ProxyProcessIdentity::Snapshot snapshot;
+		ProxyProcessIdentity::QuerySnapshot(snapshot);
+		const auto hooked = [this](const BrowserLaunchWatch::Identity& identity) { return IsBrowserCandidateHooked(identity); };
+		for (size_t index = 0; index < m_browserLaunches.size();)
+		{
+			std::vector<BrowserLaunchWatch::Identity> candidates;
+			const auto result = BrowserLaunchWatch::Evaluate(m_browserLaunches[index], GetTickCount(), snapshot, candidates);
+			if (result == BrowserLaunchWatch::Pending) { ++index; continue; }
+			auto observation = m_browserLaunches[index];
+			m_browserLaunches.erase(m_browserLaunches.begin() + index);
+			if (result != BrowserLaunchWatch::Suggest)
+			{
+				g_MainTab->AddLogText(0, Localization::Format(_T("browser_reuse.log_discarded"), observation.path.c_str()));
+				continue;
+			}
+			const auto instances = BrowserLaunchWatch::IncompleteInstances(
+				ReadBrowserNodes(snapshot, observation.path, observation.sessionId), candidates, hooked);
+			if (instances.empty())
+			{
+				g_MainTab->AddLogText(0, Localization::Format(_T("browser_reuse.log_resolved"), observation.path.c_str()));
+				continue;
+			}
+			g_MainTab->AddLogText(0, Localization::Format(_T("browser_reuse.log_risk"), observation.path.c_str()));
+			observation.candidates.clear();
+			for (const auto& instance : instances) observation.candidates.push_back(instance.main.identity);
+			// Merge repeated launches into the same still-visible notification only
+			// when the browser lifetime is shared. A restarted browser is a new event.
+			bool merged = false;
+			for (auto& notice : m_browserNotifications)
+			{
+				if (notice.sessionId != observation.sessionId || _wcsicmp(notice.path.c_str(), observation.path.c_str())) continue;
+				bool overlap = false;
+				for (const auto& a : notice.candidates)
+					for (const auto& b : observation.candidates) overlap |= a.pid == b.pid && a.time == b.time;
+				if (!overlap) continue;
+				for (const auto& identity : observation.candidates)
+				{
+					const auto found = std::find_if(notice.candidates.begin(), notice.candidates.end(),
+						[&](const BrowserLaunchWatch::Identity& old) { return old.pid == identity.pid && old.time == identity.time; });
+					if (found == notice.candidates.end()) notice.candidates.push_back(identity);
+				}
+				merged = true;
+				break;
+			}
+			if (!merged) m_browserNotifications.push_back(observation);
+		}
+	}
+	if (!m_browserNotificationActive && !m_browserNotifications.empty())
+	{
+		const auto& notice = m_browserNotifications.front();
+		const CString name(notice.path.substr(notice.path.find_last_of(L"\\/") + 1).c_str());
+		m_browserNotificationActive = TRUE;
+		CProxyLaneDlg* owner = static_cast<CProxyLaneDlg*>(GetTopLevelParent());
+		if (!owner || !owner->ShowBrowserNotification(name)) DismissBrowserNotification();
+	}
+	// Waiting for a notification click/timeout does not poll system processes.
+	if (m_browserLaunches.empty() && (m_browserNotificationActive || m_browserNotifications.empty()))
+		KillTimer(TIMER_BROWSER_LAUNCH);
+}
+
+void CPage3::DismissBrowserNotification()
+{
+	if (!m_browserNotificationActive) return;
+	m_browserNotificationActive = FALSE;
+	if (!m_browserNotifications.empty()) m_browserNotifications.erase(m_browserNotifications.begin());
+	if (!m_browserNotifications.empty()) SetTimer(TIMER_BROWSER_LAUNCH, 250, NULL);
+}
+
+void CPage3::ClearBrowserNotifications()
+{
+	const BOOL active = m_browserNotificationActive;
+	m_browserNotificationActive = FALSE;
+	m_browserNotifications.clear();
+	m_browserLaunches.clear();
+	if (active)
+	{
+		CProxyLaneDlg* owner = static_cast<CProxyLaneDlg*>(GetTopLevelParent());
+		if (owner) owner->HideBrowserNotification();
+	}
+}
+
+void CPage3::OpenBrowserNotification()
+{
+	if (!m_browserNotificationActive || m_browserNotifications.empty()) return;
+	const auto observation = m_browserNotifications.front();
+	DismissBrowserNotification();
+	static_cast<CProxyLaneDlg*>(GetTopLevelParent())->HideBrowserNotification();
+	CWnd* owner = GetTopLevelParent();
+	if (!owner || !owner->IsWindowEnabled() || m_showingBrowserWarning || m_terminating ||
+		m_btnWindowFinder.IsTracking() || !g_MainTab || !g_MainTab->IsProxyRunning()) return;
+	ProxyProcessIdentity::Snapshot snapshot;
+	ProxyProcessIdentity::QuerySnapshot(snapshot);
+	if (!snapshot.complete)
+	{
+		MessageBox(Localization::Get(_T("browser_reuse.check_failed")),
+			Localization::Get(_T("browser_reuse.title")), MB_OK | MB_ICONINFORMATION);
+		return;
+	}
+	const auto hooked = [this](const BrowserLaunchWatch::Identity& identity) { return IsBrowserCandidateHooked(identity); };
+	const auto candidates = observation.candidates;
+	const auto nodes = ReadBrowserNodes(snapshot, observation.path, observation.sessionId);
+	const auto instances = BrowserLaunchWatch::IncompleteInstances(nodes, candidates, hooked);
+	if (instances.empty())
+	{
+		MessageBox(Localization::Get(_T("browser_reuse.resolved")),
+			Localization::Get(_T("browser_reuse.title")), MB_OK | MB_ICONINFORMATION);
+		return;
+	}
+	CString details;
+	const CString name(observation.path.substr(observation.path.find_last_of(L"\\/") + 1).c_str());
+	const auto append = [&](const BrowserLaunchWatch::Identity& identity, LPCTSTR role, bool child) {
+		if (child) details += _T("   ");
+		details += Localization::Format(_T("browser_reuse.process"), static_cast<LPCTSTR>(name),
+			identity.pid, static_cast<LPCTSTR>(Localization::Get(role)), static_cast<LPCTSTR>(Localization::Get(hooked(identity) ?
+				_T("browser_reuse.hooked") : _T("browser_reuse.unhooked"))));
+	};
+	for (const auto& instance : instances)
+	{
+		append(instance.main.identity, instance.main.role == BrowserLaunchWatch::Main ?
+			_T("browser_reuse.main") : _T("browser_reuse.unknown_root"), false);
+		for (const auto& network : instance.networks) append(network, _T("browser_reuse.network"), true);
+		if (instance.networks.empty()) details += Localization::Get(_T("browser_reuse.unknown_network"));
+		details += _T("\r\n");
+	}
+	m_showingBrowserWarning = TRUE;
+	CBrowserReuseDialog dialog(name, details, owner);
+	const INT_PTR choice = dialog.DoModal();
+	if (choice == IDC_BROWSER_REUSE_TERMINATE || choice == IDC_BROWSER_REUSE_PROXY)
+	{
+		// Freeze the scope to the main/network identities actually shown. Do
+		// not add new children or another browser instance after the user clicks.
+		std::vector<BrowserLaunchWatch::Identity> targets;
+		for (const auto& instance : instances)
+		{
+			targets.push_back(instance.main.identity);
+			targets.insert(targets.end(), instance.networks.begin(), instance.networks.end());
+		}
+		g_MainTab->HideTransientStatus();
+		ApplyBrowserProcessAction(name, targets, choice == IDC_BROWSER_REUSE_TERMINATE);
+	}
+	if (choice == IDOK)
+	{
+		g_MainTab->HideTransientStatus();
+		CancelLaunchSelection();
+		g_MainTab->SelectPage(CMainTab::PAGE_APPLICATIONS);
+		UpdatePslist(FALSE);
+		ProxyProcessIdentity::Snapshot current;
+		ProxyProcessIdentity::QuerySnapshot(current);
+		std::vector<DWORD> selected;
+		const auto remaining = BrowserLaunchWatch::IncompleteInstances(
+			ReadBrowserNodes(current, observation.path, observation.sessionId), candidates, hooked);
+		for (const auto& instance : remaining)
+		{
+			std::vector<BrowserLaunchWatch::Identity> related = instance.networks;
+			related.push_back(instance.main.identity);
+			for (const auto& candidate : related)
+			{
+				const auto row = m_processSortData.find(candidate.pid);
+				if (row != m_processSortData.end() && row->second.startTimeValue == candidate.time)
+					selected.push_back(candidate.pid);
+			}
+		}
+		m_ListCtrl.SetItemState(-1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+		SelectProcessesByPid(selected);
+		SetDlgItemText(IDC_STATIC_PAGE_SUBTITLE, Localization::Get(selected.empty() ?
+			_T("browser_reuse.gone") : _T("browser_reuse.selected")));
+	}
+	m_showingBrowserWarning = FALSE;
+}
+
+void CPage3::ApplyBrowserProcessAction(const CString& name,
+	const std::vector<BrowserLaunchWatch::Identity>& targets, BOOL terminate)
+{
+	CWnd* owner = GetTopLevelParent();
+	const CString title = Localization::Get(terminate ? _T("browser_reuse.terminate") : _T("browser_reuse.proxy"));
+	ProxyProcessIdentity::Snapshot snapshot;
+	if (!ProxyProcessIdentity::QuerySnapshot(snapshot))
+	{
+		owner->MessageBox(Localization::Get(_T("page3.read_failed")), title, MB_OK | MB_ICONWARNING);
+		return;
+	}
+	std::vector<BrowserLaunchWatch::Identity> active;
+	int skipped = 0;
+	for (const auto& target : targets)
+	{
+		if (!BrowserLaunchWatch::Matches(snapshot, target) || (!terminate && IsBrowserCandidateHooked(target)))
+			++skipped;
+		else active.push_back(target);
+	}
+	if (terminate && !active.empty())
+	{
+		CString names;
+		for (size_t i = 0; i < active.size() && i < 10; ++i)
+		{
+			CString line;
+			line.Format(_T("%s (PID %lu)\r\n"), static_cast<LPCTSTR>(name), active[i].pid);
+			names += line;
+		}
+		if (active.size() > 10) names += _T("...\r\n");
+		if (owner->MessageBox(Localization::Format(_T("page3.end_confirm"),
+			static_cast<int>(active.size()), static_cast<LPCTSTR>(names)), title,
+			MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES) return;
+	}
+	std::vector<DWORD> errors;
+	if (terminate)
+	{
+		std::vector<ProcessActions::TerminationTarget> exact;
+		for (const auto& target : active) exact.push_back({ target.pid, target.time });
+		errors = ProcessActions::TerminateExactProcesses(exact);
+	}
+	else if (!active.empty())
+	{
+		char pipe[MAX_PATH] = {};
+		IProxyReceptionCentre* prc = g_GlobalProxy ? g_GlobalProxy->GetPRCInstance() : NULL;
+		if (!g_MainTab->IsProxyRunning() || !prc || !prc->GetPRCPipeName(pipe, MAX_PATH))
+		{
+			owner->MessageBox(Localization::Get(_T("page3.start_proxy_first")), title, MB_OK | MB_ICONWARNING);
+			return;
+		}
+		for (const auto& target : active)
+		{
+			SetLastError(ERROR_SUCCESS);
+			const BOOL hooked = HookProcess(target.pid, pipe, target.time);
+			const DWORD error = GetLastError();
+			errors.push_back(hooked ? ERROR_SUCCESS : (error ? error : ERROR_GEN_FAILURE));
+		}
+	}
+	int succeeded = 0, failed = 0;
+	CString failures;
+	for (size_t i = 0; i < errors.size(); ++i)
+	{
+		if (!errors[i]) ++succeeded;
+		else if (++failed <= 10) failures += Localization::Format(_T("page3.end_error"),
+			static_cast<LPCTSTR>(name), active[i].pid, errors[i]);
+	}
+	CString summary = Localization::Format(_T("page3.result_summary"),
+		static_cast<int>(targets.size()), succeeded, failed, skipped);
+	if (skipped) summary += _T("\r\n") + Localization::Get(_T("browser_reuse.skipped"));
+	if (failed) summary += _T("\r\n\r\n") + failures;
+	summary += _T("\r\n\r\n") + Localization::Get(terminate ?
+		_T("browser_reuse.restart") : _T("browser_reuse.connections"));
+	owner->MessageBox(summary, title, MB_OK | (failed ? MB_ICONWARNING : MB_ICONINFORMATION));
+	UpdatePslist(FALSE);
 }
 
 void CPage3::CancelLaunchSelection()
@@ -2468,6 +2837,7 @@ void CPage3::OnBnClickedInjectdll()
 
 void CPage3::OnTimer(UINT_PTR nIDEvent)
 {
+	if (nIDEvent == TIMER_BROWSER_LAUNCH) { CheckBrowserLaunches(); return; }
 	// TODO: 在此添加消息处理程序代码和/或调用默认值
 	switch(nIDEvent)
 	{
@@ -2733,17 +3103,23 @@ AppLaunchResult CPage3::LaunchAndProxyApp(
 		commandLine += QuoteCommandLineArgument(extraArguments[i]);
 	}
 
+	const BrowserLaunchWatch::Observation browserObservation = CaptureBrowserCandidates(szTargetPath);
 	if (elevationMode == APP_LAUNCH_ELEVATION_FORCE_ADMIN)
 	{
 		myWow64RevertWow64FsRedirection(WowRedirOldValue);
 		DWORD launchedPid;
 		ULONGLONG launchedTime;
+		const DWORD started = GetTickCount();
 		AppLaunchResult result = LaunchElevatedAndProxy(
 			GetSafeHwnd(),
 			szTargetPath,
 			commandLine,
 			szBaseDir[0] == 0 ? NULL : szBaseDir, launchedPid, launchedTime);
-		if (result == APP_LAUNCH_SUCCESS) RefreshLaunchedProcess(launchedPid, NULL, launchedTime);
+		if (result == APP_LAUNCH_SUCCESS)
+		{
+			WatchBrowserLaunch(browserObservation, launchedPid, launchedTime, started);
+			RefreshLaunchedProcess(launchedPid, NULL, launchedTime);
+		}
 		return result;
 	}
 
@@ -2770,12 +3146,17 @@ AppLaunchResult CPage3::LaunchAndProxyApp(
 		{
 			DWORD launchedPid;
 			ULONGLONG launchedTime;
+			const DWORD started = GetTickCount();
 			AppLaunchResult result = LaunchElevatedAndProxy(
 				GetSafeHwnd(),
 				szTargetPath,
 				commandLine,
 				szBaseDir[0] == 0 ? NULL : szBaseDir, launchedPid, launchedTime);
-			if (result == APP_LAUNCH_SUCCESS) RefreshLaunchedProcess(launchedPid, NULL, launchedTime);
+			if (result == APP_LAUNCH_SUCCESS)
+			{
+				WatchBrowserLaunch(browserObservation, launchedPid, launchedTime, started);
+				RefreshLaunchedProcess(launchedPid, NULL, launchedTime);
+			}
 			return result;
 		}
 #ifndef APPMODEL_ERROR_NO_PACKAGE
@@ -2834,6 +3215,7 @@ AppLaunchResult CPage3::LaunchAndProxyApp(
 		return APP_LAUNCH_INJECTION_FAILED;
 	}
 
+	const DWORD resumedAt = GetTickCount();
 	if (ResumeThread(pi.hThread) == (DWORD)-1)
 	{
 		TerminateProcess(pi.hProcess, AUTOMATION_EXIT_CREATE_PROCESS_FAILED);
@@ -2842,6 +3224,8 @@ AppLaunchResult CPage3::LaunchAndProxyApp(
 		return APP_LAUNCH_CREATE_PROCESS_FAILED;
 	}
 
+	if (injectionSucceeded)
+		WatchBrowserLaunch(browserObservation, pi.dwProcessId, hnpi.processCreateTime, resumedAt);
 	RefreshLaunchedProcess(pi.dwProcessId, pi.hProcess);
 	CloseHandle(pi.hProcess);
 	CloseHandle(pi.hThread);

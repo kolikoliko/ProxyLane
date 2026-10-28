@@ -2,6 +2,8 @@
 #include "ProxyLane.h"
 #include "Page1.h"
 #include "MainTab.h"
+#include "Page3.h"
+#include "Page4.h"
 #include "Localization.h"
 #include "ProfileShareCodec.h"
 #include "../ProxyLaneHook/DnsRedirectPolicy.h"
@@ -118,6 +120,8 @@ void CPage1::OnProfileMenu()
     menu.AppendMenu(MF_STRING | (m_bIsTesting ? MF_GRAYED : 0), IDC_BUTTON_PASTE_PROFILE,
         Localization::Get(_T("share.paste")));
     menu.AppendMenu(MF_SEPARATOR);
+    menu.AppendMenu(MF_STRING, IDC_BUTTON_IMPORT_CONFIG, Localization::Get(_T("import.action")));
+    menu.AppendMenu(MF_SEPARATOR);
     menu.AppendMenu(MF_STRING | (m_cfgls.GetCurSel() == CB_ERR ? MF_GRAYED : 0),
         IDC_BUTTON_DELETE_PROFILE, Localization::Get(_T("profile.delete_action")));
     CRect anchor;
@@ -125,6 +129,87 @@ void CPage1::OnProfileMenu()
     const UINT selected = menu.TrackPopupMenu(TPM_RETURNCMD | TPM_RIGHTALIGN | TPM_RIGHTBUTTON,
         anchor.right, anchor.bottom, this);
     if (selected) SendMessage(WM_COMMAND, selected, 0);
+}
+
+BOOL CPage1::CanImportAllConfig()
+{
+    CString reason;
+    if (m_bIsTesting || IsProxyRunning() || !g_MainTab || g_MainTab->GetPage4()->IsBusyForConfigImport())
+        reason = Localization::Get(L"import.busy");
+    else
+    {
+        std::vector<_myPROCESSINFO> processes;
+        if (!g_MainTab->GetPage3()->GetRunningHookedProcesses(processes))
+            reason = Localization::Get(L"import.process_check_failed");
+        else if (!processes.empty())
+        {
+            reason = Localization::Get(L"import.processes_running");
+            for (size_t i = 0; i < processes.size() && i < 10; ++i)
+                reason += Localization::Format(L"import.process", processes[i].proname, processes[i].pid);
+            if (processes.size() > 10) reason += L"\r\n...";
+        }
+    }
+    if (reason.IsEmpty()) return TRUE;
+    MessageBox(reason, Localization::Get(L"import.title"), MB_OK | MB_ICONINFORMATION);
+    return FALSE;
+}
+
+namespace
+{
+class ImportConfigDialog : public CModernDialog
+{
+public:
+    ImportConfigDialog(const CString& summary, CWnd* parent) : CModernDialog(IDD_IMPORT_CONFIG, parent), m_summary(summary) {}
+protected:
+    BOOL OnInitDialog() override
+    {
+        CModernDialog::OnInitDialog();
+        SetWindowText(Localization::Get(L"import.title"));
+        SetDlgItemText(IDC_IMPORT_SUMMARY, m_summary);
+        SetDlgItemText(IDCANCEL, Localization::Get(L"apps.cancel"));
+        SetDlgItemText(IDOK, Localization::Get(L"import.confirm"));
+        m_cancel.SubclassDlgItem(IDCANCEL, this);
+        m_confirm.SubclassDlgItem(IDOK, this);
+        SetDefID(IDCANCEL); GetDlgItem(IDCANCEL)->SetFocus();
+        return FALSE;
+    }
+    void OnOK() override { EndDialog(IDOK); }
+    void OnCancel() override { EndDialog(IDCANCEL); }
+private:
+    CString m_summary;
+    CModernButton m_cancel, m_confirm;
+};
+}
+
+void CPage1::OnImportAllConfig()
+{
+    if (theApp.HasPendingConfigImport() || !CanImportAllConfig()) return;
+    CFileDialog picker(TRUE, L"ini", L"ProxyLane.ini", OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR,
+        L"INI files (*.ini)|*.ini||", this);
+    const CString title = Localization::Get(L"import.action");
+    picker.m_ofn.lpstrTitle = title;
+    if (picker.DoModal() != IDOK) return;
+    std::unique_ptr<ConfigImport::Pending> pending(new ConfigImport::Pending);
+    CString error;
+    if (!pending->Prepare(picker.GetPathName(), error))
+    {
+        MessageBox(error, Localization::Get(L"import.title"), MB_OK | MB_ICONERROR);
+        return;
+    }
+    CString backup = pending->backup.IsEmpty() ? Localization::Get(L"import.no_previous") : pending->backup;
+    CString summary = Localization::Format(L"import.summary", (LPCTSTR)pending->source, (LPCTSTR)pending->destination,
+        pending->profiles, (LPCTSTR)backup);
+    ImportConfigDialog confirm(summary, this);
+    if (confirm.DoModal() != IDOK || !CanImportAllConfig()) return;
+    if (!pending->ArmRestart(error))
+    {
+        MessageBox(Localization::Format(L"import.kept_original", (LPCTSTR)error), Localization::Get(L"import.title"), MB_OK | MB_ICONERROR);
+        return;
+    }
+    theApp.ScheduleConfigImport(std::move(pending));
+    // Import is already confirmed and no service/test/monitor/proxied process
+    // remains. Close normally without the independent exit-warning workflow.
+    GetTopLevelParent()->SendMessage(WM_CONFIG_IMPORT_RESTART);
 }
 
 void CPage1::OnCopyProfile()

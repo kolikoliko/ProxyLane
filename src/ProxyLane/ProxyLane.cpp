@@ -119,6 +119,11 @@ int CProxyLaneApp::ExitInstance()
 {
 	m_profileCommandBroker.StopServer();
 	m_profileCommandBroker.ReleaseLaunchGate();
+	if (m_configImport)
+	{
+		m_configImport->FinishAfterShutdown();
+		m_configImport.reset();
+	}
 	CWinApp::ExitInstance();
 	return m_automationExitCode;
 }

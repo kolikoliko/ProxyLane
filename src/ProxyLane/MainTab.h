@@ -37,6 +37,7 @@ public:
 	void SelectPage(int pageIndex);
 	void SetPageAttention(int pageIndex, BOOL attention);
 	void ShowTransientStatus(LPCTSTR text, CStatusLabel::Tone tone);
+	void HideTransientStatus();
 	void SetRunningProfile(LPCTSTR profileName, BOOL running);
 	BOOL IsProxyRunning() const { return m_proxyRunning; }
 	CString GetRunningProfileName() const { return m_runningProfileName; }

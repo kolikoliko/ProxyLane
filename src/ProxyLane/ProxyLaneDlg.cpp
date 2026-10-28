@@ -108,6 +108,21 @@ namespace
 		OSVERSIONINFO versionInfo = { sizeof(versionInfo) };
 		return GetVersionEx(&versionInfo) && versionInfo.dwMajorVersion >= 6;
 	}
+
+	NOTIFYICONDATA TrayIconData()
+	{
+		NOTIFYICONDATA data = {};
+		// XP's Shell32 expects the V3 structure, without Vista's hBalloonIcon.
+		data.cbSize = IsVistaOrLater() ? sizeof(data) : NOTIFYICONDATA_V3_SIZE;
+		return data;
+	}
+
+	BOOL SupportsNotificationQuietTime()
+	{
+		OSVERSIONINFO versionInfo = { sizeof(versionInfo) };
+		return GetVersionEx(&versionInfo) && (versionInfo.dwMajorVersion > 6 ||
+			(versionInfo.dwMajorVersion == 6 && versionInfo.dwMinorVersion >= 1));
+	}
 }
 
 class CAdminDropOverlay : public CWnd
@@ -422,7 +437,7 @@ ShellNotifyIcon_Add(
 	PCTSTR szTip,
 	UINT nFlags /*= NIF_MESSAGE|NIF_ICON|NIF_TIP*/)
 {
-	NOTIFYICONDATA tnid = { sizeof(tnid), 0 };
+	NOTIFYICONDATA tnid = TrayIconData();
 	tnid.hWnd = hWnd;
 	tnid.uID = nID;
 	tnid.uCallbackMessage = nCallbackMessage;
@@ -446,7 +461,7 @@ ShellNotifyIcon_Delete(
 	HWND hWnd,
 	UINT nID)
 {
-	NOTIFYICONDATA tnid = { sizeof(tnid), 0 };
+	NOTIFYICONDATA tnid = TrayIconData();
 	tnid.hWnd = hWnd;
 	tnid.uID = nID;
 	return Shell_NotifyIcon(
@@ -463,7 +478,7 @@ ShellNotifyIcon_Modify(
 	PCTSTR szTip,
 	UINT nFlags)
 {
-	NOTIFYICONDATA tnid = { sizeof(tnid), 0 };
+	NOTIFYICONDATA tnid = TrayIconData();
 	tnid.hWnd = hWnd;
 	tnid.uID = nID;
 	tnid.uCallbackMessage = nCallbackMessage;
@@ -479,34 +494,6 @@ ShellNotifyIcon_Modify(
 	}
 	return Shell_NotifyIcon(
 		NIM_MODIFY,
-		&tnid);
-}
-
-BOOL
-ShellNotifyIcon_AddInfo(
-						HWND hWnd, 
-						UINT nID, 
-						UINT nCallbackMessage, 
-						HICON hIcon, 
-						PCTSTR szInfo, 
-						UINT nFlags)
-{
-	NOTIFYICONDATA tnid = { sizeof(tnid), 0 };
-	tnid.hWnd = hWnd;
-	tnid.uID = nID;
-	tnid.uCallbackMessage = nCallbackMessage;
-	tnid.uFlags = nFlags;
-	tnid.hIcon = hIcon;
-	if(szInfo)
-	{
-		_tcsncpy(
-			tnid.szInfo,
-			szInfo,
-			_countof(tnid.szInfo)-1);
-		tnid.szInfo[_countof(tnid.szInfo)-1] = _T('\0');
-	}
-	return Shell_NotifyIcon(
-		NIM_ADD,
 		&tnid);
 }
 
@@ -541,6 +528,7 @@ BEGIN_MESSAGE_MAP(CProxyLaneDlg, CModernDialog)
 	ON_MESSAGE(WM_PRELOAD_APPLICATIONS, OnPreloadApplications)
 	ON_MESSAGE(WM_PROXY_STATUS_CHANGED, OnProxyStatusChanged)
 	ON_MESSAGE(WM_PROFILE_COMMAND_REQUEST, OnProfileCommandRequest)
+	ON_MESSAGE(WM_CONFIG_IMPORT_RESTART, OnConfigImportRestart)
 	ON_MESSAGE(WM_DEFERRED_FILE_DRAG_LEAVE, OnDeferredFileDragLeave)
 	//}}AFX_MSG_MAP
 	ON_WM_DESTROY()
@@ -663,6 +651,8 @@ BOOL CProxyLaneDlg::OnInitDialog()
 		RedrawWindow(NULL, NULL,
 			RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 		PostMessage(WM_PRELOAD_APPLICATIONS);
+		// Also acknowledge a normal GUI restart after a complete INI import.
+		theApp.SignalAutomationReady();
 	}
 
 	return TRUE;  // 除非将焦点设置到控件，否则返回 TRUE
@@ -703,6 +693,12 @@ void CProxyLaneDlg::OnCancel()
 			ShowAndActivate();
 			CExitCleanupDialog dialog(m_MainTab.GetPage3(), static_cast<UINT>(processes.size()), details, this);
 			const INT_PTR choice = dialog.DoModal();
+			if (choice == IDC_EXIT_HIDE_TRAY)
+			{
+				m_confirmingExit = FALSE;
+				ShowWindow(SW_HIDE);
+				return;
+			}
 			if (choice != IDOK)
 			{
 				if (choice != IDCANCEL)
@@ -730,6 +726,12 @@ void CProxyLaneDlg::OnCancel()
 		}
 	}
 	CModernDialog::OnCancel();
+}
+
+LRESULT CProxyLaneDlg::OnConfigImportRestart(WPARAM, LPARAM)
+{
+	if (theApp.HasPendingConfigImport()) EndDialog(IDOK);
+	return 0;
 }
 
 void CProxyLaneDlg::FailAutomation(int exitCode)
@@ -853,6 +855,7 @@ void CProxyLaneDlg::UpdateTaskbarIcon()
 
 LRESULT CProxyLaneDlg::OnProxyStatusChanged(WPARAM, LPARAM)
 {
+	if (!m_MainTab.IsProxyRunning()) m_MainTab.GetPage3()->ClearBrowserNotifications();
 	RefreshProfileCommandServer();
 	UpdateTaskbarIcon();
 	return 0;
@@ -992,6 +995,7 @@ CProxyLaneDlg::OnTaskbarRestartNotify(
 							   LPARAM lParam
 							   )
 {
+	m_MainTab.GetPage3()->ClearBrowserNotifications();
 	AddTaskbarIcons();
 	return 0;
 }
@@ -1006,6 +1010,27 @@ CProxyLaneDlg::OnShellIconNotify(
 	{
 		switch(lParam)
 		{
+		case NIN_BALLOONSHOW:
+			if (m_MainTab.GetPage3()->HasBrowserNotification())
+				m_MainTab.AddLogText(0, Localization::Get(_T("browser_reuse.log_shown")));
+			break;
+		case NIN_BALLOONUSERCLICK:
+			if (m_MainTab.GetPage3()->HasBrowserNotification() && IsWindowEnabled())
+			{
+				// Activation follows the user's click, never the detection itself.
+				ShowAndActivate();
+				m_MainTab.GetPage3()->OpenBrowserNotification();
+			}
+			else m_MainTab.GetPage3()->DismissBrowserNotification();
+			break;
+		case NIN_BALLOONHIDE:
+		case NIN_BALLOONTIMEOUT:
+			if (m_MainTab.GetPage3()->HasBrowserNotification())
+			{
+				m_MainTab.GetPage3()->DismissBrowserNotification();
+				HideBrowserNotification();
+			}
+			break;
 		case WM_LBUTTONDBLCLK:
 			ShowAndActivate();
 			break;
@@ -1018,6 +1043,39 @@ CProxyLaneDlg::OnShellIconNotify(
 	}
 
 	return 1;
+}
+
+BOOL CProxyLaneDlg::ShowBrowserNotification(const CString& name)
+{
+	NOTIFYICONDATA data = TrayIconData();
+	data.hWnd = m_hWnd;
+	data.uID = IDD;
+	data.uFlags = NIF_INFO;
+	// NIIF_RESPECT_QUIET_TIME is Windows 7+, and hidden by the XP SDK headers.
+	const DWORD respectQuietTime = 0x80;
+	data.dwInfoFlags = NIIF_WARNING;
+	if (SupportsNotificationQuietTime()) data.dwInfoFlags |= respectQuietTime;
+	data.uTimeout = 15000; // XP uses this; Vista+ uses the system accessibility setting.
+	const CString title = Localization::Get(_T("browser_reuse.title"));
+	const CString body = Localization::Format(_T("browser_reuse.notification"), (LPCTSTR)name);
+	_tcsncpy_s(data.szInfoTitle, _countof(data.szInfoTitle), title, _TRUNCATE);
+	_tcsncpy_s(data.szInfo, _countof(data.szInfo), body, _TRUNCATE);
+	// Modify the existing icon; no attention badge, menu item or taskbar flash.
+	const BOOL sent = Shell_NotifyIcon(NIM_MODIFY, &data);
+	// Shell_NotifyIcon does not promise a meaningful GetLastError value.
+	// Acceptance is distinct from the later NIN_BALLOONSHOW callback.
+	m_MainTab.AddLogText(0, Localization::Get(sent ?
+		_T("browser_reuse.log_sent") : _T("browser_reuse.log_failed")));
+	return sent;
+}
+
+void CProxyLaneDlg::HideBrowserNotification()
+{
+	NOTIFYICONDATA data = TrayIconData();
+	data.hWnd = m_hWnd;
+	data.uID = IDD;
+	data.uFlags = NIF_INFO; // Empty szInfo dismisses the outstanding balloon.
+	Shell_NotifyIcon(NIM_MODIFY, &data);
 }
 
 void CProxyLaneDlg::ShowTaskbarMenu()
