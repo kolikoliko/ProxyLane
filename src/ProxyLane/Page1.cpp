@@ -76,13 +76,8 @@ CPage1::CPage1(CWnd* pParent /*=NULL*/)
 	, m_profileDirty(FALSE)
 	, m_loadingProfile(TRUE)
 	, m_profileStore(g_ini)
-	, m_filterEditBaseHeight(0)
+	, m_activeTab(0)
 {
-	m_recentLoad = NULL;
-	m_recentConsumed = TRUE;
-	m_recentReadFailed = FALSE;
-	m_recentLaunching = FALSE;
-	m_recentLaunchTick = 0;
 	m_pTestProxy = 0;
 	m_pProxyTester = 0;
 	m_bIsTesting = FALSE;
@@ -95,8 +90,6 @@ CPage1::CPage1(CWnd* pParent /*=NULL*/)
 
 CPage1::~CPage1()
 {
-	if (m_recentLoad) m_recentLoad->Release();
-	RecentApplications::ReleaseIcons(m_recentEntries);
 	if (m_pProxyTester)
 	{
 		m_pProxyTester->Release();
@@ -145,6 +138,10 @@ void CPage1::DoDataExchange(CDataExchange* pDX)
 	DDX_Control(pDX, IDC_COMBO_CFGS, m_cfgls);
 	DDX_Control(pDX, IDC_BUTTON_SAVE_PROFILE, m_btnSaveProfile);
 	DDX_Control(pDX, IDC_BUTTON_PROFILE_MENU, m_btnProfileMenu);
+	DDX_Control(pDX, IDC_STATIC_PROXY_GROUP, m_cardProxy);
+	DDX_Control(pDX, IDC_STATIC_GROUP_OTHER, m_cardOptions);
+	DDX_Control(pDX, IDC_STATIC_CHILDFILTER_GROUP, m_cardChildFilter);
+	DDX_Control(pDX, IDC_STATIC_TARGETFILTER_GROUP, m_cardTargetFilter);
 }
 
 
@@ -189,10 +186,7 @@ BEGIN_MESSAGE_MAP(CPage1, CModernDialog)
 	ON_BN_CLICKED(IDC_RADIO_TAB_BASIC, &CPage1::OnBnClickedTabBasic)
 	ON_BN_CLICKED(IDC_RADIO_TAB_CHILD, &CPage1::OnBnClickedTabChild)
 	ON_BN_CLICKED(IDC_RADIO_TAB_TARGET, &CPage1::OnBnClickedTabTarget)
-	ON_BN_CLICKED(IDC_BTN_WORKFLOW_NEXT, &CPage1::OnBnClickedWorkflowNext)
 	ON_MESSAGE(WM_RECENT_APPLICATIONS_CHANGED, &CPage1::OnRecentApplicationsChanged)
-	ON_NOTIFY(NM_DBLCLK, IDC_RECENT_LIST, &CPage1::OnRecentApplicationClick)
-	ON_NOTIFY(NM_RETURN, IDC_RECENT_LIST, &CPage1::OnRecentApplicationClick)
 	ON_WM_TIMER()
 END_MESSAGE_MAP()
 
@@ -205,12 +199,7 @@ BOOL CPage1::OnInitDialog()
 	m_btnTest.SetVisualStyle(CModernButton::STYLE_SECONDARY);
 	m_btnSaveProfile.SetVisualStyle(CModernButton::STYLE_SECONDARY);
 	m_btnProfileMenu.SetVisualStyle(CModernButton::STYLE_SECONDARY);
-	CreateWorkflowCard();
 	UpdateProxyStateUi();
-
-	CRect filterRect;
-	m_editChildFilter.GetWindowRect(&filterRect);
-	m_filterEditBaseHeight = filterRect.Height();
 
 	m_cbProxyType.AddString(_T("NOPROXY"));
 	m_cbProxyType.AddString(_T("SOCKS4"));
@@ -263,6 +252,7 @@ BOOL CPage1::OnInitDialog()
 	m_bDisableMDNS = g_ini.GetInt(_T("options"), _T("DisableMDNS"), 1);
 
 	ShowTab(0);
+	LayoutSettingsPage();
 	m_loadingProfile = FALSE;
 	SetProfileDirty(FALSE);
 
@@ -272,113 +262,13 @@ BOOL CPage1::OnInitDialog()
 void CPage1::OnSize(UINT nType, int cx, int cy)
 {
 	CModernDialog::OnSize(nType, cx, cy);
-	LayoutFilterEditor(IDC_STATIC_CHILDFILTER_GROUP,
-		m_editChildFilter, IDC_STATIC_CHILDFILTER_HINT);
-	LayoutFilterEditor(IDC_STATIC_TARGETFILTER_GROUP,
-		m_editTargetFilter, IDC_STATIC_TARGETFILTER_HINT);
-	LayoutWorkflowCard();
-}
-
-void CPage1::CreateWorkflowCard()
-{
-	const CRect emptyRect(0, 0, 0, 0);
-	m_workflowGroup.Create(Localization::Get(_T("workflow.group")), WS_CHILD | BS_GROUPBOX,
-		emptyRect, this, IDC_STATIC_WORKFLOW_GROUP);
-	m_workflowStatus.Create(Localization::Get(_T("workflow.ready")), WS_CHILD | SS_OWNERDRAW,
-		emptyRect, this, IDC_STATIC_WORKFLOW_STATUS);
-	m_workflowText.Create(_T(""), WS_CHILD | SS_LEFT,
-		emptyRect, this, IDC_STATIC_WORKFLOW_TEXT);
-	m_workflowNext.Create(Localization::Get(_T("workflow.next")),
-		WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
-		emptyRect, this, IDC_BTN_WORKFLOW_NEXT);
-
-	m_workflowGroup.SetFont(&m_uiFont, FALSE);
-	m_workflowStatus.SetFont(&m_uiFont, FALSE);
-	m_workflowText.SetFont(&m_uiFont, FALSE);
-	m_workflowNext.SetFont(&m_uiFont, FALSE);
-	m_workflowNext.SetVisualStyle(CModernButton::STYLE_PRIMARY);
-	m_recentTitle.Create(Localization::Get(L"recent.title"), WS_CHILD | SS_LEFT, emptyRect, this, IDC_RECENT_TITLE);
-	m_recentEmpty.Create(Localization::Get(L"recent.empty"), WS_CHILD | SS_LEFT, emptyRect, this, IDC_RECENT_EMPTY);
-	m_recentList.Create(WS_CHILD | WS_TABSTOP | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL,
-		emptyRect, this, IDC_RECENT_LIST);
-	m_recentTitle.SetFont(&m_uiFont, FALSE);
-	m_recentEmpty.SetFont(&m_uiFont, FALSE);
-	m_recentList.SetFont(&m_uiFont, FALSE);
-	m_recentList.SetExtendedStyle(LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
-	m_recentList.SetBkColor(UiTheme::PageBackground());
-	m_recentList.SetTextBkColor(UiTheme::PageBackground());
-	m_recentList.InsertColumn(0, L"", LVCFMT_LEFT, 120);
-	const int iconSize = UiTheme::ScaleForWindow(m_hWnd, 20);
-	m_recentIcons.Create(iconSize, iconSize, ILC_COLOR32 | ILC_MASK, 7, 1);
-	m_recentList.SetImageList(&m_recentIcons, LVSIL_SMALL);
-	if (m_recentTooltip.Create(this, TTS_ALWAYSTIP | TTS_NOPREFIX))
-	{
-		m_recentTooltip.AddTool(&m_recentList, LPSTR_TEXTCALLBACK);
-		m_recentTooltip.SetMaxTipWidth(UiTheme::ScaleForWindow(m_hWnd, 540));
-		m_recentTooltip.SetDelayTime(TTDT_AUTOPOP, 30000);
-	}
-	ReloadRecentApplications(TRUE);
-	SetTimer(0x310, 500, NULL);
-	LayoutWorkflowCard();
-}
-
-void CPage1::ReloadRecentApplications(BOOL force)
-{
-	if (!m_recentList.GetSafeHwnd()) return;
-	const CString profile = g_MainTab && g_MainTab->IsProxyRunning() ? g_MainTab->GetRunningProfileName() : CString();
-	const CString identity = g_MainTab ? g_MainTab->GetRunningRecentProfileId() : CString();
-	BOOL changed = force || identity != m_recentProfileId;
-	if (identity != m_recentProfileId)
-	{
-		RecentApplications::ReleaseIcons(m_recentEntries); m_recentEntries.clear();
-		if (m_recentLoad) { m_recentLoad->Release(); m_recentLoad = NULL; }
-		m_recentProfileId = identity;
-		m_recentConsumed = TRUE; m_recentReadFailed = FALSE;
-	}
-	if (!identity.IsEmpty())
-	{
-		RecentApplications::Load* latest = RecentApplications::AcquireLoad(profile, RecentApplications::DefaultPath(), identity);
-		if (latest != m_recentLoad)
-		{
-			{
-				RecentApplications::Load* ready = RecentApplications::AcquireReadyLoad(profile, RecentApplications::DefaultPath(), identity);
-				if (ready) { RecentApplications::Clone(ready->entries, m_recentEntries, 7); ready->Release(); }
-			}
-			if (m_recentLoad) m_recentLoad->Release();
-			m_recentLoad = latest; m_recentConsumed = FALSE; changed = TRUE;
-		}
-		else latest->Release();
-		EnterCriticalSection(&m_recentLoad->lock);
-		const BOOL done = m_recentLoad->done;
-		LeaveCriticalSection(&m_recentLoad->lock);
-		if (done && !m_recentConsumed)
-		{
-			m_recentReadFailed = !m_recentLoad->succeeded;
-			if (!m_recentReadFailed) RecentApplications::Clone(m_recentLoad->entries, m_recentEntries, 7);
-			m_recentConsumed = TRUE; changed = TRUE;
-		}
-	}
-	if (!changed) return;
-	m_recentHoverText.Empty();
-	if (m_recentTooltip.GetSafeHwnd()) m_recentTooltip.Pop();
-	m_recentList.SetRedraw(FALSE);
-	m_recentList.DeleteAllItems();
-	m_recentIcons.SetImageCount(0);
-	for (size_t i = 0; i < m_recentEntries.size(); ++i)
-	{
-		HICON icon = m_recentEntries[i].app.icon;
-		const int image = icon ? m_recentIcons.Add(icon) : -1;
-		m_recentList.InsertItem(static_cast<int>(i), m_recentEntries[i].app.name, image);
-	}
-	m_recentEmpty.SetWindowText(Localization::Get(!m_recentConsumed ? L"apps.loading_list" : (m_recentReadFailed ? L"recent.read_failed" : L"recent.empty")));
-	m_recentList.SetRedraw(TRUE);
-	m_recentList.Invalidate(FALSE);
-	LayoutWorkflowCard();
+	LayoutSettingsPage();
 }
 
 LRESULT CPage1::OnRecentApplicationsChanged(WPARAM, LPARAM)
 {
-	ReloadRecentApplications(TRUE);
+	// The applications page owns the recent-app view; this page only keeps the
+	// shared cache warm for the profile that is about to run.
 	PreloadRecentApplications();
 	return 0;
 }
@@ -393,213 +283,219 @@ void CPage1::PreloadRecentApplications()
 void CPage1::OnTimer(UINT_PTR timer)
 {
 	if (timer == 0x311) { KillTimer(0x311); PreloadRecentApplications(); }
-	if (timer == 0x310 && IsWindowVisible() && !m_recentLaunching) ReloadRecentApplications(FALSE);
 	CModernDialog::OnTimer(timer);
-}
-
-void CPage1::OnRecentApplicationClick(NMHDR* header, LRESULT* result)
-{
-	*result = 0;
-	if (!m_proxyController.IsRunning() || m_recentLaunching || !g_MainTab) return;
-	const int row = header->code == NM_DBLCLK ? reinterpret_cast<NMITEMACTIVATE*>(header)->iItem :
-		m_recentList.GetNextItem(-1, LVNI_SELECTED);
-	if (row < 0 || static_cast<size_t>(row) >= m_recentEntries.size()) return;
-	if (m_recentLaunchTick && GetTickCount() - m_recentLaunchTick < GetDoubleClickTime()) return;
-	const RecentApplications::Entry entry = m_recentEntries[row];
-	m_recentLaunching = TRUE;
-	struct Reset { BOOL& flag; ~Reset() { flag = FALSE; } } reset = { m_recentLaunching };
-	g_MainTab->GetPage3()->LaunchRecentApplication(entry);
-	m_recentLaunchTick = GetTickCount();
-}
-
-BOOL CPage1::PreTranslateMessage(MSG* message)
-{
-	if (m_recentTooltip.GetSafeHwnd())
-	{
-		if (message->message == WM_MOUSEMOVE && message->hwnd == m_recentList.GetSafeHwnd())
-		{
-			LVHITTESTINFO hit = {0};
-			hit.pt = CPoint(static_cast<short>(LOWORD(message->lParam)), static_cast<short>(HIWORD(message->lParam)));
-			const int row = m_recentList.SubItemHitTest(&hit);
-			CString text;
-			if (row >= 0 && static_cast<size_t>(row) < m_recentEntries.size())
-				text = RecentApplications::Description(m_recentEntries[row],
-					g_MainTab && g_MainTab->IsProxyRunning() ? g_MainTab->GetRunningProfileName() : CString());
-			if (text != m_recentHoverText) { m_recentTooltip.Pop(); m_recentHoverText = text; }
-			m_recentTooltip.Activate(!text.IsEmpty());
-		}
-		m_recentTooltip.RelayEvent(message);
-	}
-	return CModernDialog::PreTranslateMessage(message);
-}
-
-BOOL CPage1::OnNotify(WPARAM wParam, LPARAM lParam, LRESULT* result)
-{
-	NMHDR* header = reinterpret_cast<NMHDR*>(lParam);
-	if (header && m_recentTooltip.GetSafeHwnd() && header->hwndFrom == m_recentTooltip.GetSafeHwnd() && header->code == TTN_NEEDTEXT)
-	{
-		reinterpret_cast<NMTTDISPINFO*>(header)->lpszText = const_cast<LPTSTR>(static_cast<LPCTSTR>(m_recentHoverText));
-		*result = 0; return TRUE;
-	}
-	return CModernDialog::OnNotify(wParam, lParam, result);
-}
-
-void CPage1::LayoutWorkflowCard()
-{
-	if (!m_workflowGroup.GetSafeHwnd() || !m_recentList.GetSafeHwnd())
-		return;
-
-	CWnd* optionsGroup = GetDlgItem(IDC_STATIC_GROUP_OTHER);
-	if (!optionsGroup || !m_cfgls.GetSafeHwnd())
-		return;
-
-	CRect clientRect;
-	CRect optionsRect;
-	CRect configRect;
-	GetClientRect(&clientRect);
-	optionsGroup->GetWindowRect(&optionsRect);
-	m_cfgls.GetWindowRect(&configRect);
-	ScreenToClient(&optionsRect);
-	ScreenToClient(&configRect);
-
-	const int gap = UiTheme::ScaleForWindow(m_hWnd, 16);
-	const int outerMargin = UiTheme::ScaleForWindow(m_hWnd, 8);
-	const int cardLeft = optionsRect.right + gap;
-	const int cardRight = clientRect.right - outerMargin;
-	const int cardTop = max(outerMargin,
-		configRect.top - UiTheme::ScaleForWindow(m_hWnd, 12));
-	const int cardBottom = min(clientRect.bottom - outerMargin, optionsRect.bottom);
-	// cardRight/cardLeft are already expressed in the page's client coordinates.
-	// Do not DPI-scale this threshold again, otherwise 125%/150% displays hide
-	// a card that physically has enough room.
-	const BOOL showCard = cardRight - cardLeft >= 150
-		&& cardBottom - cardTop >= UiTheme::ScaleForWindow(m_hWnd, 180);
-
-	m_workflowGroup.ShowWindow(showCard ? SW_SHOW : SW_HIDE);
-	m_workflowStatus.ShowWindow(showCard ? SW_SHOW : SW_HIDE);
-	m_workflowText.ShowWindow(showCard ? SW_SHOW : SW_HIDE);
-	if (!showCard)
-	{
-		m_workflowNext.ShowWindow(SW_HIDE);
-		m_recentTitle.ShowWindow(SW_HIDE);
-		m_recentList.ShowWindow(SW_HIDE);
-		m_recentEmpty.ShowWindow(SW_HIDE);
-		return;
-	}
-
-	m_workflowGroup.MoveWindow(cardLeft, cardTop,
-		cardRight - cardLeft, cardBottom - cardTop);
-
-	const int inner = UiTheme::ScaleForWindow(m_hWnd, 8);
-	const int statusTop = cardTop + UiTheme::ScaleForWindow(m_hWnd, 24);
-	const int statusHeight = UiTheme::ScaleForWindow(m_hWnd, 28);
-	const int statusWidth = min(cardRight - cardLeft - inner * 2,
-		UiTheme::ScaleForWindow(m_hWnd, 170));
-	m_workflowStatus.MoveWindow(cardLeft + inner, statusTop,
-		statusWidth, statusHeight);
-
-	const int buttonWidth = min(cardRight - cardLeft - inner * 2,
-		UiTheme::ScaleForWindow(m_hWnd, 180));
-	const int buttonHeight = UiTheme::ScaleForWindow(m_hWnd, 34);
-	const int buttonTop = cardBottom - inner - buttonHeight;
-	m_workflowNext.MoveWindow(cardLeft + inner, buttonTop,
-		buttonWidth, buttonHeight);
-
-	const int textTop = statusTop + statusHeight + UiTheme::ScaleForWindow(m_hWnd, 14);
-	const int textBottom = buttonTop - UiTheme::ScaleForWindow(m_hWnd, 12);
-	const int contentWidth = max(1, cardRight - cardLeft - inner * 2);
-	CString guidance;
-	m_workflowText.GetWindowText(guidance);
-	CClientDC dc(this);
-	CFont* oldFont = dc.SelectObject(&m_uiFont);
-	CRect measured(0, 0, contentWidth, 0);
-	dc.DrawText(guidance, measured, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
-	if (oldFont) dc.SelectObject(oldFont);
-	const int textHeight = min(max(0, textBottom - textTop), measured.Height());
-	m_workflowText.MoveWindow(cardLeft + inner, textTop,
-		contentWidth, textHeight);
-	const int recentTop = textTop + textHeight + UiTheme::ScaleForWindow(m_hWnd, 12);
-	const int titleHeight = UiTheme::ScaleForWindow(m_hWnd, 22);
-	const int listTop = recentTop + titleHeight;
-	const BOOL showRecent = textBottom - listTop >= UiTheme::ScaleForWindow(m_hWnd, 30);
-	m_recentTitle.MoveWindow(cardLeft + inner, recentTop, contentWidth, titleHeight);
-	m_recentList.MoveWindow(cardLeft + inner, listTop, contentWidth, max(0, textBottom - listTop));
-	m_recentList.SetColumnWidth(0, max(1, contentWidth - UiTheme::ScaleForWindow(m_hWnd, 20)));
-	m_recentEmpty.MoveWindow(cardLeft + inner, listTop, contentWidth, max(0, textBottom - listTop));
-	m_recentTitle.ShowWindow(showRecent ? SW_SHOW : SW_HIDE);
-	m_recentList.ShowWindow(showRecent && !m_recentEntries.empty() ? SW_SHOW : SW_HIDE);
-	m_recentEmpty.ShowWindow(showRecent && m_recentEntries.empty() ? SW_SHOW : SW_HIDE);
-	m_recentList.SetTextColor(m_proxyController.IsRunning() ? UiTheme::Accent() : UiTheme::TextSecondary());
-
-	m_workflowNext.ShowWindow(SW_SHOW);
 }
 
 void CPage1::UpdateWorkflowCard()
 {
-	const BOOL running = m_proxyController.IsRunning();
-	if (running)
+	// Only the "apps need attention" marker of the navigation remains.
+	if (g_MainTab)
+		g_MainTab->SetPageAttention(CMainTab::PAGE_APPLICATIONS, m_proxyController.IsRunning());
+}
+
+void CPage1::LayoutSettingsPage()
+{
+	if (!GetSafeHwnd() || !m_cfgls.GetSafeHwnd() || !m_OK.GetSafeHwnd())
+		return;
+	CRect client;
+	GetClientRect(&client);
+	if (client.Width() <= 0 || client.Height() <= 0)
+		return;
+
+	auto S = [this](int value) { return UiTheme::ScaleForWindow(m_hWnd, value); };
+	auto place = [this](UINT id, int x, int y, int width, int height)
 	{
-		if (m_runtimeDirty)
+		CWnd* control = GetDlgItem(id);
+		if (control && control->GetSafeHwnd())
+			control->SetWindowPos(NULL, x, y, max(0, width), max(0, height), SWP_NOZORDER | SWP_NOACTIVATE);
+	};
+	auto textWidth = [this](UINT id) -> int
+	{
+		CWnd* control = GetDlgItem(id);
+		if (!control || !control->GetSafeHwnd()) return 0;
+		CString text;
+		control->GetWindowText(text);
+		CClientDC dc(control);
+		CFont* font = control->GetFont();
+		CFont* oldFont = font ? dc.SelectObject(font) : NULL;
+		const int width = dc.GetTextExtent(text).cx;
+		if (oldFont) dc.SelectObject(oldFont);
+		return width;
+	};
+
+	const int margin = S(8);
+	const int gap = S(8);
+	const int gapX = S(12);
+	const int pad = S(16);
+	const int fieldH = S(26);
+	const int labelH = S(18);
+	const int rowStep = labelH + S(2) + fieldH + S(8);
+	const int contentW = min(client.Width() - margin * 2, S(780));
+	const int x0 = margin;
+	const int innerX = x0 + pad;
+	const int innerW = contentW - pad * 2;
+	int y = S(58);
+
+	// Selected combo fields should line up with the edit controls.
+	m_cfgls.SetItemHeight(-1, S(18));
+	m_cbProxyType.SetItemHeight(-1, S(18));
+	m_cbTransport.SetItemHeight(-1, S(18));
+
+	// Profile row. With enough width it shares the title row to save height.
+	{
+		const int saveW = max(S(84), textWidth(IDC_BUTTON_SAVE_PROFILE) + S(24));
+		const int menuW = max(S(92), textWidth(IDC_BUTTON_PROFILE_MENU) + S(30));
+		const int labelW = textWidth(IDC_STATIC_CONFIG_LABEL) + S(6);
+		const int menuX = x0 + contentW - menuW;
+		const int saveX = menuX - gap - saveW;
+		const int inlineLeft = x0 + S(228);
+		const BOOL inlineProfile = saveX - gap - (inlineLeft + labelW + S(8)) >= S(120);
+		const int rowY = inlineProfile ? S(10) : y;
+		const int left = inlineProfile ? inlineLeft : x0 + S(2);
+		place(IDC_STATIC_CONFIG_LABEL, left, rowY + (fieldH - labelH) / 2, labelW, labelH);
+		const int comboX = left + labelW + S(8);
+		place(IDC_COMBO_CFGS, comboX, rowY, saveX - gap - comboX, S(260));
+		place(IDC_BUTTON_SAVE_PROFILE, saveX, rowY, saveW, fieldH);
+		place(IDC_BUTTON_PROFILE_MENU, menuX, rowY, menuW, fieldH);
+		y = inlineProfile ? S(56) : y + fieldH + S(12);
+	}
+
+	// Proxy server card.
+	const int serverTop = y;
+	{
+		int row = serverTop + S(34);
+		const int typeW = S(140), portW = S(90);
+		const int hostW = innerW - typeW - portW - gapX * 2;
+		place(IDC_STATIC_TYPE_LABEL, innerX, row, typeW, labelH);
+		place(IDC_CB_PROXYTYPE, innerX, row + labelH + S(2), typeW, S(260));
+		place(IDC_STATIC_HOST_LABEL, innerX + typeW + gapX, row, hostW, labelH);
+		place(IDC_EDIT_ADDR, innerX + typeW + gapX, row + labelH + S(2), hostW, fieldH);
+		place(IDC_STATIC_PORT_LABEL, innerX + typeW + hostW + gapX * 2, row, portW, labelH);
+		place(IDC_EDIT_PORT, innerX + typeW + hostW + gapX * 2, row + labelH + S(2), portW, fieldH);
+
+		row += rowStep;
+		const int half = (innerW - gapX) / 2;
+		place(IDC_STATIC_USER_LABEL, innerX, row, half, labelH);
+		place(IDC_EDIT_USER, innerX, row + labelH + S(2), half, fieldH);
+		place(IDC_STATIC_PASSWORD_LABEL, innerX + half + gapX, row, half, labelH);
+		place(IDC_EDIT_PASS, innerX + half + gapX, row + labelH + S(2), half, fieldH);
+
+		row += rowStep;
+		const int transportW = S(200);
+		const int pskW = innerW - transportW - gapX;
+		place(IDC_STATIC_TRANSPORT_LABEL, innerX, row, transportW, labelH);
+		place(IDC_COMBO_TRANSPORT, innerX, row + labelH + S(2), transportW, S(260));
+		place(IDC_STATIC_PSK_LABEL, innerX + transportW + gapX, row, pskW, labelH);
+		place(IDC_EDIT_TRANSPORT_PSK, innerX + transportW + gapX, row + labelH + S(2), pskW, fieldH);
+
+		row += rowStep + S(2);
+		const int buttonH = S(30);
+		const int testW = max(S(110), textWidth(IDC_TestProxy) + S(24));
+		const int startW = max(S(88), textWidth(IDOK) + S(24));
+		const int stopW = max(S(88), textWidth(IDCANCEL) + S(24));
+		const int stopX = innerX + innerW - stopW;
+		const int startX = stopX - gap - startW;
+		const int testX = startX - gap - testW;
+		// On a narrow page the test status gets its own line above the buttons.
+		const BOOL statusOwnRow = testX - gap - innerX < S(120);
+		if (statusOwnRow)
 		{
-			m_workflowStatus.SetStatus(Localization::Get(_T("workflow.unapplied")), CStatusLabel::TONE_WARNING);
-			m_workflowText.SetWindowText(Localization::Get(_T("workflow.unapplied_text")));
+			place(IDC_STATIC_TestProxy, innerX, row, innerW, S(28));
+			row += S(34);
 		}
 		else
 		{
-			m_workflowStatus.SetStatus(Localization::Get(_T("workflow.running")), CStatusLabel::TONE_SUCCESS);
-			m_workflowText.SetWindowText(Localization::Get(_T("workflow.running_text")));
+			place(IDC_STATIC_TestProxy, innerX, row, testX - gap - innerX, buttonH);
 		}
-	}
-	else
-	{
-		m_workflowStatus.SetStatus(Localization::Get(_T("workflow.ready")), CStatusLabel::TONE_INFO);
-		m_workflowText.SetWindowText(Localization::Get(_T("workflow.steps")));
+		place(IDC_TestProxy, max(innerX, testX), row, testW, buttonH);
+		place(IDOK, max(innerX, startX), row, startW, buttonH);
+		place(IDCANCEL, max(innerX, stopX), row, stopW, buttonH);
+		y = row + buttonH + S(14);
+		place(IDC_STATIC_PROXY_GROUP, x0, serverTop, contentW, y - serverTop);
+		y += S(12);
 	}
 
-	if (g_MainTab)
-		g_MainTab->SetPageAttention(CMainTab::PAGE_APPLICATIONS, running);
-	LayoutWorkflowCard();
+	// Section switcher.
+	{
+		const UINT ids[] = { IDC_RADIO_TAB_BASIC, IDC_RADIO_TAB_CHILD, IDC_RADIO_TAB_TARGET };
+		int x = x0 + S(4);
+		for (int i = 0; i < _countof(ids); ++i)
+		{
+			const int width = textWidth(ids[i]) + S(30);
+			place(ids[i], x, y, width, S(24));
+			x += width + S(14);
+		}
+		y += S(24) + S(6);
+	}
+
+	// Section card: the three option groups share one frame rectangle.
+	{
+		const int top = y;
+		const int rowH = S(29);
+		const int checkH = S(24);
+		int height;
+		if (m_activeTab == 0)
+			height = S(34) + rowH * 4 + S(6);
+		else
+			height = max(S(200), client.bottom - margin - top);
+		const CRect frame(x0, top, x0 + contentW, top + height);
+		place(IDC_STATIC_GROUP_OTHER, frame.left, frame.top, frame.Width(), frame.Height());
+		place(IDC_STATIC_CHILDFILTER_GROUP, frame.left, frame.top, frame.Width(), frame.Height());
+		place(IDC_STATIC_TARGETFILTER_GROUP, frame.left, frame.top, frame.Width(), frame.Height());
+
+		// Basic options.
+		const int column = innerW / 3;
+		int row = top + S(34);
+		place(IDC_CHECK_HOOKTCP, innerX, row, column - S(8), checkH);
+		place(IDC_CHECK_HOOK_UDP, innerX + column, row, column - S(8), checkH);
+		place(IDC_CHECK_HOOKCHILDPROCESS, innerX + column * 2, row, column, checkH);
+		row += rowH;
+		place(IDC_CHECK_BLOCKUDP, innerX, row, column * 2 - S(8), checkH);
+		place(IDC_CHECK_BLOCK_IPV6, innerX + column * 2, row, column, checkH);
+		row += rowH;
+		place(IDC_STATIC_DNS_LABEL, innerX, row + S(4), column - S(8), labelH);
+		place(IDC_RADIO_DNSLOCAL, innerX + column, row, column - S(8), checkH);
+		place(IDC_RADIO_DNSREMOTE, innerX + column * 2, row, column, checkH);
+		row += rowH;
+		place(IDC_CHECK_REDIRECT_PRIVATE_DNS, innerX, row, column * 2 - S(8), checkH);
+		place(IDC_EDIT_REDIRECT_DNS, innerX + column * 2, row - (fieldH - checkH) / 2, column, fieldH);
+
+		// Child process and target filters share the same arrangement.
+		const int filterRadioTop = top + S(34);
+		const int hintH = S(36);
+		const int hintY = frame.bottom - pad - hintH + S(4);
+		const int editY = filterRadioTop + S(32);
+		const int editH = max(S(48), hintY - S(6) - editY);
+		place(IDC_RADIO_CHILDFILTER_EXCLUDE, innerX, filterRadioTop, S(190), checkH);
+		place(IDC_RADIO_CHILDFILTER_INCLUDE, innerX + S(200), filterRadioTop, S(200), checkH);
+		place(IDC_EDIT_CHILDFILTER, innerX, editY, innerW, editH);
+		place(IDC_STATIC_CHILDFILTER_HINT, innerX, hintY, innerW, hintH);
+		place(IDC_RADIO_TARGETFILTER_BYPASS, innerX, filterRadioTop, S(190), checkH);
+		place(IDC_RADIO_TARGETFILTER_PROXY, innerX + S(200), filterRadioTop, S(200), checkH);
+		place(IDC_EDIT_TARGETFILTER, innerX, editY, innerW, editH);
+		place(IDC_STATIC_TARGETFILTER_HINT, innerX, hintY, innerW, hintH);
+	}
+
+	RedrawWindow(NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
-void CPage1::LayoutFilterEditor(UINT groupId, CEdit& editor, UINT hintId)
+BOOL CPage1::UsesSecondaryText(UINT controlId) const
 {
-	if (m_filterEditBaseHeight <= 0 || !editor.GetSafeHwnd())
-		return;
-
-	CWnd* group = GetDlgItem(groupId);
-	CWnd* hint = GetDlgItem(hintId);
-	if (!group || !hint)
-		return;
-
-	CRect clientRect;
-	GetClientRect(&clientRect);
-
-	CRect editRect;
-	CRect hintRect;
-	CRect groupRect;
-	editor.GetWindowRect(&editRect);
-	hint->GetWindowRect(&hintRect);
-	group->GetWindowRect(&groupRect);
-	ScreenToClient(&editRect);
-	ScreenToClient(&hintRect);
-	ScreenToClient(&groupRect);
-
-	const int hintGap = max(0, hintRect.top - editRect.bottom);
-	const int groupPadding = max(0, groupRect.bottom - hintRect.bottom);
-	const int bottomMargin = UiTheme::ScaleForWindow(m_hWnd, 24);
-	const int desiredHeight = m_filterEditBaseHeight * 2;
-	const int maxHeight = clientRect.bottom - bottomMargin - editRect.top
-		- hintGap - hintRect.Height() - groupPadding;
-	const int targetHeight = max(m_filterEditBaseHeight,
-		min(desiredHeight, maxHeight));
-
-	editRect.bottom = editRect.top + targetHeight;
-	hintRect.OffsetRect(0, editRect.bottom + hintGap - hintRect.top);
-	groupRect.bottom = hintRect.bottom + groupPadding;
-
-	editor.MoveWindow(&editRect);
-	hint->MoveWindow(&hintRect);
-	group->MoveWindow(&groupRect);
+	switch (controlId)
+	{
+	case IDC_STATIC_TYPE_LABEL:
+	case IDC_STATIC_HOST_LABEL:
+	case IDC_STATIC_PORT_LABEL:
+	case IDC_STATIC_USER_LABEL:
+	case IDC_STATIC_PASSWORD_LABEL:
+	case IDC_STATIC_TRANSPORT_LABEL:
+	case IDC_STATIC_PSK_LABEL:
+	case IDC_STATIC_DNS_LABEL:
+	case IDC_STATIC_CHILDFILTER_HINT:
+	case IDC_STATIC_TARGETFILTER_HINT:
+		return TRUE;
+	}
+	return CModernDialog::UsesSecondaryText(controlId);
 }
 
 BOOL CPage1::GetProxyInfo(const LPPRCClient pPRCC, LPProxyInfo lpPI)
@@ -1729,7 +1625,6 @@ void CPage1::OnCfgoptDelete()
 				MessageBox(Localization::Get(L"recent.write_failed"), Localization::Get(L"profile.delete_title"), MB_OK | MB_ICONWARNING);
 				return;
 			}
-			ReloadRecentApplications(TRUE);
 			m_cfgls.DeleteString(idx);
 			m_loadingProfile = TRUE;
 			m_cfgls.SetCurSel(-1);
@@ -1931,17 +1826,13 @@ void CPage1::ShowTab(int nTab)
 	m_radioTabBasic.SetCheck (nTab == 0 ? BST_CHECKED : BST_UNCHECKED);
 	m_radioTabChild.SetCheck (nTab == 1 ? BST_CHECKED : BST_UNCHECKED);
 	m_radioTabTarget.SetCheck(nTab == 2 ? BST_CHECKED : BST_UNCHECKED);
+	m_activeTab = nTab;
+	LayoutSettingsPage();
 }
 
 void CPage1::OnBnClickedTabBasic()  { ShowTab(0); }
 void CPage1::OnBnClickedTabChild()  { ShowTab(1); UpdateChildFilterEnable(); }
 void CPage1::OnBnClickedTabTarget() { ShowTab(2); }
-
-void CPage1::OnBnClickedWorkflowNext()
-{
-	if (g_MainTab)
-		g_MainTab->SelectPage(CMainTab::PAGE_APPLICATIONS);
-}
 
 void CPage1::OnCbnSelchangeComboCfgs()
 {

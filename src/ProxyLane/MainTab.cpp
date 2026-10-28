@@ -27,9 +27,57 @@ namespace
 	}
 	LPCTSTR kNavigationKeys[] =
 	{
-		_T("nav.proxy"), _T("nav.apps"), _T("nav.log"),
+		_T("nav.apps"), _T("nav.proxy"), _T("nav.log"),
 		_T("nav.monitor"), _T("nav.about")
 	};
+
+	// Small line glyphs for the navigation list, drawn on a 16x16 grid.
+	void DrawNavGlyph(CDC& dc, int page, const CRect& box, COLORREF color, HWND window)
+	{
+		const double unit = box.Width() / 16.0;
+		auto P = [&](double x, double y) {
+			return CPoint(box.left + static_cast<int>(x * unit + 0.5), box.top + static_cast<int>(y * unit + 0.5));
+		};
+		CPen pen(PS_SOLID, max(1, UiTheme::ScaleForWindow(window, 3) / 2), color);
+		CPen* oldPen = dc.SelectObject(&pen);
+		CBrush* oldBrush = static_cast<CBrush*>(dc.SelectStockObject(NULL_BRUSH));
+		switch (page)
+		{
+		case CMainTab::PAGE_APPLICATIONS:
+			dc.RoundRect(CRect(P(2, 2), P(7, 7)), CPoint(2, 2));
+			dc.RoundRect(CRect(P(9, 2), P(14, 7)), CPoint(2, 2));
+			dc.RoundRect(CRect(P(2, 9), P(7, 14)), CPoint(2, 2));
+			dc.RoundRect(CRect(P(9, 9), P(14, 14)), CPoint(2, 2));
+			break;
+		case CMainTab::PAGE_PROXY:
+			dc.MoveTo(P(2, 4)); dc.LineTo(P(14, 4));
+			dc.MoveTo(P(2, 8)); dc.LineTo(P(14, 8));
+			dc.MoveTo(P(2, 12)); dc.LineTo(P(14, 12));
+			dc.Ellipse(CRect(P(9, 2.2), P(12.6, 5.8)));
+			dc.Ellipse(CRect(P(3.4, 6.2), P(7, 9.8)));
+			dc.Ellipse(CRect(P(10, 10.2), P(13.6, 13.8)));
+			break;
+		case CMainTab::PAGE_LOG:
+			dc.MoveTo(P(6, 4)); dc.LineTo(P(14, 4));
+			dc.MoveTo(P(6, 8)); dc.LineTo(P(14, 8));
+			dc.MoveTo(P(6, 12)); dc.LineTo(P(14, 12));
+			dc.MoveTo(P(2.5, 4)); dc.LineTo(P(3.5, 4));
+			dc.MoveTo(P(2.5, 8)); dc.LineTo(P(3.5, 8));
+			dc.MoveTo(P(2.5, 12)); dc.LineTo(P(3.5, 12));
+			break;
+		case CMainTab::PAGE_MONITOR:
+			dc.MoveTo(P(1, 8)); dc.LineTo(P(4.5, 8)); dc.LineTo(P(6.5, 3)); dc.LineTo(P(9.5, 13));
+			dc.LineTo(P(11.5, 8)); dc.LineTo(P(15, 8));
+			break;
+		default:
+			dc.Ellipse(CRect(P(2, 2), P(14, 14)));
+			dc.MoveTo(P(8, 7.2)); dc.LineTo(P(8, 11));
+			dc.MoveTo(P(8, 4.6)); dc.LineTo(P(8, 5.4));
+			break;
+		}
+		dc.SelectObject(oldBrush);
+		dc.SelectObject(oldPen);
+	}
 }
 
 CMainTab* g_MainTab = NULL;
@@ -41,6 +89,7 @@ CMainTab::CMainTab()
 	, m_hoverPage(-1)
 	, m_attentionPage(-1)
 	, m_proxyRunning(FALSE)
+	, m_brandIcon(NULL)
 {
 	ZeroMemory(m_pages, sizeof(m_pages));
 	g_MainTab = this;
@@ -48,6 +97,7 @@ CMainTab::CMainTab()
 
 CMainTab::~CMainTab()
 {
+	if (m_brandIcon) ::DestroyIcon(m_brandIcon);
 	g_MainTab = NULL;
 }
 
@@ -70,7 +120,9 @@ BOOL CMainTab::CreateTabCtrl(CWnd* parent)
 	}
 
 	UiTheme::CreateUiFont(m_navigationFont, m_hWnd, 10, FW_NORMAL);
-	UiTheme::CreateUiFont(m_brandFont, m_hWnd, 15, FW_BOLD, _T("Tahoma"));
+	UiTheme::CreateUiFont(m_brandFont, m_hWnd, 13, FW_BOLD, _T("Tahoma"));
+	m_brandIcon = static_cast<HICON>(::LoadImage(AfxGetResourceHandle(), MAKEINTRESOURCE(IDR_MAINFRAME),
+		IMAGE_ICON, UiTheme::ScaleForWindow(m_hWnd, 30), UiTheme::ScaleForWindow(m_hWnd, 30), LR_DEFAULTCOLOR));
 
 	if (!m_page1.Create(IDD_Page1, this)
 		|| !m_page2.Create(IDD_Page2, this)
@@ -118,6 +170,8 @@ BOOL CMainTab::CreateTabCtrl(CWnd* parent)
 	}
 	m_transientStatus.SetFont(&m_navigationFont, FALSE);
 
+	if (m_currentPage == PAGE_APPLICATIONS)
+		m_page3.OnPageActivated();
 	FinalizeLayout(FALSE);
 	// Run once more after WM_INITDIALOG returns and the normal message loop is
 	// active. This covers delayed theme/font realization on a busy machine.
@@ -139,14 +193,14 @@ END_MESSAGE_MAP()
 int CMainTab::NavigationWidth() const
 {
 	const int width = Localization::CurrentLanguage().CompareNoCase(_T("en-US")) == 0
-		? 180 : 146;
+		? 196 : 164;
 	return UiTheme::ScaleForWindow(m_hWnd, width);
 }
 
 CRect CMainTab::NavigationItemRect(int index) const
 {
 	int margin = UiTheme::ScaleForWindow(m_hWnd, 10);
-	int top = UiTheme::ScaleForWindow(m_hWnd, 78);
+	int top = UiTheme::ScaleForWindow(m_hWnd, 72);
 	int height = UiTheme::ScaleForWindow(m_hWnd, 40);
 	int gap = UiTheme::ScaleForWindow(m_hWnd, 4);
 	return CRect(
@@ -168,9 +222,16 @@ int CMainTab::HitTestNavigation(CPoint point) const
 
 void CMainTab::OnPaint()
 {
-	CPaintDC dc(this);
+	CPaintDC paint(this);
 	CRect client;
 	GetClientRect(&client);
+	if (client.IsRectEmpty()) return;
+
+	CDC dc;
+	CBitmap bitmap;
+	dc.CreateCompatibleDC(&paint);
+	bitmap.CreateCompatibleBitmap(&paint, client.Width(), client.Height());
+	CBitmap* oldBitmap = dc.SelectObject(&bitmap);
 
 	dc.FillSolidRect(client, UiTheme::WindowBackground());
 	CRect sidebar = client;
@@ -180,18 +241,26 @@ void CMainTab::OnPaint()
 
 	dc.SetBkMode(TRANSPARENT);
 	dc.SetTextColor(UiTheme::TextPrimary());
+
+	// Brand: program icon, name and subtitle.
+	const int iconSize = UiTheme::ScaleForWindow(m_hWnd, 30);
+	const int brandLeft = UiTheme::ScaleForWindow(m_hWnd, 16);
+	const int brandTop = UiTheme::ScaleForWindow(m_hWnd, 16);
+	if (m_brandIcon)
+		::DrawIconEx(dc.m_hDC, brandLeft, brandTop, m_brandIcon, iconSize, iconSize, 0, NULL, DI_NORMAL);
+	const int textLeft = brandLeft + iconSize + UiTheme::ScaleForWindow(m_hWnd, 10);
 	CFont* oldFont = dc.SelectObject(&m_brandFont);
-	CRect brand(UiTheme::ScaleForWindow(m_hWnd, 16), UiTheme::ScaleForWindow(m_hWnd, 10),
-		NavigationWidth() - UiTheme::ScaleForWindow(m_hWnd, 14), UiTheme::ScaleForWindow(m_hWnd, 42));
+	CRect brand(textLeft, UiTheme::ScaleForWindow(m_hWnd, 10),
+		NavigationWidth() - UiTheme::ScaleForWindow(m_hWnd, 10), UiTheme::ScaleForWindow(m_hWnd, 34));
 	dc.DrawText(_T("ProxyLane"), brand, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 
 	dc.SelectObject(&m_navigationFont);
 	dc.SetTextColor(UiTheme::TextSecondary());
 	CRect subtitle = brand;
-	subtitle.top = UiTheme::ScaleForWindow(m_hWnd, 38);
-	subtitle.bottom = UiTheme::ScaleForWindow(m_hWnd, 62);
+	subtitle.top = UiTheme::ScaleForWindow(m_hWnd, 32);
+	subtitle.bottom = UiTheme::ScaleForWindow(m_hWnd, 52);
 	CString subtitleText = Localization::Get(_T("nav.subtitle"));
-	dc.DrawText(subtitleText, subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+	dc.DrawText(subtitleText, subtitle, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
 	for (int i = 0; i < PAGE_COUNT; ++i)
 	{
@@ -200,8 +269,8 @@ void CMainTab::OnPaint()
 		BOOL hot = i == m_hoverPage;
 		if (selected || hot)
 		{
-			CBrush fill(selected ? UiTheme::AccentSoft() : RGB(241, 244, 249));
-			CPen pen(PS_SOLID, 1, selected ? RGB(207, 220, 251) : RGB(234, 237, 242));
+			CBrush fill(selected ? UiTheme::AccentSoft() : RGB(240, 243, 248));
+			CPen pen(PS_SOLID, 1, selected ? UiTheme::AccentSoft() : RGB(240, 243, 248));
 			CBrush* oldBrush = dc.SelectObject(&fill);
 			CPen* oldPen = dc.SelectObject(&pen);
 			dc.RoundRect(item, CPoint(UiTheme::ScaleForWindow(m_hWnd, 8), UiTheme::ScaleForWindow(m_hWnd, 8)));
@@ -209,21 +278,18 @@ void CMainTab::OnPaint()
 			dc.SelectObject(oldBrush);
 		}
 
-		if (selected)
-		{
-			CRect marker = item;
-			marker.left += UiTheme::ScaleForWindow(m_hWnd, 3);
-			marker.right = marker.left + UiTheme::ScaleForWindow(m_hWnd, 3);
-			marker.top += UiTheme::ScaleForWindow(m_hWnd, 10);
-			marker.bottom -= UiTheme::ScaleForWindow(m_hWnd, 10);
-			dc.FillSolidRect(marker, UiTheme::Accent());
-		}
+		const COLORREF ink = selected ? UiTheme::Accent() : UiTheme::TextPrimary();
+		const int glyph = UiTheme::ScaleForWindow(m_hWnd, 18);
+		CRect glyphRect(item.left + UiTheme::ScaleForWindow(m_hWnd, 12), item.CenterPoint().y - glyph / 2,
+			item.left + UiTheme::ScaleForWindow(m_hWnd, 12) + glyph, item.CenterPoint().y - glyph / 2 + glyph);
+		DrawNavGlyph(dc, i, glyphRect, selected ? ink : UiTheme::TextSecondary(), m_hWnd);
 
 		CRect label = item;
-		label.left += UiTheme::ScaleForWindow(m_hWnd, 18);
-		dc.SetTextColor(selected ? UiTheme::Accent() : UiTheme::TextPrimary());
+		label.left = glyphRect.right + UiTheme::ScaleForWindow(m_hWnd, 10);
+		label.right -= UiTheme::ScaleForWindow(m_hWnd, 22);
+		dc.SetTextColor(ink);
 		CString navigationText = Localization::Get(kNavigationKeys[i]);
-		dc.DrawText(navigationText, label, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+		dc.DrawText(navigationText, label, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
 		const bool monitoring = i == PAGE_MONITOR && m_page4.IsMonitoring();
 		if (monitoring || (i == m_attentionPage && !selected))
@@ -246,6 +312,8 @@ void CMainTab::OnPaint()
 	}
 
 	dc.SelectObject(oldFont);
+	paint.BitBlt(0, 0, client.Width(), client.Height(), &dc, 0, 0, SRCCOPY);
+	dc.SelectObject(oldBitmap);
 }
 
 BOOL CMainTab::OnEraseBkgnd(CDC*)

@@ -42,6 +42,8 @@ protected:
 	afx_msg BOOL OnEraseBkgnd(CDC* dc);
 	afx_msg HBRUSH OnCtlColor(CDC* dc, CWnd* wnd, UINT ctlColor);
 	void LayoutPageHeader();
+	// Static texts that should be drawn in the secondary (muted) colour.
+	virtual BOOL UsesSecondaryText(UINT controlId) const;
 
 	CBrush m_backgroundBrush;
 	CFont m_uiFont;
@@ -113,6 +115,20 @@ protected:
 	CString m_downloadText;
 	CString m_tooltipText;
 	CToolTipCtrl m_tooltip;
+
+	DECLARE_MESSAGE_MAP()
+};
+
+// Replaces a group box with a flat, rounded section card. Only the border and
+// the title are painted, so controls placed over it keep their own background.
+class CCardFrame : public CButton
+{
+	DECLARE_DYNAMIC(CCardFrame)
+
+protected:
+	virtual void PreSubclassWindow();
+	virtual void DrawItem(LPDRAWITEMSTRUCT drawItemStruct);
+	afx_msg BOOL OnEraseBkgnd(CDC* dc);
 
 	DECLARE_MESSAGE_MAP()
 };

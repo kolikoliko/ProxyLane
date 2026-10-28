@@ -85,29 +85,12 @@ private:
 	BOOL m_bHookLanIP;
 	CProxyController m_proxyController;
 	CProxyProfileStore m_profileStore;
-	int m_filterEditBaseHeight;
-	CButton m_workflowGroup;
-	CStatusLabel m_workflowStatus;
-	CStatic m_workflowText;
-	CModernButton m_workflowNext;
-	CStatic m_recentTitle;
-	CStatic m_recentEmpty;
-	CListCtrl m_recentList;
-	CImageList m_recentIcons;
-	CToolTipCtrl m_recentTooltip;
-	CString m_recentHoverText;
-	std::vector<RecentApplications::Entry> m_recentEntries;
-	RecentApplications::Load* m_recentLoad;
-	BOOL m_recentConsumed;
-	BOOL m_recentReadFailed;
-	CString m_recentProfileId;
-	BOOL m_recentLaunching;
-	DWORD m_recentLaunchTick;
-	void ReloadRecentApplications(BOOL force);
-
-	void LayoutFilterEditor(UINT groupId, CEdit& editor, UINT hintId);
-	void CreateWorkflowCard();
-	void LayoutWorkflowCard();
+	int m_activeTab;
+	CCardFrame m_cardProxy;
+	CCardFrame m_cardOptions;
+	CCardFrame m_cardChildFilter;
+	CCardFrame m_cardTargetFilter;
+	void LayoutSettingsPage();
 	void UpdateWorkflowCard();
 	void SetProfileDirty(BOOL dirty);
 	void SetRuntimeDirty(BOOL dirty);
@@ -148,10 +131,8 @@ public:
 protected:
 	virtual void DoDataExchange(CDataExchange* pDX);    // DDX/DDV 支持
 	virtual BOOL OnInitDialog();
-	virtual BOOL PreTranslateMessage(MSG* message);
-	virtual BOOL OnNotify(WPARAM wParam, LPARAM lParam, LRESULT* result);
+	virtual BOOL UsesSecondaryText(UINT controlId) const;
 	afx_msg LRESULT OnRecentApplicationsChanged(WPARAM, LPARAM);
-	afx_msg void OnRecentApplicationClick(NMHDR* header, LRESULT* result);
 	afx_msg void OnTimer(UINT_PTR timer);
 
 	DECLARE_MESSAGE_MAP()
@@ -207,7 +188,6 @@ public:
 	afx_msg void OnBnClickedTabBasic();
 	afx_msg void OnBnClickedTabChild();
 	afx_msg void OnBnClickedTabTarget();
-	afx_msg void OnBnClickedWorkflowNext();
 	void ShowTab(int nTab);
 	void UpdateProxyTestStatus();
 	void UpdateProxyStateUi();

@@ -155,12 +155,17 @@ BOOL CModernDialog::OnEraseBkgnd(CDC* dc)
 	return TRUE;
 }
 
+BOOL CModernDialog::UsesSecondaryText(UINT controlId) const
+{
+	return controlId == IDC_STATIC_PAGE_SUBTITLE;
+}
+
 HBRUSH CModernDialog::OnCtlColor(CDC* dc, CWnd* wnd, UINT ctlColor)
 {
 	if (ctlColor == CTLCOLOR_STATIC || ctlColor == CTLCOLOR_BTN || ctlColor == CTLCOLOR_DLG)
 	{
 		dc->SetBkMode(TRANSPARENT);
-		if (wnd && wnd->GetDlgCtrlID() == IDC_STATIC_PAGE_SUBTITLE)
+		if (wnd && UsesSecondaryText(wnd->GetDlgCtrlID()))
 			dc->SetTextColor(UiTheme::TextSecondary());
 		else
 			dc->SetTextColor(UiTheme::TextPrimary());
@@ -217,9 +222,15 @@ LRESULT CModernButton::OnMouseLeave(WPARAM, LPARAM)
 
 void CModernButton::DrawItem(LPDRAWITEMSTRUCT info)
 {
+	// Paint into an off-screen bitmap so hover/press changes do not flicker.
+	CDC target;
+	target.Attach(info->hDC);
+	CRect rect(0, 0, info->rcItem.right - info->rcItem.left, info->rcItem.bottom - info->rcItem.top);
 	CDC dc;
-	dc.Attach(info->hDC);
-	CRect rect(info->rcItem);
+	CBitmap buffer;
+	dc.CreateCompatibleDC(&target);
+	buffer.CreateCompatibleBitmap(&target, max(1, rect.Width()), max(1, rect.Height()));
+	CBitmap* oldBuffer = dc.SelectObject(&buffer);
 	BOOL disabled = (info->itemState & ODS_DISABLED) != 0;
 	BOOL pressed = (info->itemState & ODS_SELECTED) != 0;
 
@@ -280,7 +291,9 @@ void CModernButton::DrawItem(LPDRAWITEMSTRUCT info)
 		dc.DrawFocusRect(focus);
 	}
 
-	dc.Detach();
+	target.BitBlt(info->rcItem.left, info->rcItem.top, rect.Width(), rect.Height(), &dc, 0, 0, SRCCOPY);
+	dc.SelectObject(oldBuffer);
+	target.Detach();
 }
 
 IMPLEMENT_DYNAMIC(CStatusLabel, CStatic)
@@ -455,9 +468,14 @@ void CStatusLabel::UpdateOverflowTooltip()
 
 void CStatusLabel::DrawItem(LPDRAWITEMSTRUCT info)
 {
+	CDC target;
+	target.Attach(info->hDC);
+	CRect rect(0, 0, info->rcItem.right - info->rcItem.left, info->rcItem.bottom - info->rcItem.top);
 	CDC dc;
-	dc.Attach(info->hDC);
-	CRect rect(info->rcItem);
+	CBitmap buffer;
+	dc.CreateCompatibleDC(&target);
+	buffer.CreateCompatibleBitmap(&target, max(1, rect.Width()), max(1, rect.Height()));
+	CBitmap* oldBuffer = dc.SelectObject(&buffer);
 	COLORREF fill = RGB(242, 244, 247);
 	COLORREF border = UiTheme::Border();
 	COLORREF text = UiTheme::TextSecondary();
@@ -559,5 +577,60 @@ void CStatusLabel::DrawItem(LPDRAWITEMSTRUCT info)
 	}
 	if (oldFont)
 		dc.SelectObject(oldFont);
+	target.BitBlt(info->rcItem.left, info->rcItem.top, info->rcItem.right - info->rcItem.left,
+		info->rcItem.bottom - info->rcItem.top, &dc, 0, 0, SRCCOPY);
+	dc.SelectObject(oldBuffer);
+	target.Detach();
+}
+
+IMPLEMENT_DYNAMIC(CCardFrame, CButton)
+
+BEGIN_MESSAGE_MAP(CCardFrame, CButton)
+	ON_WM_ERASEBKGND()
+END_MESSAGE_MAP()
+
+void CCardFrame::PreSubclassWindow()
+{
+	ModifyStyle(0x0000000F, BS_OWNERDRAW);
+	CButton::PreSubclassWindow();
+}
+
+BOOL CCardFrame::OnEraseBkgnd(CDC*)
+{
+	return TRUE;
+}
+
+void CCardFrame::DrawItem(LPDRAWITEMSTRUCT info)
+{
+	CDC dc;
+	dc.Attach(info->hDC);
+	CRect rect(info->rcItem);
+	rect.DeflateRect(0, 0, 1, 1);
+
+	CPen pen(PS_SOLID, 1, UiTheme::Border());
+	CPen* oldPen = dc.SelectObject(&pen);
+	CBrush* oldBrush = static_cast<CBrush*>(dc.SelectStockObject(NULL_BRUSH));
+	dc.RoundRect(rect, CPoint(UiTheme::ScaleForWindow(m_hWnd, 10), UiTheme::ScaleForWindow(m_hWnd, 10)));
+	dc.SelectObject(oldBrush);
+	dc.SelectObject(oldPen);
+
+	CString caption;
+	GetWindowText(caption);
+	if (!caption.IsEmpty())
+	{
+		LOGFONT logFont = { 0 };
+		CFont* font = GetFont();
+		if (font) font->GetLogFont(&logFont);
+		logFont.lfWeight = FW_SEMIBOLD;
+		CFont titleFont;
+		titleFont.CreateFontIndirect(&logFont);
+		CFont* oldFont = dc.SelectObject(&titleFont);
+		dc.SetBkMode(TRANSPARENT);
+		dc.SetTextColor(UiTheme::TextPrimary());
+		CRect title(rect.left + UiTheme::ScaleForWindow(m_hWnd, 16), rect.top + UiTheme::ScaleForWindow(m_hWnd, 9),
+			rect.right - UiTheme::ScaleForWindow(m_hWnd, 16), rect.top + UiTheme::ScaleForWindow(m_hWnd, 29));
+		dc.DrawText(caption, title, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+		dc.SelectObject(oldFont);
+	}
 	dc.Detach();
 }
