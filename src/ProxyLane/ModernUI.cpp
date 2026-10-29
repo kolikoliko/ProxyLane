@@ -4,6 +4,8 @@
 #include "resource.h"
 #include "Localization.h"
 #include <gdiplus.h>
+#include <vector>
+#include "GlyphData.h"
 #pragma comment(lib, "gdiplus.lib")
 
 namespace
@@ -91,6 +93,29 @@ namespace UiTheme
 		pen.SetStartCap(Gdiplus::LineCapRound);
 		pen.SetEndCap(Gdiplus::LineCapRound);
 		pen.SetLineJoin(Gdiplus::LineJoinRound);
+		// Icons supplied as vector outlines: log, settings (proxy page) and the proxy tool.
+		const GlyphData::Outline* outlines = NULL;
+		int outlineCount = 0;
+		if (glyph == GLYPH_LOG) { outlines = GlyphData::kLog; outlineCount = GlyphData::kLogCount; }
+		else if (glyph == GLYPH_PROXY) { outlines = GlyphData::kSettings; outlineCount = GlyphData::kSettingsCount; }
+		else if (glyph == GLYPH_PROXY_TOOL) { outlines = GlyphData::kProxyTool; outlineCount = GlyphData::kProxyToolCount; }
+		if (outlines)
+		{
+			const float side = static_cast<float>(min(box.Width(), box.Height())) * 1.08f;
+			const float left = box.left + (box.Width() - side) / 2, top = box.top + (box.Height() - side) / 2;
+			Gdiplus::GraphicsPath shape(Gdiplus::FillModeWinding);
+			for (int i = 0; i < outlineCount; ++i)
+			{
+				std::vector<Gdiplus::PointF> pts(outlines[i].count);
+				for (int k = 0; k < outlines[i].count; ++k)
+					pts[k] = Gdiplus::PointF(left + outlines[i].points[k * 2] * side, top + outlines[i].points[k * 2 + 1] * side);
+				shape.StartFigure();
+				shape.AddPolygon(&pts[0], outlines[i].count);
+			}
+			Gdiplus::SolidBrush brush(ToColor(color));
+			graphics.FillPath(&brush, &shape);
+			return;
+		}
 		const float unit = box.Width() / 16.0f;
 		auto P = [&](float px, float py) { return Gdiplus::PointF(box.left + px * unit, box.top + py * unit); };
 		auto line = [&](float x1, float y1, float x2, float y2) { graphics.DrawLine(&pen, P(x1, y1), P(x2, y2)); };
@@ -260,8 +285,11 @@ void CModernDialog::LayoutPageHeader()
 		CRect rect;
 		header->GetWindowRect(&rect);
 		ScreenToClient(&rect);
+		int height = rect.Height();
+		if (headerIds[i] == IDC_STATIC_PAGE_SUBTITLE)
+			height = min(height, UiTheme::ScaleForWindow(m_hWnd, 18));
 		header->MoveWindow(rect.left, rect.top,
-			max(0, client.right - rightMargin - rect.left), rect.Height());
+			max(0, client.right - rightMargin - rect.left), height);
 	}
 }
 
@@ -769,4 +797,93 @@ void CCardFrame::DrawItem(LPDRAWITEMSTRUCT info)
 		dc.SelectObject(oldFont);
 	}
 	dc.Detach();
+}
+
+IMPLEMENT_DYNAMIC(CSoftEdit, CEdit)
+
+BEGIN_MESSAGE_MAP(CSoftEdit, CEdit)
+	ON_WM_NCCALCSIZE()
+	ON_WM_NCPAINT()
+	ON_WM_SETFOCUS()
+	ON_WM_KILLFOCUS()
+	ON_WM_ENABLE()
+END_MESSAGE_MAP()
+
+void CSoftEdit::PreSubclassWindow()
+{
+	ModifyStyle(WS_BORDER, 0);
+	ModifyStyleEx(WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE, 0, SWP_FRAMECHANGED);
+	CEdit::PreSubclassWindow();
+}
+
+void CSoftEdit::OnNcCalcSize(BOOL calcValidRects, NCCALCSIZE_PARAMS* params)
+{
+	CEdit::OnNcCalcSize(calcValidRects, params);
+	if (!calcValidRects) return;
+	RECT& area = params->rgrc[0];
+	const int padX = UiTheme::ScaleForWindow(m_hWnd, 9);
+	int padY;
+	if (GetStyle() & ES_MULTILINE)
+		padY = UiTheme::ScaleForWindow(m_hWnd, 7);
+	else
+	{
+		// Centre the single text line vertically inside the field.
+		int textHeight = UiTheme::ScaleForWindow(m_hWnd, 16);
+		if (CDC* dc = GetDC())
+		{
+			CFont* font = GetFont();
+			CFont* oldFont = font ? dc->SelectObject(font) : NULL;
+			TEXTMETRIC metrics = { 0 };
+			if (dc->GetTextMetrics(&metrics)) textHeight = metrics.tmHeight;
+			if (oldFont) dc->SelectObject(oldFont);
+			ReleaseDC(dc);
+		}
+		padY = max(2, (area.bottom - area.top - textHeight) / 2);
+	}
+	area.left += padX;
+	area.right -= (GetStyle() & WS_VSCROLL) ? 0 : padX;
+	area.top += padY;
+	area.bottom -= padY;
+	if (area.right < area.left) area.right = area.left;
+	if (area.bottom < area.top) area.bottom = area.top;
+}
+
+void CSoftEdit::OnNcPaint()
+{
+	CRect window;
+	GetWindowRect(&window);
+	CRect client;
+	GetClientRect(&client);
+	ClientToScreen(&client);
+	client.OffsetRect(-window.left, -window.top);
+	window.OffsetRect(-window.left, -window.top);
+
+	CWindowDC dc(this);
+	dc.ExcludeClipRect(&client);
+	dc.FillSolidRect(window, UiTheme::PageBackground());
+	const BOOL enabled = IsWindowEnabled();
+	const BOOL focused = ::GetFocus() == m_hWnd;
+	COLORREF border = focused ? UiTheme::Accent() : (enabled ? RGB(208, 214, 223) : UiTheme::BorderSoft());
+	UiTheme::FillRoundRect(dc.m_hDC, window, UiTheme::ScaleForWindow(m_hWnd, 8),
+		RGB(255, 255, 255), border);
+	// Scroll bars of multi-line edits are painted by the default handler.
+	Default();
+}
+
+void CSoftEdit::OnSetFocus(CWnd* oldWindow)
+{
+	CEdit::OnSetFocus(oldWindow);
+	RedrawWindow(NULL, NULL, RDW_FRAME | RDW_INVALIDATE);
+}
+
+void CSoftEdit::OnKillFocus(CWnd* newWindow)
+{
+	CEdit::OnKillFocus(newWindow);
+	RedrawWindow(NULL, NULL, RDW_FRAME | RDW_INVALIDATE);
+}
+
+void CSoftEdit::OnEnable(BOOL enable)
+{
+	CEdit::OnEnable(enable);
+	RedrawWindow(NULL, NULL, RDW_FRAME | RDW_INVALIDATE);
 }

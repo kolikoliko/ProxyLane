@@ -223,8 +223,8 @@ void CLaunchPanel::OnPaint()
 		CRect box(Scale(kPadding), Scale(20), Scale(kPadding + kIconBox), Scale(20 + kIconBox));
 		UiTheme::FillRoundRect(dc.m_hDC, box, Scale(12), m_enabled ? UiTheme::AccentSoft() : RGB(238, 241, 245), CLR_NONE);
 		CRect glyph = box;
-		glyph.DeflateRect(Scale(10), Scale(10));
-		UiTheme::DrawGlyph(dc.m_hDC, UiTheme::GLYPH_DROP, glyph,
+		glyph.DeflateRect(Scale(8), Scale(8));
+		UiTheme::DrawGlyph(dc.m_hDC, UiTheme::GLYPH_PROXY_TOOL, glyph,
 			m_enabled ? UiTheme::Accent() : RGB(160, 166, 177), max(1.6f, Scale(2) * 0.9f));
 	}
 

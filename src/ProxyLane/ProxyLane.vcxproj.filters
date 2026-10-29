@@ -162,6 +162,9 @@
     <ClInclude Include="Page4.h">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="GlyphData.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
     <ClInclude Include="LaunchPanel.h">
       <Filter>头文件</Filter>
     </ClInclude>

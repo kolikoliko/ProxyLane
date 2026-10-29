@@ -29,12 +29,12 @@ public:
 
 	CComboBox m_cfgls;
 	CComboBox m_cbProxyType;
-	CEdit     m_edit_HostName;
-	CEdit     m_edit_Port;
-	CEdit     m_edit_User;
-	CEdit     m_edit_Pass;
+	CSoftEdit     m_edit_HostName;
+	CSoftEdit     m_edit_Port;
+	CSoftEdit     m_edit_User;
+	CSoftEdit     m_edit_Pass;
 	CComboBox m_cbTransport;
-	CEdit     m_editTransportPsk;
+	CSoftEdit     m_editTransportPsk;
 	CModernButton m_OK;
 	CModernButton m_Cancel;
 	CModernButton m_btnSaveProfile;
@@ -150,12 +150,12 @@ public:
 	CButton m_btnDNSLocal;
 	CButton m_btnDNSRemote;
 	CButton m_btnRedirectPrivateDNS;
-	CEdit   m_editRedirectDNS;
+	CSoftEdit   m_editRedirectDNS;
 	CButton m_btnHookChildProcess;
-	CEdit   m_editChildFilter;
+	CSoftEdit   m_editChildFilter;
 	CButton m_radioChildFilterExclude;
 	CButton m_radioChildFilterInclude;
-	CEdit   m_editTargetFilter;
+	CSoftEdit   m_editTargetFilter;
 	CButton m_radioTargetFilterBypass;
 	CButton m_radioTargetFilterProxy;
 	CButton m_radioTabBasic;

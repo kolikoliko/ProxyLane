@@ -203,6 +203,7 @@ private:
 	CString m_recentProfileId;
 	void ReloadRecentApplications(BOOL force);
 	void RefreshLaunchPanel();
+	BOOL HasConfiguredProxy() const;
 	void SetProcessesExpanded(BOOL expanded);
 
 public:

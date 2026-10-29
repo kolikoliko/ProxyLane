@@ -334,7 +334,7 @@ void CPage1::LayoutSettingsPage()
 	const int x0 = margin;
 	const int innerX = x0 + pad;
 	const int innerW = contentW - pad * 2;
-	int y = S(58);
+	int y = S(64);
 
 	// Selected combo fields should line up with the edit controls.
 	m_cfgls.SetItemHeight(-1, S(18));
@@ -357,7 +357,7 @@ void CPage1::LayoutSettingsPage()
 		place(IDC_COMBO_CFGS, comboX, rowY, saveX - gap - comboX, S(260));
 		place(IDC_BUTTON_SAVE_PROFILE, saveX, rowY, saveW, fieldH);
 		place(IDC_BUTTON_PROFILE_MENU, menuX, rowY, menuW, fieldH);
-		y = inlineProfile ? S(56) : y + fieldH + S(12);
+		y = inlineProfile ? S(62) : y + fieldH + S(12);
 	}
 
 	// Proxy server card.

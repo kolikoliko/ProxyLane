@@ -1278,7 +1278,7 @@ void CPage3::LayoutProcessPage()
 	};
 
 	// Launch panel with the primary action inside it.
-	int top = UiTheme::ScaleForWindow(m_hWnd, 58);
+	int top = UiTheme::ScaleForWindow(m_hWnd, 66);
 	if (m_launchPanel.GetSafeHwnd())
 	{
 		const int panelHeight = m_launchPanel.PreferredHeight();
@@ -1474,20 +1474,28 @@ void CPage3::ReloadRecentApplications(BOOL force)
 	m_launchPanel.SetTiles(tiles);
 }
 
+BOOL CPage3::HasConfiguredProxy() const
+{
+	return g_MainTab && g_MainTab->GetPage1() && g_MainTab->GetPage1()->m_cfgls.GetCount() > 0;
+}
+
 void CPage3::RefreshLaunchPanel()
 {
 	if (!m_launchPanel.GetSafeHwnd()) return;
 	const BOOL running = g_MainTab && g_MainTab->IsProxyRunning();
+	const BOOL configured = HasConfiguredProxy();
 	ReloadRecentApplications(FALSE);
 	CString empty = Localization::Get(!m_recentConsumed ? L"apps.loading_list" :
 		(m_recentReadFailed ? L"recent.read_failed" : L"recent.empty"));
-	m_launchPanel.SetText(
-		Localization::Get(running ? _T("launch.title_ready") : _T("launch.title_offline")),
-		Localization::Get(running ? _T("launch.body_ready") : _T("launch.body_offline")),
+	LPCTSTR titleKey = running ? _T("launch.title_ready") : (configured ? _T("launch.title_offline") : _T("launch.title_unconfigured"));
+	LPCTSTR bodyKey = running ? _T("launch.body_ready") : (configured ? _T("launch.body_offline") : _T("launch.body_unconfigured"));
+	m_launchPanel.SetText(Localization::Get(titleKey), Localization::Get(bodyKey),
 		Localization::Get(_T("recent.title")), empty);
 	m_launchPanel.SetEnabledState(running);
 
-	const CString actionText = Localization::Get(_T("apps.select"));
+	// One action button whose meaning follows the state of the proxy.
+	LPCTSTR actionKey = running ? _T("apps.select") : (configured ? _T("action.start_proxy") : _T("launch.goto_proxy"));
+	const CString actionText = Localization::Get(actionKey);
 	CString current;
 	m_btnSelectApp.GetWindowText(current);
 	if (current != actionText)
@@ -1540,13 +1548,11 @@ void CPage3::OnBnClickedSelectApp()
 {
 	if (!g_MainTab || !g_MainTab->IsProxyRunning())
 	{
-		// Apps can only be launched through a running proxy: say so and
-		// take the user to where it is started.
-		if (g_MainTab)
-		{
-			g_MainTab->ShowTransientStatus(Localization::Get(_T("apps.start_proxy_first")), CStatusLabel::TONE_WARNING);
+		// Not running: start the configured proxy, or lead the user to configure one.
+		if (HasConfiguredProxy())
+			g_MainTab->GetPage1()->OnBnClickedOk();
+		else if (g_MainTab)
 			g_MainTab->SelectPage(CMainTab::PAGE_PROXY);
-		}
 		return;
 	}
 	CApplicationPicker picker(this);

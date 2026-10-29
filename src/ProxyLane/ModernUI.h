@@ -29,6 +29,7 @@ namespace UiTheme
 		GLYPH_MONITOR,
 		GLYPH_ABOUT,
 		GLYPH_DROP,
+		GLYPH_PROXY_TOOL,
 		GLYPH_CHEVRON_DOWN,
 		GLYPH_CHEVRON_UP
 	};
@@ -153,6 +154,23 @@ protected:
 	virtual void PreSubclassWindow();
 	virtual void DrawItem(LPDRAWITEMSTRUCT drawItemStruct);
 	afx_msg BOOL OnEraseBkgnd(CDC* dc);
+
+	DECLARE_MESSAGE_MAP()
+};
+
+// Single/multi-line edit with a soft rounded border and inner padding; the
+// border turns to the accent colour while the control has focus.
+class CSoftEdit : public CEdit
+{
+	DECLARE_DYNAMIC(CSoftEdit)
+
+protected:
+	virtual void PreSubclassWindow();
+	afx_msg void OnNcCalcSize(BOOL calcValidRects, NCCALCSIZE_PARAMS* params);
+	afx_msg void OnNcPaint();
+	afx_msg void OnSetFocus(CWnd* oldWindow);
+	afx_msg void OnKillFocus(CWnd* newWindow);
+	afx_msg void OnEnable(BOOL enable);
 
 	DECLARE_MESSAGE_MAP()
 };
