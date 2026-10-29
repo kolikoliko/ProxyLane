@@ -213,17 +213,7 @@ void CLaunchPanel::OnPaint()
 
 	// Page background first so the rounded corners blend into the page.
 	dc.FillSolidRect(client, UiTheme::PageBackground());
-	{
-		CRect card = client;
-		card.DeflateRect(0, 0, 1, 1);
-		CPen pen(PS_SOLID, 1, UiTheme::Border());
-		CBrush brush(UiTheme::Surface());
-		CPen* oldPen = dc.SelectObject(&pen);
-		CBrush* oldBrush = dc.SelectObject(&brush);
-		dc.RoundRect(card, CPoint(Scale(10), Scale(10)));
-		dc.SelectObject(oldBrush);
-		dc.SelectObject(oldPen);
-	}
+	UiTheme::FillRoundRect(dc.m_hDC, client, Scale(14), UiTheme::Surface(), UiTheme::BorderSoft());
 
 	dc.SetBkMode(TRANSPARENT);
 	const COLORREF primary = m_enabled ? UiTheme::TextPrimary() : UiTheme::TextSecondary();
@@ -231,29 +221,11 @@ void CLaunchPanel::OnPaint()
 	// Header glyph: a tray with a downward arrow.
 	{
 		CRect box(Scale(kPadding), Scale(20), Scale(kPadding + kIconBox), Scale(20 + kIconBox));
-		CPen pen(PS_SOLID, 1, m_enabled ? UiTheme::AccentSoftBorder() : UiTheme::Border());
-		CBrush brush(m_enabled ? UiTheme::AccentSoft() : RGB(240, 242, 245));
-		CPen* oldPen = dc.SelectObject(&pen);
-		CBrush* oldBrush = dc.SelectObject(&brush);
-		dc.RoundRect(box, CPoint(Scale(10), Scale(10)));
-		dc.SelectObject(oldBrush);
-		dc.SelectObject(oldPen);
-
-		const COLORREF ink = m_enabled ? UiTheme::Accent() : RGB(160, 166, 177);
-		CPen ink2(PS_SOLID, max(2, Scale(2)), ink);
-		oldPen = dc.SelectObject(&ink2);
-		const int cx = box.CenterPoint().x;
-		const int top = box.top + Scale(10);
-		const int tip = box.top + Scale(24);
-		const int wing = Scale(6);
-		dc.MoveTo(cx, top);
-		dc.LineTo(cx, tip);
-		dc.MoveTo(cx - wing, tip - wing);
-		dc.LineTo(cx, tip);
-		dc.LineTo(cx + wing, tip - wing);
-		dc.MoveTo(box.left + Scale(11), box.bottom - Scale(11));
-		dc.LineTo(box.right - Scale(11), box.bottom - Scale(11));
-		dc.SelectObject(oldPen);
+		UiTheme::FillRoundRect(dc.m_hDC, box, Scale(12), m_enabled ? UiTheme::AccentSoft() : RGB(238, 241, 245), CLR_NONE);
+		CRect glyph = box;
+		glyph.DeflateRect(Scale(10), Scale(10));
+		UiTheme::DrawGlyph(dc.m_hDC, UiTheme::GLYPH_DROP, glyph,
+			m_enabled ? UiTheme::Accent() : RGB(160, 166, 177), max(1.6f, Scale(2) * 0.9f));
 	}
 
 	// Header title and body.
@@ -271,7 +243,7 @@ void CLaunchPanel::OnPaint()
 	}
 
 	// Divider between the header and the recent apps.
-	dc.FillSolidRect(Scale(kPadding), Scale(kHeaderHeight), client.Width() - Scale(kPadding) * 2, 1, UiTheme::Border());
+	dc.FillSolidRect(Scale(kPadding), Scale(kHeaderHeight), client.Width() - Scale(kPadding) * 2, 1, UiTheme::BorderSoft());
 
 	// Recent apps.
 	{
@@ -293,15 +265,9 @@ void CLaunchPanel::OnPaint()
 			CRect tile = TileRect(i);
 			const BOOL hot = m_enabled && i == m_hot;
 			const BOOL down = hot && i == m_pressed;
-			CPen pen(PS_SOLID, 1, hot ? UiTheme::Accent() : UiTheme::Border());
-			CBrush brush(down ? UiTheme::AccentSoft() : (hot ? RGB(246, 249, 254) : RGB(255, 255, 255)));
-			CPen* oldPen = dc.SelectObject(&pen);
-			CBrush* oldBrush = dc.SelectObject(&brush);
-			CRect body = tile;
-			body.DeflateRect(0, 0, 1, 1);
-			dc.RoundRect(body, CPoint(Scale(8), Scale(8)));
-			dc.SelectObject(oldBrush);
-			dc.SelectObject(oldPen);
+			UiTheme::FillRoundRect(dc.m_hDC, tile, Scale(10),
+				down ? UiTheme::AccentSoft() : (hot ? RGB(243, 247, 254) : RGB(255, 255, 255)),
+				hot ? UiTheme::AccentSoftBorder() : UiTheme::BorderSoft());
 
 			const int iconSize = Scale(kTileIcon);
 			const int iconLeft = tile.left + Scale(10);

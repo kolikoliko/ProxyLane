@@ -785,6 +785,7 @@ CPage3::CPage3(CWnd* pParent /*=NULL*/)
 	, m_launchedProcessTime(0)
 	, m_launchSelectionTick(0)
 	, m_processRegistry(NULL)
+	, m_processesExpanded(FALSE)
 	, m_recentLoad(NULL)
 	, m_recentConsumed(TRUE)
 	, m_recentReadFailed(FALSE)
@@ -833,6 +834,7 @@ BOOL CPage3::OnInitDialog()
 	m_btnWindowFinder.SetVisualStyle(CModernButton::STYLE_SECONDARY);
 	m_btnRefresh.SetVisualStyle(CModernButton::STYLE_SECONDARY);
 	m_btnSelectApp.SetVisualStyle(CModernButton::STYLE_PRIMARY);
+	m_btnSelectApp.SetBackdropColor(UiTheme::Surface());
 	m_btnInject.SetVisualStyle(CModernButton::STYLE_SECONDARY);
 	m_btnTerminate.SetVisualStyle(CModernButton::STYLE_DANGER);
 	m_btnTerminate.EnableWindow(FALSE);
@@ -841,15 +843,16 @@ BOOL CPage3::OnInitDialog()
 	// The launch panel paints itself; without this the page background erase
 	// would wipe it whenever the page is invalidated after the panel painted.
 	ModifyStyle(0, WS_CLIPCHILDREN);
-	UiTheme::CreateUiFont(m_headingFont, m_hWnd, 11, FW_SEMIBOLD);
-	m_processHeading.Create(Localization::Get(_T("launch.processes")),
-		WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE | SS_NOPREFIX,
-		CRect(0, 0, 0, 0), this, IDC_STATIC);
-	m_processHeading.SetFont(&m_headingFont, FALSE);
+	m_processToggle.Create(Localization::Get(_T("launch.processes_show")),
+		WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+		CRect(0, 0, 0, 0), this, IDC_PROCESS_TOGGLE);
+	m_processToggle.SetFont(&m_uiFont, FALSE);
+	m_processToggle.SetVisualStyle(CModernButton::STYLE_SECONDARY);
 	if (m_launchPanel.Create(this, IDC_LAUNCH_PANEL))
 		m_launchPanel.SetWindowPos(&wndBottom, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 	SetTimer(TIMER_LAUNCH_PANEL, 500, NULL);
 	RefreshLaunchPanel();
+	SetProcessesExpanded(FALSE);
 	if (m_windowFinderToolTip.Create(this, TTS_ALWAYSTIP | TTS_NOPREFIX))
 	{
 		m_windowFinderToolTip.AddTool(
@@ -1228,6 +1231,7 @@ BEGIN_MESSAGE_MAP(CPage3, CModernDialog)
 	ON_NOTIFY(LVN_COLUMNCLICK, IDC_PSLIST, &CPage3::OnLvnColumnClickProcessList)
 	ON_NOTIFY(NM_CUSTOMDRAW, IDC_PSLIST, &CPage3::OnNMCustomdrawProcessList)
 	ON_MESSAGE(WM_LAUNCH_PANEL_TILE, &CPage3::OnLaunchPanelTile)
+	ON_BN_CLICKED(IDC_PROCESS_TOGGLE, &CPage3::OnBnClickedProcessToggle)
 	ON_MESSAGE(WM_RECENT_APPLICATIONS_CHANGED, &CPage3::OnRecentApplicationsChanged)
 	ON_MESSAGE(WM_WINDOW_FINDER_BEGIN, &CPage3::OnWindowFinderBegin)
 	ON_MESSAGE(WM_WINDOW_FINDER_UPDATE, &CPage3::OnWindowFinderUpdate)
@@ -1295,12 +1299,13 @@ void CPage3::LayoutProcessPage()
 	const int injectWidth = textWidth(m_btnInject, 96);
 	const int terminateWidth = textWidth(m_btnTerminate, 90);
 	const int toolbarWidth = finderWidth + refreshWidth + injectWidth + terminateWidth + gap * 3;
-	const int headingWidth = UiTheme::ScaleForWindow(m_hWnd, 130);
-	const BOOL separateRow = rcClient.Width() - margin * 2 < toolbarWidth + headingWidth;
+	const int headingWidth = textWidth(m_processToggle, 150);
+	const BOOL separateRow = rcClient.Width() - margin * 2 < toolbarWidth + headingWidth + gap;
 
-	if (m_processHeading.GetSafeHwnd())
-		m_processHeading.MoveWindow(margin + UiTheme::ScaleForWindow(m_hWnd, 2), top,
-			max(0, (separateRow ? rcClient.Width() - margin * 2 : headingWidth)), buttonHeight);
+	if (m_processToggle.GetSafeHwnd())
+		m_processToggle.MoveWindow(margin, top, headingWidth, buttonHeight);
+	if (!m_processesExpanded)
+		return;
 	int left = separateRow ? margin : rcClient.right - margin - toolbarWidth;
 	int toolbarTop = top;
 	if (separateRow)
@@ -1482,7 +1487,7 @@ void CPage3::RefreshLaunchPanel()
 		Localization::Get(_T("recent.title")), empty);
 	m_launchPanel.SetEnabledState(running);
 
-	const CString actionText = Localization::Get(running ? _T("apps.select") : _T("launch.goto_proxy"));
+	const CString actionText = Localization::Get(_T("apps.select"));
 	CString current;
 	m_btnSelectApp.GetWindowText(current);
 	if (current != actionText)
@@ -1490,6 +1495,28 @@ void CPage3::RefreshLaunchPanel()
 		m_btnSelectApp.SetWindowText(actionText);
 		LayoutProcessPage();
 	}
+}
+
+void CPage3::OnBnClickedProcessToggle()
+{
+	SetProcessesExpanded(!m_processesExpanded);
+}
+
+void CPage3::SetProcessesExpanded(BOOL expanded)
+{
+	m_processesExpanded = expanded;
+	RestoreProcessPageSubtitle();
+	if (m_processToggle.GetSafeHwnd())
+		m_processToggle.SetWindowText(Localization::Get(expanded ? _T("launch.processes_hide") : _T("launch.processes_show")));
+	const int show = expanded ? SW_SHOW : SW_HIDE;
+	m_ListCtrl.ShowWindow(show);
+	m_btnWindowFinder.ShowWindow(show);
+	m_btnRefresh.ShowWindow(show);
+	m_btnInject.ShowWindow(show);
+	m_btnTerminate.ShowWindow(show);
+	LayoutProcessPage();
+	if (expanded)
+		UpdatePslist(TRUE);
 }
 
 LRESULT CPage3::OnLaunchPanelTile(WPARAM index, LPARAM)
@@ -1513,7 +1540,13 @@ void CPage3::OnBnClickedSelectApp()
 {
 	if (!g_MainTab || !g_MainTab->IsProxyRunning())
 	{
-		if (g_MainTab) g_MainTab->SelectPage(CMainTab::PAGE_PROXY);
+		// Apps can only be launched through a running proxy: say so and
+		// take the user to where it is started.
+		if (g_MainTab)
+		{
+			g_MainTab->ShowTransientStatus(Localization::Get(_T("apps.start_proxy_first")), CStatusLabel::TONE_WARNING);
+			g_MainTab->SelectPage(CMainTab::PAGE_PROXY);
+		}
 		return;
 	}
 	CApplicationPicker picker(this);
@@ -1650,6 +1683,7 @@ void CPage3::UpdateWindowFinderHighlight(HWND targetWindow)
 
 BOOL CPage3::SelectProcessByPid(DWORD processId)
 {
+	if (!m_processesExpanded) SetProcessesExpanded(TRUE);
 	std::vector<DWORD> processIds;
 	if (processId)
 		processIds.push_back(processId);
@@ -2061,6 +2095,7 @@ void CPage3::RefreshLaunchedProcess(DWORD pid, HANDLE process, ULONGLONG creatio
 
 BOOL CPage3::SelectProcessesByPid(const std::vector<DWORD>& processIds)
 {
+	if (!m_processesExpanded) SetProcessesExpanded(TRUE);
 	if (processIds.empty() || !m_ListCtrl.GetSafeHwnd())
 		return FALSE;
 
@@ -2162,9 +2197,10 @@ void CPage3::CollectDescendantProcessIds(
 
 void CPage3::RestoreProcessPageSubtitle()
 {
+	// The selection tip only makes sense while the process list is shown.
 	SetDlgItemText(
 		IDC_STATIC_PAGE_SUBTITLE,
-		Localization::Get(_T("page3.list_tip")));
+		Localization::Get(m_processesExpanded ? _T("page3.list_tip") : _T("page3.subtitle")));
 }
 
 LRESULT CPage3::OnWindowFinderBegin(WPARAM, LPARAM)
@@ -2975,7 +3011,7 @@ void CPage3::OnTimer(UINT_PTR nIDEvent)
 		{
 			// Hidden pages and a hidden top-level window still receive WM_TIMER.
 			// Avoid enumerating every process while the list cannot be seen.
-			if (IsWindowVisible() && !m_btnWindowFinder.IsTracking() && !m_terminating)
+			if (IsWindowVisible() && m_processesExpanded && !m_btnWindowFinder.IsTracking() && !m_terminating)
 				UpdatePslist(FALSE);
 		}
 		break;

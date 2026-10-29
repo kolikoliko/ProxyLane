@@ -25,59 +25,16 @@ namespace
 		text.Format(unit == 0 ? _T("%.0f %s") : _T("%.1f %s"), bytesPerSecond, units[unit]);
 		return text;
 	}
+	const UiTheme::Glyph kNavigationGlyphs[] =
+	{
+		UiTheme::GLYPH_APPS, UiTheme::GLYPH_PROXY, UiTheme::GLYPH_LOG,
+		UiTheme::GLYPH_MONITOR, UiTheme::GLYPH_ABOUT
+	};
 	LPCTSTR kNavigationKeys[] =
 	{
 		_T("nav.apps"), _T("nav.proxy"), _T("nav.log"),
 		_T("nav.monitor"), _T("nav.about")
 	};
-
-	// Small line glyphs for the navigation list, drawn on a 16x16 grid.
-	void DrawNavGlyph(CDC& dc, int page, const CRect& box, COLORREF color, HWND window)
-	{
-		const double unit = box.Width() / 16.0;
-		auto P = [&](double x, double y) {
-			return CPoint(box.left + static_cast<int>(x * unit + 0.5), box.top + static_cast<int>(y * unit + 0.5));
-		};
-		CPen pen(PS_SOLID, max(1, UiTheme::ScaleForWindow(window, 3) / 2), color);
-		CPen* oldPen = dc.SelectObject(&pen);
-		CBrush* oldBrush = static_cast<CBrush*>(dc.SelectStockObject(NULL_BRUSH));
-		switch (page)
-		{
-		case CMainTab::PAGE_APPLICATIONS:
-			dc.RoundRect(CRect(P(2, 2), P(7, 7)), CPoint(2, 2));
-			dc.RoundRect(CRect(P(9, 2), P(14, 7)), CPoint(2, 2));
-			dc.RoundRect(CRect(P(2, 9), P(7, 14)), CPoint(2, 2));
-			dc.RoundRect(CRect(P(9, 9), P(14, 14)), CPoint(2, 2));
-			break;
-		case CMainTab::PAGE_PROXY:
-			dc.MoveTo(P(2, 4)); dc.LineTo(P(14, 4));
-			dc.MoveTo(P(2, 8)); dc.LineTo(P(14, 8));
-			dc.MoveTo(P(2, 12)); dc.LineTo(P(14, 12));
-			dc.Ellipse(CRect(P(9, 2.2), P(12.6, 5.8)));
-			dc.Ellipse(CRect(P(3.4, 6.2), P(7, 9.8)));
-			dc.Ellipse(CRect(P(10, 10.2), P(13.6, 13.8)));
-			break;
-		case CMainTab::PAGE_LOG:
-			dc.MoveTo(P(6, 4)); dc.LineTo(P(14, 4));
-			dc.MoveTo(P(6, 8)); dc.LineTo(P(14, 8));
-			dc.MoveTo(P(6, 12)); dc.LineTo(P(14, 12));
-			dc.MoveTo(P(2.5, 4)); dc.LineTo(P(3.5, 4));
-			dc.MoveTo(P(2.5, 8)); dc.LineTo(P(3.5, 8));
-			dc.MoveTo(P(2.5, 12)); dc.LineTo(P(3.5, 12));
-			break;
-		case CMainTab::PAGE_MONITOR:
-			dc.MoveTo(P(1, 8)); dc.LineTo(P(4.5, 8)); dc.LineTo(P(6.5, 3)); dc.LineTo(P(9.5, 13));
-			dc.LineTo(P(11.5, 8)); dc.LineTo(P(15, 8));
-			break;
-		default:
-			dc.Ellipse(CRect(P(2, 2), P(14, 14)));
-			dc.MoveTo(P(8, 7.2)); dc.LineTo(P(8, 11));
-			dc.MoveTo(P(8, 4.6)); dc.LineTo(P(8, 5.4));
-			break;
-		}
-		dc.SelectObject(oldBrush);
-		dc.SelectObject(oldPen);
-	}
 }
 
 CMainTab* g_MainTab = NULL;
@@ -154,6 +111,7 @@ BOOL CMainTab::CreateTabCtrl(CWnd* parent)
 		return FALSE;
 	}
 	m_sidebarStatus.SetFont(&m_navigationFont, FALSE);
+	m_sidebarStatus.SetBackdropColor(UiTheme::SidebarBackground());
 	m_sidebarStatus.SetStatus(stoppedText, CStatusLabel::TONE_NEUTRAL);
 	if (m_sidebarTooltip.Create(this, TTS_ALWAYSTIP | TTS_NOPREFIX))
 	{
@@ -269,20 +227,16 @@ void CMainTab::OnPaint()
 		BOOL hot = i == m_hoverPage;
 		if (selected || hot)
 		{
-			CBrush fill(selected ? UiTheme::AccentSoft() : RGB(240, 243, 248));
-			CPen pen(PS_SOLID, 1, selected ? UiTheme::AccentSoft() : RGB(240, 243, 248));
-			CBrush* oldBrush = dc.SelectObject(&fill);
-			CPen* oldPen = dc.SelectObject(&pen);
-			dc.RoundRect(item, CPoint(UiTheme::ScaleForWindow(m_hWnd, 8), UiTheme::ScaleForWindow(m_hWnd, 8)));
-			dc.SelectObject(oldPen);
-			dc.SelectObject(oldBrush);
+			UiTheme::FillRoundRect(dc.m_hDC, item, UiTheme::ScaleForWindow(m_hWnd, 9),
+				selected ? UiTheme::AccentSoft() : RGB(240, 243, 248), CLR_NONE);
 		}
 
 		const COLORREF ink = selected ? UiTheme::Accent() : UiTheme::TextPrimary();
 		const int glyph = UiTheme::ScaleForWindow(m_hWnd, 18);
 		CRect glyphRect(item.left + UiTheme::ScaleForWindow(m_hWnd, 12), item.CenterPoint().y - glyph / 2,
 			item.left + UiTheme::ScaleForWindow(m_hWnd, 12) + glyph, item.CenterPoint().y - glyph / 2 + glyph);
-		DrawNavGlyph(dc, i, glyphRect, selected ? ink : UiTheme::TextSecondary(), m_hWnd);
+		UiTheme::DrawGlyph(dc.m_hDC, kNavigationGlyphs[i], glyphRect, selected ? ink : UiTheme::TextSecondary(),
+			max(1.4f, UiTheme::ScaleForWindow(m_hWnd, 3) / 2.0f));
 
 		CRect label = item;
 		label.left = glyphRect.right + UiTheme::ScaleForWindow(m_hWnd, 10);

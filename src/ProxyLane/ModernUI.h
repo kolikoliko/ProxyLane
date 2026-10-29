@@ -15,6 +15,25 @@ namespace UiTheme
 	COLORREF AccentSoft();
 	COLORREF AccentSoftBorder();
 	COLORREF Surface();
+	COLORREF BorderSoft();
+
+	// Anti-aliased drawing (GDI+, available on Windows XP and later).
+	// fill/border may be CLR_NONE to skip that part. `radius` is in pixels.
+	void FillRoundRect(HDC dc, const CRect& rect, int radius, COLORREF fill, COLORREF border);
+
+	enum Glyph
+	{
+		GLYPH_APPS,
+		GLYPH_PROXY,
+		GLYPH_LOG,
+		GLYPH_MONITOR,
+		GLYPH_ABOUT,
+		GLYPH_DROP,
+		GLYPH_CHEVRON_DOWN,
+		GLYPH_CHEVRON_UP
+	};
+	// Draws a line glyph centred in `box`; `strokePx` is the pen width in pixels.
+	void DrawGlyph(HDC dc, Glyph glyph, const CRect& box, COLORREF color, float strokePx);
 	COLORREF Success();
 	COLORREF SuccessSoft();
 	COLORREF Danger();
@@ -67,6 +86,8 @@ public:
 
 	CModernButton();
 	void SetVisualStyle(VisualStyle style);
+	// Colour behind the rounded corners; defaults to the page background.
+	void SetBackdropColor(COLORREF color);
 
 protected:
 	virtual void PreSubclassWindow();
@@ -75,6 +96,7 @@ protected:
 	afx_msg LRESULT OnMouseLeave(WPARAM, LPARAM);
 
 	VisualStyle m_visualStyle;
+	COLORREF m_backdrop;
 	BOOL m_hot;
 
 	DECLARE_MESSAGE_MAP()
@@ -98,6 +120,7 @@ public:
 	void SetStatus(LPCTSTR text, Tone tone);
 	void SetTwoLineStatus(LPCTSTR primaryText, LPCTSTR secondaryText, Tone tone);
 	void SetTrafficRates(LPCTSTR uploadText, LPCTSTR downloadText);
+	void SetBackdropColor(COLORREF color);
 
 protected:
 	virtual void PreSubclassWindow();
@@ -108,6 +131,7 @@ protected:
 	void UpdateOverflowTooltip();
 
 	Tone m_tone;
+	COLORREF m_backdrop;
 	BOOL m_twoLine;
 	CString m_primaryText;
 	CString m_secondaryText;

@@ -193,8 +193,8 @@ private:
 
 	// Launch area: one-click recent apps and the main launch action.
 	CLaunchPanel m_launchPanel;
-	CStatic m_processHeading;
-	CFont m_headingFont;
+	CModernButton m_processToggle;
+	BOOL m_processesExpanded;
 	std::vector<RecentApplications::Entry> m_recentEntries;
 	RecentApplications::Load* m_recentLoad;
 	BOOL m_recentConsumed;
@@ -203,6 +203,7 @@ private:
 	CString m_recentProfileId;
 	void ReloadRecentApplications(BOOL force);
 	void RefreshLaunchPanel();
+	void SetProcessesExpanded(BOOL expanded);
 
 public:
 
@@ -271,6 +272,7 @@ public:
 	afx_msg void OnProcessSelectionChanged(NMHDR* header, LRESULT* result);
 	afx_msg void OnTimer(UINT_PTR nIDEvent);
 	afx_msg LRESULT OnLaunchPanelTile(WPARAM index, LPARAM);
+	afx_msg void OnBnClickedProcessToggle();
 	afx_msg LRESULT OnRecentApplicationsChanged(WPARAM, LPARAM);
 	afx_msg void OnLvnColumnClickProcessList(NMHDR* notifyHeader, LRESULT* result);
 	afx_msg void OnNMCustomdrawProcessList(NMHDR* notifyHeader, LRESULT* result);

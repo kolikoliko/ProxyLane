@@ -3,6 +3,8 @@
 #include "ModernUI.h"
 #include "resource.h"
 #include "Localization.h"
+#include <gdiplus.h>
+#pragma comment(lib, "gdiplus.lib")
 
 namespace
 {
@@ -26,6 +28,122 @@ namespace UiTheme
 	COLORREF SuccessSoft()       { return RGB(230, 247, 236); }
 	COLORREF Danger()            { return RGB(220, 38, 38); }
 	COLORREF DangerSoft()        { return RGB(254, 235, 235); }
+
+	COLORREF BorderSoft()        { return RGB(231, 235, 241); }
+
+	namespace
+	{
+		void EnsureGdiplus()
+		{
+			// Started once and left to the OS at process exit.
+			static ULONG_PTR token = 0;
+			if (token) return;
+			Gdiplus::GdiplusStartupInput input;
+			Gdiplus::GdiplusStartup(&token, &input, NULL);
+		}
+
+		Gdiplus::Color ToColor(COLORREF color)
+		{
+			return Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color));
+		}
+	}
+
+	void FillRoundRect(HDC dc, const CRect& rect, int radius, COLORREF fill, COLORREF border)
+	{
+		if (!dc || rect.Width() < 2 || rect.Height() < 2) return;
+		EnsureGdiplus();
+		Gdiplus::Graphics graphics(dc);
+		graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+		// Coordinates are pixel edges; a 1px border is centred half a pixel inside.
+		graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+		const Gdiplus::REAL inset = border != CLR_NONE ? 0.5f : 0.0f;
+		const Gdiplus::REAL x = rect.left + inset, y = rect.top + inset;
+		const Gdiplus::REAL w = rect.Width() - inset * 2, h = rect.Height() - inset * 2;
+		Gdiplus::REAL d = static_cast<Gdiplus::REAL>(radius) * 2;
+		if (d > w) d = w;
+		if (d > h) d = h;
+		Gdiplus::GraphicsPath path;
+		path.AddArc(x, y, d, d, 180, 90);
+		path.AddArc(x + w - d, y, d, d, 270, 90);
+		path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+		path.AddArc(x, y + h - d, d, d, 90, 90);
+		path.CloseFigure();
+		if (fill != CLR_NONE)
+		{
+			Gdiplus::SolidBrush brush(ToColor(fill));
+			graphics.FillPath(&brush, &path);
+		}
+		if (border != CLR_NONE)
+		{
+			Gdiplus::Pen pen(ToColor(border), 1.0f);
+			graphics.DrawPath(&pen, &path);
+		}
+	}
+
+	void DrawGlyph(HDC dc, Glyph glyph, const CRect& box, COLORREF color, float strokePx)
+	{
+		if (!dc || box.Width() < 4) return;
+		EnsureGdiplus();
+		Gdiplus::Graphics graphics(dc);
+		graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+		graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+		Gdiplus::Pen pen(ToColor(color), strokePx);
+		pen.SetStartCap(Gdiplus::LineCapRound);
+		pen.SetEndCap(Gdiplus::LineCapRound);
+		pen.SetLineJoin(Gdiplus::LineJoinRound);
+		const float unit = box.Width() / 16.0f;
+		auto P = [&](float px, float py) { return Gdiplus::PointF(box.left + px * unit, box.top + py * unit); };
+		auto line = [&](float x1, float y1, float x2, float y2) { graphics.DrawLine(&pen, P(x1, y1), P(x2, y2)); };
+		auto ellipse = [&](float x1, float y1, float x2, float y2) {
+			const Gdiplus::PointF a = P(x1, y1), b = P(x2, y2);
+			graphics.DrawEllipse(&pen, a.X, a.Y, b.X - a.X, b.Y - a.Y);
+		};
+		auto box2 = [&](float x1, float y1, float x2, float y2, float r) {
+			const Gdiplus::PointF a = P(x1, y1), b = P(x2, y2);
+			const float dd = r * 2 * unit;
+			Gdiplus::GraphicsPath path;
+			path.AddArc(a.X, a.Y, dd, dd, 180, 90);
+			path.AddArc(b.X - dd, a.Y, dd, dd, 270, 90);
+			path.AddArc(b.X - dd, b.Y - dd, dd, dd, 0, 90);
+			path.AddArc(a.X, b.Y - dd, dd, dd, 90, 90);
+			path.CloseFigure();
+			graphics.DrawPath(&pen, &path);
+		};
+		switch (glyph)
+		{
+		case GLYPH_APPS:
+			box2(2, 2, 7, 7, 1.5f); box2(9, 2, 14, 7, 1.5f);
+			box2(2, 9, 7, 14, 1.5f); box2(9, 9, 14, 14, 1.5f);
+			break;
+		case GLYPH_PROXY:
+			line(2, 4, 14, 4); line(2, 8, 14, 8); line(2, 12, 14, 12);
+			ellipse(9, 2.2f, 12.6f, 5.8f); ellipse(3.4f, 6.2f, 7, 9.8f); ellipse(10, 10.2f, 13.6f, 13.8f);
+			break;
+		case GLYPH_LOG:
+			line(6, 4, 14, 4); line(6, 8, 14, 8); line(6, 12, 14, 12);
+			line(2.5f, 4, 3.2f, 4); line(2.5f, 8, 3.2f, 8); line(2.5f, 12, 3.2f, 12);
+			break;
+		case GLYPH_MONITOR:
+			{
+				Gdiplus::PointF pts[] = { P(1, 8), P(4.5f, 8), P(6.5f, 3), P(9.5f, 13), P(11.5f, 8), P(15, 8) };
+				graphics.DrawLines(&pen, pts, 6);
+			}
+			break;
+		case GLYPH_ABOUT:
+			ellipse(2, 2, 14, 14); line(8, 7.2f, 8, 11); line(8, 4.8f, 8, 5.0f);
+			break;
+		case GLYPH_DROP:
+			line(8, 2.5f, 8, 10.5f); line(4.5f, 7, 8, 10.5f); line(11.5f, 7, 8, 10.5f);
+			line(3, 13.5f, 13, 13.5f);
+			break;
+		case GLYPH_CHEVRON_DOWN:
+			line(4, 6, 8, 10); line(12, 6, 8, 10);
+			break;
+		case GLYPH_CHEVRON_UP:
+			line(4, 10, 8, 6); line(12, 10, 8, 6);
+			break;
+		}
+	}
 
 	int ScaleForWindow(HWND hWnd, int value)
 	{
@@ -179,8 +297,16 @@ IMPLEMENT_DYNAMIC(CModernButton, CButton)
 
 CModernButton::CModernButton()
 	: m_visualStyle(STYLE_SECONDARY)
+	, m_backdrop(UiTheme::PageBackground())
 	, m_hot(FALSE)
 {
+}
+
+void CModernButton::SetBackdropColor(COLORREF color)
+{
+	m_backdrop = color;
+	if (GetSafeHwnd())
+		Invalidate(FALSE);
 }
 
 void CModernButton::SetVisualStyle(VisualStyle style)
@@ -225,7 +351,11 @@ void CModernButton::DrawItem(LPDRAWITEMSTRUCT info)
 	// Paint into an off-screen bitmap so hover/press changes do not flicker.
 	CDC target;
 	target.Attach(info->hDC);
-	CRect rect(0, 0, info->rcItem.right - info->rcItem.left, info->rcItem.bottom - info->rcItem.top);
+	CRect clientRect;
+	GetClientRect(&clientRect);
+	// Cover the whole client area, not only rcItem, so no part keeps the dialog brush.
+	target.FillSolidRect(clientRect, m_backdrop);
+	CRect rect(0, 0, clientRect.Width(), clientRect.Height());
 	CDC dc;
 	CBitmap buffer;
 	dc.CreateCompatibleDC(&target);
@@ -264,13 +394,13 @@ void CModernButton::DrawItem(LPDRAWITEMSTRUCT info)
 		text = RGB(160, 166, 177);
 	}
 
-	dc.FillSolidRect(rect, UiTheme::PageBackground());
+	dc.FillSolidRect(rect, m_backdrop);
 	rect.DeflateRect(1, 1);
 	CPen pen(PS_SOLID, 1, border);
 	CBrush brush(fill);
 	CPen* oldPen = dc.SelectObject(&pen);
 	CBrush* oldBrush = dc.SelectObject(&brush);
-	dc.RoundRect(rect, CPoint(UiTheme::ScaleForWindow(m_hWnd, 7), UiTheme::ScaleForWindow(m_hWnd, 7)));
+	UiTheme::FillRoundRect(dc.m_hDC, rect, UiTheme::ScaleForWindow(m_hWnd, 6), fill, border);
 	dc.SelectObject(oldBrush);
 	dc.SelectObject(oldPen);
 
@@ -291,7 +421,7 @@ void CModernButton::DrawItem(LPDRAWITEMSTRUCT info)
 		dc.DrawFocusRect(focus);
 	}
 
-	target.BitBlt(info->rcItem.left, info->rcItem.top, rect.Width(), rect.Height(), &dc, 0, 0, SRCCOPY);
+	target.BitBlt(0, 0, clientRect.Width(), clientRect.Height(), &dc, 0, 0, SRCCOPY);
 	dc.SelectObject(oldBuffer);
 	target.Detach();
 }
@@ -300,8 +430,16 @@ IMPLEMENT_DYNAMIC(CStatusLabel, CStatic)
 
 CStatusLabel::CStatusLabel()
 	: m_tone(TONE_NEUTRAL),
+	m_backdrop(UiTheme::PageBackground()),
 	m_twoLine(FALSE)
 {
+}
+
+void CStatusLabel::SetBackdropColor(COLORREF color)
+{
+	m_backdrop = color;
+	if (GetSafeHwnd())
+		Invalidate(FALSE);
 }
 
 void CStatusLabel::SetStatus(LPCTSTR text, Tone tone)
@@ -470,7 +608,11 @@ void CStatusLabel::DrawItem(LPDRAWITEMSTRUCT info)
 {
 	CDC target;
 	target.Attach(info->hDC);
-	CRect rect(0, 0, info->rcItem.right - info->rcItem.left, info->rcItem.bottom - info->rcItem.top);
+	CRect clientRect;
+	GetClientRect(&clientRect);
+	// Cover the whole client area, not only rcItem, so no part keeps the dialog brush.
+	target.FillSolidRect(clientRect, m_backdrop);
+	CRect rect(0, 0, clientRect.Width(), clientRect.Height());
 	CDC dc;
 	CBitmap buffer;
 	dc.CreateCompatibleDC(&target);
@@ -505,13 +647,13 @@ void CStatusLabel::DrawItem(LPDRAWITEMSTRUCT info)
 		text = UiTheme::Danger();
 	}
 
-	dc.FillSolidRect(rect, UiTheme::PageBackground());
+	dc.FillSolidRect(rect, m_backdrop);
 	rect.DeflateRect(1, 1);
 	CPen pen(PS_SOLID, 1, border);
 	CBrush brush(fill);
 	CPen* oldPen = dc.SelectObject(&pen);
 	CBrush* oldBrush = dc.SelectObject(&brush);
-	dc.RoundRect(rect, CPoint(UiTheme::ScaleForWindow(m_hWnd, 10), UiTheme::ScaleForWindow(m_hWnd, 10)));
+	UiTheme::FillRoundRect(dc.m_hDC, rect, UiTheme::ScaleForWindow(m_hWnd, 9), fill, border);
 	dc.SelectObject(oldBrush);
 	dc.SelectObject(oldPen);
 
@@ -577,8 +719,7 @@ void CStatusLabel::DrawItem(LPDRAWITEMSTRUCT info)
 	}
 	if (oldFont)
 		dc.SelectObject(oldFont);
-	target.BitBlt(info->rcItem.left, info->rcItem.top, info->rcItem.right - info->rcItem.left,
-		info->rcItem.bottom - info->rcItem.top, &dc, 0, 0, SRCCOPY);
+	target.BitBlt(0, 0, clientRect.Width(), clientRect.Height(), &dc, 0, 0, SRCCOPY);
 	dc.SelectObject(oldBuffer);
 	target.Detach();
 }
@@ -607,12 +748,7 @@ void CCardFrame::DrawItem(LPDRAWITEMSTRUCT info)
 	CRect rect(info->rcItem);
 	rect.DeflateRect(0, 0, 1, 1);
 
-	CPen pen(PS_SOLID, 1, UiTheme::Border());
-	CPen* oldPen = dc.SelectObject(&pen);
-	CBrush* oldBrush = static_cast<CBrush*>(dc.SelectStockObject(NULL_BRUSH));
-	dc.RoundRect(rect, CPoint(UiTheme::ScaleForWindow(m_hWnd, 10), UiTheme::ScaleForWindow(m_hWnd, 10)));
-	dc.SelectObject(oldBrush);
-	dc.SelectObject(oldPen);
+	UiTheme::FillRoundRect(dc.m_hDC, rect, UiTheme::ScaleForWindow(m_hWnd, 12), CLR_NONE, UiTheme::BorderSoft());
 
 	CString caption;
 	GetWindowText(caption);
