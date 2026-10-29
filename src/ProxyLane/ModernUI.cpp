@@ -15,7 +15,7 @@ namespace
 
 namespace UiTheme
 {
-	COLORREF WindowBackground()  { return RGB(245, 247, 250); }
+	COLORREF WindowBackground()  { return RGB(255, 255, 255); }
 	COLORREF PageBackground()    { return RGB(255, 255, 255); }
 	COLORREF SidebarBackground() { return RGB(249, 250, 251); }
 	COLORREF TextPrimary()       { return RGB(23, 32, 51); }
@@ -275,7 +275,12 @@ void CModernDialog::LayoutPageHeader()
 	CRect client;
 	GetClientRect(&client);
 	const int rightMargin = UiTheme::ScaleForWindow(m_hWnd, 8);
+	// Fixed pixel geometry: the dialog-unit rectangles are based on the 8pt
+	// template font and are too short for the 16pt title, which then gets its
+	// descenders clipped.
 	const UINT headerIds[] = { IDC_STATIC_PAGE_TITLE, IDC_STATIC_PAGE_SUBTITLE };
+	const int tops[] = { UiTheme::ScaleForWindow(m_hWnd, 4), UiTheme::ScaleForWindow(m_hWnd, 38) };
+	const int heights[] = { UiTheme::ScaleForWindow(m_hWnd, 36), UiTheme::ScaleForWindow(m_hWnd, 18) };
 	for (int i = 0; i < _countof(headerIds); ++i)
 	{
 		CWnd* header = GetDlgItem(headerIds[i]);
@@ -285,11 +290,8 @@ void CModernDialog::LayoutPageHeader()
 		CRect rect;
 		header->GetWindowRect(&rect);
 		ScreenToClient(&rect);
-		int height = rect.Height();
-		if (headerIds[i] == IDC_STATIC_PAGE_SUBTITLE)
-			height = min(height, UiTheme::ScaleForWindow(m_hWnd, 18));
-		header->MoveWindow(rect.left, rect.top,
-			max(0, client.right - rightMargin - rect.left), height);
+		header->MoveWindow(rect.left, tops[i],
+			max(0, client.right - rightMargin - rect.left), heights[i]);
 	}
 }
 
@@ -901,4 +903,122 @@ LRESULT CCardFrame::OnNcHitTest(CPoint)
 {
 	// Like a stock group box, let clicks fall through to the controls it frames.
 	return HTTRANSPARENT;
+}
+
+IMPLEMENT_DYNAMIC(CSoftCombo, CComboBox)
+
+BEGIN_MESSAGE_MAP(CSoftCombo, CComboBox)
+	ON_WM_PAINT()
+	ON_WM_ERASEBKGND()
+	ON_WM_MOUSEMOVE()
+	ON_MESSAGE(WM_MOUSELEAVE, OnMouseLeave)
+	ON_WM_ENABLE()
+	ON_CONTROL_REFLECT_EX(CBN_SETFOCUS, OnStateChanged)
+	ON_CONTROL_REFLECT_EX(CBN_KILLFOCUS, OnStateChanged)
+	ON_CONTROL_REFLECT_EX(CBN_DROPDOWN, OnStateChanged)
+	ON_CONTROL_REFLECT_EX(CBN_CLOSEUP, OnStateChanged)
+	ON_CONTROL_REFLECT_EX(CBN_SELCHANGE, OnStateChanged)
+END_MESSAGE_MAP()
+
+CSoftCombo::CSoftCombo()
+	: m_hot(FALSE)
+{
+}
+
+void CSoftCombo::PreSubclassWindow()
+{
+	// The edit child of an editable combo paints itself; keep it out of our DC.
+	ModifyStyle(0, WS_CLIPCHILDREN);
+	CComboBox::PreSubclassWindow();
+	// Keep typed text off the rounded border.
+	if (CWnd* edit = GetWindow(GW_CHILD))
+		edit->SendMessage(EM_SETMARGINS, EC_LEFTMARGIN, MAKELONG(UiTheme::ScaleForWindow(m_hWnd, 6), 0));
+}
+
+BOOL CSoftCombo::OnEraseBkgnd(CDC*)
+{
+	return TRUE;
+}
+
+BOOL CSoftCombo::OnStateChanged()
+{
+	Invalidate(FALSE);
+	return FALSE; // let the parent handle the notification too
+}
+
+void CSoftCombo::OnEnable(BOOL enable)
+{
+	CComboBox::OnEnable(enable);
+	Invalidate(FALSE);
+}
+
+void CSoftCombo::OnMouseMove(UINT flags, CPoint point)
+{
+	if (!m_hot)
+	{
+		m_hot = TRUE;
+		TRACKMOUSEEVENT track = { sizeof(track), TME_LEAVE, m_hWnd, 0 };
+		_TrackMouseEvent(&track);
+		Invalidate(FALSE);
+	}
+	CComboBox::OnMouseMove(flags, point);
+}
+
+LRESULT CSoftCombo::OnMouseLeave(WPARAM, LPARAM)
+{
+	m_hot = FALSE;
+	Invalidate(FALSE);
+	return 0;
+}
+
+void CSoftCombo::OnPaint()
+{
+	CPaintDC paint(this);
+	CRect client;
+	GetClientRect(&client);
+	if (client.IsRectEmpty()) return;
+
+	CDC dc;
+	CBitmap buffer;
+	dc.CreateCompatibleDC(&paint);
+	buffer.CreateCompatibleBitmap(&paint, client.Width(), client.Height());
+	CBitmap* oldBuffer = dc.SelectObject(&buffer);
+
+	const BOOL enabled = IsWindowEnabled();
+	CWnd* focus = GetFocus();
+	const BOOL focused = focus && (focus == this || focus->GetParent() == this);
+	const BOOL dropped = GetDroppedState();
+	COLORREF border = !enabled ? UiTheme::BorderSoft()
+		: (focused || dropped) ? UiTheme::Accent()
+		: m_hot ? RGB(184, 193, 207) : RGB(208, 214, 223);
+
+	dc.FillSolidRect(client, UiTheme::PageBackground());
+	UiTheme::FillRoundRect(dc.m_hDC, client, UiTheme::ScaleForWindow(m_hWnd, 8), RGB(255, 255, 255), border);
+
+	// Arrow.
+	// Kept inside the native button area so the edit child of an editable combo never covers it.
+	const int arrow = UiTheme::ScaleForWindow(m_hWnd, 10);
+	CRect arrowRect(client.right - UiTheme::ScaleForWindow(m_hWnd, 8) - arrow, client.CenterPoint().y - arrow / 2,
+		client.right - UiTheme::ScaleForWindow(m_hWnd, 8), client.CenterPoint().y - arrow / 2 + arrow);
+	UiTheme::DrawGlyph(dc.m_hDC, dropped ? UiTheme::GLYPH_CHEVRON_UP : UiTheme::GLYPH_CHEVRON_DOWN, arrowRect,
+		enabled ? UiTheme::TextSecondary() : RGB(176, 182, 192), max(1.4f, UiTheme::ScaleForWindow(m_hWnd, 3) / 2.0f));
+
+	// Selected text (editable combos show it in their own edit child).
+	if ((GetStyle() & 0x3) == CBS_DROPDOWNLIST)
+	{
+		CString text;
+		const int selection = GetCurSel();
+		if (selection != CB_ERR) GetLBText(selection, text);
+		CFont* font = GetFont();
+		CFont* oldFont = font ? dc.SelectObject(font) : NULL;
+		dc.SetBkMode(TRANSPARENT);
+		dc.SetTextColor(enabled ? UiTheme::TextPrimary() : RGB(160, 166, 177));
+		CRect textRect(client.left + UiTheme::ScaleForWindow(m_hWnd, 10), client.top,
+			arrowRect.left - UiTheme::ScaleForWindow(m_hWnd, 6), client.bottom);
+		dc.DrawText(text, textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+		if (oldFont) dc.SelectObject(oldFont);
+	}
+
+	paint.BitBlt(0, 0, client.Width(), client.Height(), &dc, 0, 0, SRCCOPY);
+	dc.SelectObject(oldBuffer);
 }

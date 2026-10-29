@@ -128,6 +128,8 @@ BOOL CMainTab::CreateTabCtrl(CWnd* parent)
 	}
 	m_transientStatus.SetFont(&m_navigationFont, FALSE);
 
+	if (m_page1.m_cfgls.GetCount() == 0)
+		m_currentPage = PAGE_PROXY;
 	if (m_currentPage == PAGE_APPLICATIONS)
 		m_page3.OnPageActivated();
 	FinalizeLayout(FALSE);

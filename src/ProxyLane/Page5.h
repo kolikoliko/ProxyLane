@@ -14,7 +14,7 @@ public:
 
 protected:
 	CToolTipCtrl m_projectTooltip;
-	CComboBox m_languageCombo;
+	CSoftCombo m_languageCombo;
 	CCardFrame m_openSourceCard;
 	HICON m_aboutIcon;
 	void LayoutAboutPage();

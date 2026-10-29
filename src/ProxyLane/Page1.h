@@ -27,13 +27,13 @@ public:
 // 对话框数据
 	enum { IDD = IDD_Page1 };
 
-	CComboBox m_cfgls;
-	CComboBox m_cbProxyType;
+	CSoftCombo m_cfgls;
+	CSoftCombo m_cbProxyType;
 	CSoftEdit     m_edit_HostName;
 	CSoftEdit     m_edit_Port;
 	CSoftEdit     m_edit_User;
 	CSoftEdit     m_edit_Pass;
-	CComboBox m_cbTransport;
+	CSoftCombo m_cbTransport;
 	CSoftEdit     m_editTransportPsk;
 	CModernButton m_OK;
 	CModernButton m_Cancel;

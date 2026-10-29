@@ -176,3 +176,26 @@ protected:
 
 	DECLARE_MESSAGE_MAP()
 };
+
+// Combo box drawn with the same rounded field look as CSoftEdit. The drop-down
+// list itself stays native; only the closed field and its arrow are painted.
+class CSoftCombo : public CComboBox
+{
+	DECLARE_DYNAMIC(CSoftCombo)
+
+public:
+	CSoftCombo();
+
+protected:
+	virtual void PreSubclassWindow();
+	afx_msg void OnPaint();
+	afx_msg BOOL OnEraseBkgnd(CDC* dc);
+	afx_msg void OnMouseMove(UINT flags, CPoint point);
+	afx_msg LRESULT OnMouseLeave(WPARAM, LPARAM);
+	afx_msg void OnEnable(BOOL enable);
+	afx_msg BOOL OnStateChanged();
+
+	BOOL m_hot;
+
+	DECLARE_MESSAGE_MAP()
+};

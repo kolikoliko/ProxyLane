@@ -256,6 +256,14 @@ BOOL CPage1::OnInitDialog()
 	m_loadingProfile = FALSE;
 	SetProfileDirty(FALSE);
 
+	// First run: offer a named draft that still has to be saved once.
+	if (m_cfgls.GetCount() == 0)
+	{
+		m_draftProfileName = _T("proxy");
+		m_cfgls.SetWindowText(m_draftProfileName);
+		SetProfileDirty(TRUE);
+	}
+
 	return TRUE;
 }
 
@@ -337,9 +345,9 @@ void CPage1::LayoutSettingsPage()
 	int y = S(64);
 
 	// Selected combo fields should line up with the edit controls.
-	m_cfgls.SetItemHeight(-1, S(18));
-	m_cbProxyType.SetItemHeight(-1, S(18));
-	m_cbTransport.SetItemHeight(-1, S(18));
+	m_cfgls.SetItemHeight(-1, fieldH - S(6));
+	m_cbProxyType.SetItemHeight(-1, fieldH - S(6));
+	m_cbTransport.SetItemHeight(-1, fieldH - S(6));
 
 	// Profile row. With enough width it shares the title row to save height.
 	{
@@ -351,6 +359,15 @@ void CPage1::LayoutSettingsPage()
 		const int inlineLeft = x0 + S(228);
 		const BOOL inlineProfile = saveX - gap - (inlineLeft + labelW + S(8)) >= S(120);
 		const int rowY = inlineProfile ? S(10) : y;
+		if (CWnd* title = GetDlgItem(IDC_STATIC_PAGE_TITLE))
+		{
+			CRect titleRect;
+			title->GetWindowRect(&titleRect);
+			ScreenToClient(&titleRect);
+			const int titleRight = inlineProfile ? inlineLeft - S(12) : x0 + contentW;
+			title->SetWindowPos(NULL, 0, 0, max(0, titleRight - titleRect.left), titleRect.Height(),
+				SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+		}
 		const int left = inlineProfile ? inlineLeft : x0 + S(2);
 		place(IDC_STATIC_CONFIG_LABEL, left, rowY + (fieldH - labelH) / 2, labelW, labelH);
 		const int comboX = left + labelW + S(8);
@@ -933,6 +950,23 @@ BOOL CPage1::StartProxy(BOOL showErrors)
 {
 	if (m_proxyController.IsRunning())
 		return TRUE;
+
+	// The proxy always runs a saved profile; on first use ask to save it now.
+	if (m_cfgls.GetCount() == 0)
+	{
+		if (!showErrors)
+			return FALSE;
+		if (MessageBox(Localization::Get(_T("profile.save_before_start")),
+			Localization::Get(_T("profile.save_before_start_title")), MB_OKCANCEL | MB_ICONINFORMATION) != IDOK)
+			return FALSE;
+		CString name;
+		m_cfgls.GetWindowText(name);
+		name.Trim();
+		if (name.IsEmpty())
+			name = _T("proxy");
+		if (!SaveCurrentProfile(name))
+			return FALSE;
+	}
 
 	ProxyInfo proxyInfo;
 	ProxySettingsInfo runtimeSettings;
