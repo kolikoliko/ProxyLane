@@ -13,23 +13,39 @@
 
 ---
 
-ProxyLane is an application-level transparent proxy for Windows. It uses process injection and network API hooks to route selected applications through a separately configured proxy without changing the system-wide proxy settings.
+ProxyLane gives selected Windows applications their own proxy settings without changing the system-wide proxy or installing a kernel driver. It uses user-mode process injection and network API hooks, and can pass proxy settings to child processes.
 
-**Inspect encrypted application traffic:** decrypt HTTPS and QUIC v1, view HTTP/1.1, HTTP/2 and HTTP/3 requests, responses and bodies, and record, filter and replay sessions by process. Select `NOPROXY` to monitor and decrypt traffic without an external proxy.
+Core proxy features support **Windows XP through Windows 11**, with Win32 and x64 components.
 
-Decryption requires the **64-bit host**, enabling the relevant options and installing a local CA. See [Traffic Monitoring and Decryption](#traffic-monitoring-and-decryption) for setup and application compatibility.
+It also helps inspect application traffic: view HTTP/1.1, HTTP/2 and HTTP/3 requests and responses, DNS and Raw/Hex data, decrypt HTTPS and QUIC v1, and save recordings for offline viewing. Select `NOPROXY` to monitor traffic without an external proxy.
 
 ## Usage Demo
 
 ![ProxyLane usage demo](demo.gif)
 
-## Use Case
+## Quick Start
+
+1. Extract the entire release package, keeping the executables and DLLs together. On 64-bit Windows, use `ProxyLane64.exe`.
+2. Under **Proxy Settings**, select or create a profile and enter the proxy type, server address, port and credentials.
+3. Enable TCP proxying, UDP proxying and **Proxy child processes** as needed. Click **Test Current** to check the connection, then **Start Proxy**.
+4. Under **Apps and Processes**, choose an app to launch, or drop an executable or shortcut into ProxyLane. To attach to a running app, select its process and click **Proxy Selected Processes**.
+5. Check the runtime log for the result. Open **Traffic Monitor** to inspect connections and data.
+
+Prefer launching applications through ProxyLane. Attaching to a running process may leave existing connections outside the proxy. For complete coverage, save your work, exit the application and launch it through ProxyLane again.
+
+### Proxy Types and Rules
+
+- **SOCKS5**: TCP and UDP; UDP requires server support.
+- **HTTP10 / HTTP11**: TCP through HTTP CONNECT, without UDP proxying.
+- **NOPROXY**: direct connections for monitoring and decryption without an external proxy. No server address or port is needed.
+- **Child-process / target rules**: by default, all child processes (with **Proxy child processes** enabled) and all network destinations are proxied. To limit the scope, follow the matching examples in the interface.
+- **Block UDP / Block IPv6**: restrict the corresponding traffic as needed. Blocking UDP takes priority over UDP proxying or capture.
 
 ### Proxy a Command-Line Workspace
 
-First, start the proxy with **Proxy child processes** enabled. Open a Command Prompt, select the new `cmd.exe` entry under **Apps and Processes**, and click **Proxy Selected**. Programs launched from that command-line window—including `curl`, Git, Python, `pip`, package managers, and other tools—will automatically inherit the active proxy settings. You do not need to add every child process separately or change the system-wide proxy.
+Start the proxy with **Proxy child processes** enabled, then launch `cmd.exe` through ProxyLane. Alternatively, open a new Command Prompt, select its process and click **Proxy Selected Processes**.
 
-For example:
+Programs launched from that window, such as Git, Python, `pip` and `curl`, can inherit the proxy settings according to your child-process rules:
 
 ```bat
 curl https://example.com
@@ -38,123 +54,138 @@ pip install requests
 python script.py
 ```
 
-When you manually launch Edge or Chrome through ProxyLane and the new process exits within 2.5 seconds, ProxyLane checks surviving browser instances from the same executable path and session that existed before launch. It identifies the main process and Network Service using the process tree and command lines. An instance is excluded from the hint only when its main process and all identified Network Services are hooked by this ProxyLane instance. Renderer or GPU injection failures alone do not trigger a hint; an unidentified network process is explicitly marked as unknown. **View related processes** rechecks and selects the relevant main and network processes, including any hooked ones. We recommend saving your work, ending the related browser processes, and restarting the browser through ProxyLane. The dialog offers **End processes** and **Proxy processes** to act directly on the listed main and network processes without switching pages. Ending requires confirmation; proxying skips already hooked processes. Actions verify the PID and creation time and do not include newly appearing processes. Existing network connections may still bypass the proxy, so attaching cannot guarantee that all traffic goes through it. ProxyLane does not automatically end or hook candidates, and an independent instance that keeps running does not trigger the hint merely because another browser instance exists.
+### Browsers Running in the Background
 
-Detection sends a tray notification without automatically opening a dialog, bringing a window forward or flashing the taskbar. Clicking the notification rechecks the processes and opens the details. Expired or dismissed notifications leave no additional reminder entry. Repeated launches involving the same browser instance are merged while its notification is outstanding. Later launches are checked again, including after fully closing and reopening the browser. System notification settings may affect delivery.
+Edge and Chrome may keep running after their windows close. Launching them through ProxyLane can reuse an existing process, leaving traffic outside the proxy. When ProxyLane detects a possible case, it sends a tray notification. Click it to inspect the related processes and choose **End processes**, **Proxy processes** or **View related processes**.
 
-## Features
-
-- Transparent proxying for selected applications and processes
-- HTTPS and QUIC v1 decryption with HTTP/1.1, HTTP/2 and HTTP/3 request, response and body inspection (64-bit host)
-- Network sessions by process, DNS queries and responses, and Raw/Hex inspection
-- Traffic recording and offline playback for troubleshooting and analysis
-- Proxy profile management and connection testing
-- HTTP and SOCKS5 support for TCP and UDP traffic
-- Child-process and destination filtering rules
-- Launch and proxy applications by dropping programs or shortcuts into the window
-- Runtime logs and connection traffic statistics
-- Win32 and x64 builds
-- Compatible with Windows XP through Windows 11
-
-## How It Works
-
-ProxyLane uses user-mode process injection and API hooking to intercept and redirect application network connections. It does not install a kernel driver or modify the system-wide proxy settings.
-
-- A Hook module matching the target process architecture is injected into a user-selected process. It intercepts network APIs and redirects matching TCP and UDP connections through the configured proxy.
-- The Hook monitors process creation. When **Proxy child processes** is enabled, every injected process continues monitoring its descendants, allowing ProxyLane to handle multiple generations of child processes according to the configured filters.
-- For a child process that must be proxied, the Hook module is loaded and initialized in that process's main-thread context. The main thread resumes only after initialization succeeds, ensuring the network hooks are ready before the application opens connections.
-- The main application manages proxy profiles, filtering rules, and logs. The Hook module monitors child-process creation and network activity. The entire workflow runs in user mode.
-- Win32 and x64 components are provided for compatibility with Windows XP through Windows 11.
-- The 32-bit host and Windows XP / Server 2003 retain core proxy features without data monitoring, HTTPS decryption or gonc secure transport. A supported 64-bit host provides these features for both 32-bit and 64-bit target applications.
-
-## Build Environment
-
-- Visual Studio 2019
-- Visual C++ v141_xp toolset
-- Windows 7.1A SDK
-
-Open `src/ProxyLane.sln`, select the `Win32` or `x64` platform, and build the solution. Release binaries are written to `bin/`.
-
-### gonc TLS-PSK transport
-
-For a SOCKS5 profile, select `gonc TLS-PSK` under **Transport** and enter the same PSK used by the remote gonc `:s5s` server. Both TCP and UDP use the encrypted SOCKS5 service directly; no local gonc client or standard SOCKS5 bridge is required.
-
-PL's gonc TLS-PSK transport supports TLS 1.3 with TLS 1.2 compatibility. It does not send SNI, even when the proxy host is a domain name; authentication still checks the PSK-derived public key. Use `-tls13` on the gonc server to require TLS 1.3.
-
-In this initial format, the PSK is stored as plaintext in the profile's `PSK=` field. Protect access to `ProxyLane.ini` accordingly. Secure transport is available only for SOCKS5, and plain HTTP/SOCKS5 profiles do not load the secure component.
-
-Secure transport runs in the 64-bit host through `ProxyLaneSecureTransport64.dll` and supports both 32-bit and 64-bit target applications. The 32-bit host retains plain proxy support, without secure transport or data monitoring. The application and Hook DLLs remain built with `v141_xp`, and the secure DLL is not loaded unless the profile selects secure transport. Build them with the Rust MSVC toolchain:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build-secure-transport.ps1
-```
-
-## Sharing Proxy Profiles
-
-Choose **Actions ▾ → Copy full profile** on the proxy settings page to copy the current settings, including unsaved edits, username, password, PSK, network options, child-process rules and target rules. The result is a single `proxylane://profile/v1/…` line. Base64URL is encoding, not encryption: anyone holding the code can read its credentials.
-
-The recipient copies the complete line and chooses **Actions ▾ → Paste profile** to fill all profile fields. Imported profiles remain unsaved, and duplicate names receive an “(imported)” suffix. Existing unsaved edits prompt before replacement. While a proxy is running, pasted settings take effect only after **Save & Apply**. Global options, decryption settings, CA material, recordings and recent applications are not included.
-
-To import a complete `ProxyLane.ini` from another directory or version, choose **Actions ▾ → Import all settings from file…**. Stop the proxy, tests and monitoring, and manually close applications hooked by this instance first. After confirmation, ProxyLane creates a timestamped backup in its current directory, replaces the entire INI and restarts without automatically starting the proxy. Unsaved edits are discarded. All sections, recent applications and unknown fields are preserved; UTF-8 files are converted to UTF-16 LE for the Windows INI API. The source remains unchanged. Referenced certificates, recordings and other external files are not copied, and paths are preserved. Replacement or restart failures are reported and restoration of the previous configuration is attempted.
-
-Opening the profile dropdown refreshes its names from disk, including additions and deletions made by other instances. Selecting a profile reads its latest settings. Refreshing the list preserves current edits; a profile deleted by another instance is retained in the editor as an unsaved draft.
-
-## Interface Languages
-
-ProxyLane includes Simplified Chinese and English. By default, it follows the Windows UI language: Chinese systems use Simplified Chinese, while all other systems use English. You can also select a language on the **About & Language** page; the change takes effect the next time ProxyLane starts.
-
-All translatable strings are stored in UTF-8 language catalogs:
-
-- `src/ProxyLane/locales/zh-CN.json`
-- `src/ProxyLane/locales/en-US.json`
-
-Both catalogs must contain the same set of keys. `ProxyLane.rc` contains only control layout data, while the catalogs are embedded into the EXE as `RCDATA`, so release packages do not require external language files.
-
-After changing translations, validate the catalogs and embedded resources with:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\check-locales.ps1
-```
+Save your browser work and check the listed processes before ending them, then restart the browser through ProxyLane. Using **Proxy processes** directly may leave existing connections outside the proxy. Windows notification settings can affect whether the notification appears.
 
 ## Traffic Monitoring and Decryption
 
-The 64-bit host shows captured sessions by process without requiring applications to use the system proxy. Inspect HTTP/1.1 and HTTP/2 requests, responses and decompressed bodies, DNS queries and responses, and ordinary TCP/UDP traffic in Raw or HexView. HTTPS decryption is not restricted to port 443. QUIC v1 decryption is also independent of application name and port.
+Monitoring and decryption require a supported **64-bit host**, which can handle both 32-bit and 64-bit target applications.
 
-Under **Traffic Monitor → Decryption options**, enable HTTPS or QUIC decryption as needed (both default off), install the current-user CA when prompted, save, then start monitoring. Target applications need new connections. Stopping monitoring stops new interception and capture while existing connections keep forwarding. The QUIC option also attempts to relax compatible Chromium applications' extra restrictions on trusted local/enterprise CAs while retaining normal certificate validation. Restart target applications after changing this option; the compatibility change remains until they exit. Compatibility varies by browser version.
+### Inspect Traffic
 
-For monitoring without an external proxy, select `NOPROXY`, enable TCP/UDP interception as needed and disable **Block UDP**. Ordinary monitoring does not need a CA. Applications with private trust stores, certificate pinning or unsupported QUIC application protocols may not support decryption.
+1. Start the proxy and hook the target application. For monitoring without an external proxy, select `NOPROXY` and enable TCP/UDP capture as needed. Disable **Block UDP** if you need UDP traffic.
+2. Open **Traffic Monitor**, start monitoring, then make requests in the application.
+3. Filter sessions by process and inspect requests, responses, bodies and DNS queries, or use Raw/HexView for raw data.
 
-Enable QUIC decryption to automatically identify the negotiated application protocol; no ALPN entry is required. HTTP/3 keeps its request/response view, while other protocols expose decrypted bytes by Stream ID. QUIC DATAGRAMs appear separately with packet boundaries. Both support Raw/HexView and recording. QUIC v1 is supported; 0-RTT forwarding, migration, and HTTP/3 extensions such as WebTransport and CONNECT-UDP are not supported.
+Ordinary traffic monitoring does not require a CA. Stopping monitoring stops new capture while existing connections keep forwarding.
 
-For long captures or analysis by an AI agent, enable **Keep recording files** under **Traffic Monitor → Options → Recording options**, choose a location, capacity and disk reserve, then start monitoring. The recording checkbox resets when ProxyLane restarts; the location and limits are remembered. Session metadata, request/response headers and payloads are saved continuously and retained after exit. Reaching capacity or running out of available disk space stops capture without deleting old payloads or interrupting existing connections.
+### Decrypt HTTPS and QUIC
 
-After stopping monitoring, choose **Options → View saved recording…** and choose a recording directory to browse sessions, filter processes and inspect Raw/HexView again. Offline viewing requires no running proxy. Lists load from a saved index, with details read on demand. If the index is missing or damaged, ProxyLane asks before rebuilding it; original requests and payloads remain unchanged. The directory can also be passed directly to an AI agent and includes a format guide.
+1. Open **Traffic Monitor → Decryption options** and enable HTTPS or QUIC decryption as needed.
+2. Install the current-user CA when prompted, save the options and start monitoring.
+3. Make the target application establish new connections. After changing QUIC decryption options, fully exit and restart the application.
+
+HTTPS decryption is not limited to port 443. QUIC v1 support includes HTTP/3 and stream or datagram data from other supported protocols. Private trust stores, certificate pinning and unsupported protocols may prevent decryption; compatibility also varies by application version. QUIC 0-RTT forwarding, connection migration, WebTransport and CONNECT-UDP are not currently supported.
+
+### Record and View Offline
+
+Enable **Keep recording files** under **Traffic Monitor → Options → Recording options**, choose a directory, capacity and disk reserve, then start monitoring. The directory and limits are remembered, but recording must be enabled again after restarting ProxyLane. Capture stops when its capacity or disk-space limit is reached without deleting old data.
+
+After stopping monitoring, choose **Options → View saved recording…** and open a recording directory. You can filter sessions and inspect requests, responses and Raw/Hex data without starting the proxy. Each directory includes a format guide for use with other tools or AI agents.
+
+## Profile Management and Sharing
+
+### Share One Proxy Profile
+
+Choose **Actions ▾ → Copy full profile** on the settings page and send the complete `proxylane://profile/v1/…` line. The recipient copies it and selects **Actions ▾ → Paste profile** to fill the settings, then saves or starts the proxy. If the proxy is already running, click **Save & Apply** for the new settings to take effect.
+
+The code includes current unsaved edits, username, **password and PSK**, network options and filtering rules. It is not encrypted, so share it only with trusted recipients. Global options, decryption settings, CA material, recordings and recent applications are not included.
+
+### Import All Settings
+
+Choose **Actions ▾ → Import all settings from file…** to import a `ProxyLane.ini` from another directory or version, including all profiles and recent application records stored in it.
+
+First stop the proxy, tests and monitoring, and close applications hooked by this instance. After confirmation, ProxyLane backs up the current configuration, replaces the entire INI and restarts. Unsaved edits are lost. External files such as certificates and recordings must be moved separately.
+
+The profile dropdown refreshes when opened to reflect changes made by other instances sharing the file. Refreshing preserves current edits.
+
+## gonc TLS-PSK Secure Transport
+
+For SOCKS5, HTTP10 or HTTP11, select `gonc TLS-PSK` under **Transport** and enter the remote gonc server address, port and matching PSK. No separate local gonc client is needed.
+
+SOCKS5 supports encrypted TCP and UDP; HTTP10/HTTP11 support TCP only. To accept both SOCKS5 and HTTP on the same server port, enable `-http`, for example:
+
+```bat
+gonc -e ":s5s -u -http" -l -k -psk YOUR_PSK -tls 1083
+```
+
+Replace `YOUR_PSK` with your own key. TLS 1.3 is supported with TLS 1.2 server compatibility. The PSK is stored as plaintext in `ProxyLane.ini`, so keep the configuration file secure.
+
+## Compatibility and Interface Languages
+
+- Core proxy features support Windows XP through Windows 11, with Win32 and x64 components.
+- The 32-bit host and Windows XP / Server 2003 do not support traffic monitoring, decryption or gonc secure transport.
+- A supported 64-bit host provides these features for 32-bit and 64-bit applications; hooking and decryption depend on application compatibility.
+- Simplified Chinese and English are included. The default follows the system language; changes under **About & Language** take effect after restarting ProxyLane.
+
+## Building
+
+### Requirements
+
+- Visual Studio 2019 with Desktop development with C++ and MFC components.
+- Visual C++ `v141_xp` toolset and Windows 7.1A SDK for the application and Hook DLLs.
+- `v142` toolset and Windows 10 SDK for the test project.
+- Rust MSVC toolchain, with `rustup` and `cargo` on PATH. The MITM build uses pinned version `1.88.0`.
+
+Prepare the Rust toolchain from the repository root:
+
+```powershell
+rustup toolchain install 1.88.0-x86_64-pc-windows-msvc
+rustup target add x86_64-pc-windows-msvc
+```
+
+### Build the Application
+
+Open `src/ProxyLane.sln`, select `Release`, and build both `Win32` and `x64`. Alternatively, run these commands from the repository root in a Visual Studio Developer PowerShell:
+
+```powershell
+msbuild .\src\ProxyLane.sln /m /p:Configuration=Release /p:Platform=Win32
+msbuild .\src\ProxyLane.sln /m /p:Configuration=Release /p:Platform=x64
+```
+
+The application and runtime DLLs are written to `bin/`. The x64 Release post-build step invokes the Rust scripts to build secure transport and MITM components. The first build downloads dependencies and takes longer.
+
+### Build Rust Components Separately
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-secure-transport.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\build-mitm.ps1
+```
+
+These produce `bin/ProxyLaneSecureTransport64.dll` and `bin/ProxyLaneMitm64.dll`. The MITM script also writes a command-line helper to `build/tools/`. `src\build-secure-transport.bat` is a shortcut for the secure-transport script and builds only the 64-bit secure-transport DLL.
+
+### Tests and Translation Checks
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\tests\run-tests.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\check-locales.ps1
+```
+
+The test script builds and runs Win32/x64 unit tests. Translations are in `src/ProxyLane/locales/zh-CN.json` and `en-US.json`; both must contain the same keys. Rebuild the application after editing them. Language resources are embedded in the EXE and need no separate distribution.
 
 ## Packaging a Release
 
-Build the Win32 and x64 Release configurations, then run the following command from the repository root:
+After building both Win32/x64 Release configurations and the two Rust DLLs, run from the repository root:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\package-release.ps1
 ```
 
-The script reads version information from the application and Hook binaries, verifies that they have the same version, and creates `dist/ProxyLane-version-Windows.zip`. The archive contains the Win32 and x64 applications, matching Hook DLLs, the 64-bit secure-transport and MITM DLLs, the sample configuration, a combined license file, and both README files. Test executables and command-line helpers are excluded.
+The script checks that the application and Hook DLL versions match, creates `dist/ProxyLane-version-Windows.zip`, and reports its SHA-256. Use `-OutputDirectory D:\releases` to choose another output directory.
 
-The archive contains a single `LICENSE`: ProxyLane's own license appears first, followed by third-party licenses and notices under `Third-Party Software Licenses`.
-
-The sample configuration is stored at `examples/ProxyLane.ini` and is copied to the package root as `ProxyLane.ini`.
-
-“Test Current” uses `IPv6TestAddress` under `[options]` as its IPv6 egress probe address. It must be an IPv6 literal; the default is `2001:4860:4860::8888`, probed over TCP port 53.
-
-Each profile can set `BlockIPv6=1` to prevent injected processes from reaching external IPv6 destinations. IPv4, IPv4-mapped IPv6, and local `::1` remain available. The “Block IPv6” UI option is off by default.
-
-To use a custom output directory, add `-OutputDirectory D:\releases`.
+The package includes both application architectures and Hook DLLs, the 64-bit secure-transport and MITM DLLs, both README files, and a `LICENSE` containing third-party notices. The configuration comes from `examples/ProxyLane.ini`, not your local `bin/ProxyLane.ini`. Test executables and command-line helpers are excluded.
 
 ## Project Structure
 
-- `src/ProxyLane`: MFC desktop UI and application logic
-- `src/ProxyLaneHook`: process injection and network Hook module
-- `src/remotecode`: remote-code execution helper module
-- `tests`: unit tests
-- `examples`: sample configuration
-- `scripts`: release packaging scripts
+| Directory | Contents |
+| --- | --- |
+| `src/ProxyLane` | MFC desktop UI and application logic |
+| `src/ProxyLaneHook`, `src/remotecode` | Process injection and network hooks |
+| `src/ProxyLaneSecureTransport` | Encrypted proxy transport |
+| `src/ProxyLaneMitm`, `src/ProxyLaneProtocol` | Traffic decryption and protocol parsing |
+| `tests` | Automated tests and test tools |
+| `examples` | Sample configuration |
+| `scripts` | Build, validation and packaging scripts |
