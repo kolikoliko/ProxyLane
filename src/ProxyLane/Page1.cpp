@@ -367,7 +367,10 @@ void CPage1::LayoutSettingsPage()
 		const int menuX = x0 + contentW - menuW;
 		const int saveX = menuX - gap - saveW;
 		const int inlineLeft = x0 + S(228);
-		const BOOL inlineProfile = saveX - gap - (inlineLeft + labelW + S(8)) >= S(120);
+		// Decide on the width without the scroll bar, otherwise showing the bar
+		// can push this row down, which in turn keeps the bar visible.
+		const int barWidth = (GetStyle() & WS_VSCROLL) ? ::GetSystemMetrics(SM_CXVSCROLL) : 0;
+		const BOOL inlineProfile = saveX + barWidth - gap - (inlineLeft + labelW + S(8)) >= S(120);
 		const int rowY = inlineProfile ? S(10) : y;
 		if (CWnd* title = GetDlgItem(IDC_STATIC_PAGE_TITLE))
 		{

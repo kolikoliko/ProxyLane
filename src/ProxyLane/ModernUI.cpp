@@ -942,9 +942,6 @@ void CSoftCombo::PreSubclassWindow()
 	// The edit child of an editable combo paints itself; keep it out of our DC.
 	ModifyStyle(0, WS_CLIPCHILDREN);
 	CComboBox::PreSubclassWindow();
-	// Keep typed text off the rounded border.
-	if (CWnd* edit = GetWindow(GW_CHILD))
-		edit->SendMessage(EM_SETMARGINS, EC_LEFTMARGIN, MAKELONG(UiTheme::ScaleForWindow(m_hWnd, 6), 0));
 }
 
 BOOL CSoftCombo::OnEraseBkgnd(CDC*)
@@ -985,6 +982,14 @@ LRESULT CSoftCombo::OnMouseLeave(WPARAM, LPARAM)
 
 void CSoftCombo::OnPaint()
 {
+	// Keep typed text off the rounded border. The edit child resets its
+	// margins whenever its font changes, so re-apply them here.
+	if (CWnd* edit = GetWindow(GW_CHILD))
+	{
+		const int margin = UiTheme::ScaleForWindow(m_hWnd, 7);
+		if (LOWORD(edit->SendMessage(EM_GETMARGINS)) != margin)
+			edit->SendMessage(EM_SETMARGINS, EC_LEFTMARGIN, MAKELONG(margin, 0));
+	}
 	CPaintDC paint(this);
 	CRect client;
 	GetClientRect(&client);
