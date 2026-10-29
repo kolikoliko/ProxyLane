@@ -154,6 +154,7 @@ protected:
 	virtual void PreSubclassWindow();
 	virtual void DrawItem(LPDRAWITEMSTRUCT drawItemStruct);
 	afx_msg BOOL OnEraseBkgnd(CDC* dc);
+	afx_msg LRESULT OnNcHitTest(CPoint point);
 
 	DECLARE_MESSAGE_MAP()
 };
@@ -171,6 +172,7 @@ protected:
 	afx_msg void OnSetFocus(CWnd* oldWindow);
 	afx_msg void OnKillFocus(CWnd* newWindow);
 	afx_msg void OnEnable(BOOL enable);
+	afx_msg LRESULT OnNcHitTest(CPoint point);
 
 	DECLARE_MESSAGE_MAP()
 };

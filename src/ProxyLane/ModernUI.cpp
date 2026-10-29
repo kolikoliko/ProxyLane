@@ -756,6 +756,7 @@ IMPLEMENT_DYNAMIC(CCardFrame, CButton)
 
 BEGIN_MESSAGE_MAP(CCardFrame, CButton)
 	ON_WM_ERASEBKGND()
+	ON_WM_NCHITTEST()
 END_MESSAGE_MAP()
 
 void CCardFrame::PreSubclassWindow()
@@ -807,6 +808,7 @@ BEGIN_MESSAGE_MAP(CSoftEdit, CEdit)
 	ON_WM_SETFOCUS()
 	ON_WM_KILLFOCUS()
 	ON_WM_ENABLE()
+	ON_WM_NCHITTEST()
 END_MESSAGE_MAP()
 
 void CSoftEdit::PreSubclassWindow()
@@ -886,4 +888,17 @@ void CSoftEdit::OnEnable(BOOL enable)
 {
 	CEdit::OnEnable(enable);
 	RedrawWindow(NULL, NULL, RDW_FRAME | RDW_INVALIDATE);
+}
+
+LRESULT CSoftEdit::OnNcHitTest(CPoint point)
+{
+	// The padding is part of the field: clicking it must focus and place the caret.
+	const LRESULT hit = CEdit::OnNcHitTest(point);
+	return (hit == HTVSCROLL || hit == HTHSCROLL) ? hit : HTCLIENT;
+}
+
+LRESULT CCardFrame::OnNcHitTest(CPoint)
+{
+	// Like a stock group box, let clicks fall through to the controls it frames.
+	return HTTRANSPARENT;
 }
