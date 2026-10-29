@@ -16,6 +16,53 @@ namespace
 	const int kTileTop = 120;
 }
 
+namespace
+{
+	// Store apps ship white glyphs meant for a coloured tile; detect icons whose
+	// visible pixels are almost all very light so they can get a backing plate.
+	BOOL IsLightIcon(HICON icon)
+	{
+		ICONINFO info = { 0 };
+		if (!icon || !::GetIconInfo(icon, &info)) return FALSE;
+		BOOL light = FALSE;
+		if (info.hbmColor)
+		{
+			BITMAP bitmap = { 0 };
+			::GetObject(info.hbmColor, sizeof(bitmap), &bitmap);
+			const int width = bitmap.bmWidth, height = bitmap.bmHeight;
+			if (width > 0 && height > 0 && width <= 256 && height <= 256)
+			{
+				BITMAPINFO bmi = { 0 };
+				bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+				bmi.bmiHeader.biWidth = width;
+				bmi.bmiHeader.biHeight = -height;
+				bmi.bmiHeader.biPlanes = 1;
+				bmi.bmiHeader.biBitCount = 32;
+				bmi.bmiHeader.biCompression = BI_RGB;
+				std::vector<DWORD> pixels(width * height);
+				HDC screen = ::GetDC(NULL);
+				if (::GetDIBits(screen, info.hbmColor, 0, height, &pixels[0], &bmi, DIB_RGB_COLORS) == height)
+				{
+					int visible = 0, bright = 0;
+					for (size_t i = 0; i < pixels.size(); ++i)
+					{
+						const DWORD p = pixels[i];
+						if ((p >> 24) < 64) continue; // transparent (icons without alpha are never "light" here)
+						++visible;
+						const int lum = (GetBValue(p) * 299 + GetGValue(p) * 587 + GetRValue(p) * 114) / 1000;
+						if (lum > 225) ++bright;
+					}
+					light = visible > 0 && bright * 100 >= visible * 85;
+				}
+				::ReleaseDC(NULL, screen);
+			}
+		}
+		if (info.hbmColor) ::DeleteObject(info.hbmColor);
+		if (info.hbmMask) ::DeleteObject(info.hbmMask);
+		return light;
+	}
+}
+
 IMPLEMENT_DYNAMIC(CLaunchPanel, CWnd)
 
 BEGIN_MESSAGE_MAP(CLaunchPanel, CWnd)
@@ -117,6 +164,8 @@ void CLaunchPanel::SetEnabledState(BOOL enabled)
 void CLaunchPanel::SetTiles(const std::vector<Tile>& tiles)
 {
 	m_tiles = tiles;
+	for (size_t i = 0; i < m_tiles.size(); ++i)
+		m_tiles[i].lightIcon = IsLightIcon(m_tiles[i].icon);
 	if (m_focusTile >= static_cast<int>(m_tiles.size())) m_focusTile = 0;
 	m_hot = -1;
 	m_pressed = -1;
@@ -273,6 +322,11 @@ void CLaunchPanel::OnPaint()
 			const int iconSize = max(Scale(kTileIcon), min(::GetSystemMetrics(SM_CXICON), Scale(32)));
 			const int iconLeft = tile.left + Scale(10);
 			const int iconTop = tile.top + (tile.Height() - iconSize) / 2;
+			if (m_tiles[i].icon && m_tiles[i].lightIcon)
+			{
+				CRect plate(iconLeft - Scale(2), iconTop - Scale(2), iconLeft + iconSize + Scale(2), iconTop + iconSize + Scale(2));
+				UiTheme::FillRoundRect(dc.m_hDC, plate, Scale(7), RGB(47, 52, 61), CLR_NONE);
+			}
 			if (m_tiles[i].icon)
 				::DrawIconEx(dc.m_hDC, iconLeft, iconTop, m_tiles[i].icon, iconSize, iconSize, 0, NULL, DI_NORMAL);
 			dc.SetTextColor(m_enabled ? UiTheme::TextPrimary() : UiTheme::TextSecondary());

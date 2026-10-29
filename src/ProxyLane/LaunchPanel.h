@@ -20,7 +20,8 @@ public:
 		HICON icon;
 		CString name;
 		CString tip;
-		Tile() : icon(NULL) {}
+		BOOL lightIcon; // white-on-transparent icon (Store apps); drawn on a dark plate
+		Tile() : icon(NULL), lightIcon(FALSE) {}
 	};
 
 	CLaunchPanel();
