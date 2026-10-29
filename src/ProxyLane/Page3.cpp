@@ -848,6 +848,12 @@ BOOL CPage3::OnInitDialog()
 		CRect(0, 0, 0, 0), this, IDC_PROCESS_TOGGLE);
 	m_processToggle.SetFont(&m_uiFont, FALSE);
 	m_processToggle.SetVisualStyle(CModernButton::STYLE_SECONDARY);
+	// Lets the user stop the proxy where they started it from.
+	m_btnStopProxy.Create(Localization::Get(_T("action.stop_proxy")),
+		WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, CRect(0, 0, 0, 0), this, IDC_STOP_PROXY_APP);
+	m_btnStopProxy.SetFont(&m_uiFont, FALSE);
+	m_btnStopProxy.SetVisualStyle(CModernButton::STYLE_SECONDARY);
+	m_btnStopProxy.SetBackdropColor(UiTheme::Surface());
 	if (m_launchPanel.Create(this, IDC_LAUNCH_PANEL))
 		m_launchPanel.SetWindowPos(&wndBottom, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 	SetTimer(TIMER_LAUNCH_PANEL, 500, NULL);
@@ -1232,6 +1238,7 @@ BEGIN_MESSAGE_MAP(CPage3, CModernDialog)
 	ON_NOTIFY(NM_CUSTOMDRAW, IDC_PSLIST, &CPage3::OnNMCustomdrawProcessList)
 	ON_MESSAGE(WM_LAUNCH_PANEL_TILE, &CPage3::OnLaunchPanelTile)
 	ON_BN_CLICKED(IDC_PROCESS_TOGGLE, &CPage3::OnBnClickedProcessToggle)
+	ON_BN_CLICKED(IDC_STOP_PROXY_APP, &CPage3::OnBnClickedStopProxy)
 	ON_MESSAGE(WM_RECENT_APPLICATIONS_CHANGED, &CPage3::OnRecentApplicationsChanged)
 	ON_MESSAGE(WM_WINDOW_FINDER_BEGIN, &CPage3::OnWindowFinderBegin)
 	ON_MESSAGE(WM_WINDOW_FINDER_UPDATE, &CPage3::OnWindowFinderUpdate)
@@ -1290,6 +1297,13 @@ void CPage3::LayoutProcessPage()
 		CRect slot = m_launchPanel.ActionSlot(actionWidth, actionHeight);
 		if (m_btnSelectApp.GetSafeHwnd())
 			m_btnSelectApp.MoveWindow(panel.left + slot.left, panel.top + slot.top, actionWidth, actionHeight);
+		if (m_btnStopProxy.GetSafeHwnd())
+		{
+			const int stopWidth = textWidth(m_btnStopProxy, 96);
+			m_btnStopProxy.MoveWindow(panel.left + slot.left - stopWidth - UiTheme::ScaleForWindow(m_hWnd, 10),
+				panel.top + slot.top, stopWidth, actionHeight);
+			m_launchPanel.SetActionWidth(actionWidth + stopWidth + UiTheme::ScaleForWindow(m_hWnd, 10));
+		}
 		top = panel.bottom + UiTheme::ScaleForWindow(m_hWnd, 16);
 	}
 
@@ -1492,6 +1506,8 @@ void CPage3::RefreshLaunchPanel()
 	m_launchPanel.SetText(Localization::Get(titleKey), Localization::Get(bodyKey),
 		Localization::Get(_T("recent.title")), empty);
 	m_launchPanel.SetEnabledState(running);
+	if (m_btnStopProxy.GetSafeHwnd())
+		m_btnStopProxy.ShowWindow(running ? SW_SHOW : SW_HIDE);
 
 	// One action button whose meaning follows the state of the proxy.
 	LPCTSTR actionKey = running ? _T("apps.select") : (configured ? _T("action.start_proxy") : _T("launch.goto_proxy"));
@@ -1503,6 +1519,12 @@ void CPage3::RefreshLaunchPanel()
 		m_btnSelectApp.SetWindowText(actionText);
 		LayoutProcessPage();
 	}
+}
+
+void CPage3::OnBnClickedStopProxy()
+{
+	if (g_MainTab && g_MainTab->GetPage1())
+		g_MainTab->GetPage1()->OnBnClickedCancel();
 }
 
 void CPage3::OnBnClickedProcessToggle()

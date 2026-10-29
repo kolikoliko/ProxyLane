@@ -194,6 +194,7 @@ private:
 	// Launch area: one-click recent apps and the main launch action.
 	CLaunchPanel m_launchPanel;
 	CModernButton m_processToggle;
+	CModernButton m_btnStopProxy;
 	BOOL m_processesExpanded;
 	std::vector<RecentApplications::Entry> m_recentEntries;
 	RecentApplications::Load* m_recentLoad;
@@ -274,6 +275,7 @@ public:
 	afx_msg void OnTimer(UINT_PTR nIDEvent);
 	afx_msg LRESULT OnLaunchPanelTile(WPARAM index, LPARAM);
 	afx_msg void OnBnClickedProcessToggle();
+	afx_msg void OnBnClickedStopProxy();
 	afx_msg LRESULT OnRecentApplicationsChanged(WPARAM, LPARAM);
 	afx_msg void OnLvnColumnClickProcessList(NMHDR* notifyHeader, LRESULT* result);
 	afx_msg void OnNMCustomdrawProcessList(NMHDR* notifyHeader, LRESULT* result);

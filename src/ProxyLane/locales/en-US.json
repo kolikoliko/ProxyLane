@@ -267,7 +267,7 @@
   "recent.unavailable_hint": "The app or shortcut is currently unavailable. Remove the record, or refresh after restoring it.",
   "recent.empty": "Apps you launch will appear here.",
   "launch.title_ready": "Drop a program or shortcut here",
-  "launch.body_ready": "It launches through the running profile, and child processes inherit the proxy. Or choose an installed app with the button on the right.",
+  "launch.body_ready": "Starts through the running profile; child processes inherit the proxy.",,
   "launch.title_unconfigured": "No proxy configured yet",
   "launch.body_unconfigured": "Add a proxy profile first, then come back to launch apps.",
   "launch.title_offline": "Start the proxy first",
