@@ -86,6 +86,8 @@ private:
 	CProxyController m_proxyController;
 	CProxyProfileStore m_profileStore;
 	int m_activeTab;
+	int m_scrollY;
+	BOOL m_inLayout;
 	CCardFrame m_cardProxy;
 	CCardFrame m_cardOptions;
 	CCardFrame m_cardChildFilter;
@@ -138,6 +140,8 @@ protected:
 	DECLARE_MESSAGE_MAP()
 public:
 	afx_msg void OnSize(UINT nType, int cx, int cy);
+	afx_msg void OnVScroll(UINT code, UINT position, CScrollBar* scrollBar);
+	afx_msg BOOL OnMouseWheel(UINT flags, short delta, CPoint point);
 	afx_msg void OnBnClickedOk();
 	afx_msg void OnBnClickedCancel();
 	afx_msg void OnDestroy();

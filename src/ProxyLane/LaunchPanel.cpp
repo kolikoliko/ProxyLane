@@ -9,7 +9,7 @@ namespace
 	const int kHeaderHeight = 88;
 	const int kIconBox = 44;
 	const int kTileWidth = 156;
-	const int kTileHeight = 40;
+	const int kTileHeight = 46;
 	const int kTileGap = 8;
 	const int kTileIcon = 24;
 	const int kRecentLabelTop = 98;
@@ -269,7 +269,8 @@ void CLaunchPanel::OnPaint()
 				down ? UiTheme::AccentSoft() : (hot ? RGB(243, 247, 254) : RGB(255, 255, 255)),
 				hot ? UiTheme::AccentSoftBorder() : UiTheme::BorderSoft());
 
-			const int iconSize = Scale(kTileIcon);
+			// Draw the shell's large icon at its own size; scaling makes it blurry.
+			const int iconSize = max(Scale(kTileIcon), min(::GetSystemMetrics(SM_CXICON), Scale(32)));
 			const int iconLeft = tile.left + Scale(10);
 			const int iconTop = tile.top + (tile.Height() - iconSize) / 2;
 			if (m_tiles[i].icon)
@@ -278,12 +279,9 @@ void CLaunchPanel::OnPaint()
 			CRect name(iconLeft + iconSize + Scale(8), tile.top, tile.right - Scale(10), tile.bottom);
 			dc.DrawText(m_tiles[i].name, name, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
 
-			if (m_enabled && ::GetFocus() == m_hWnd && i == m_focusTile)
-			{
-				CRect focus = tile;
-				focus.DeflateRect(Scale(3), Scale(3));
-				dc.DrawFocusRect(focus);
-			}
+			const BOOL cuesHidden = (SendMessage(WM_QUERYUISTATE) & UISF_HIDEFOCUS) != 0;
+			if (m_enabled && !cuesHidden && ::GetFocus() == m_hWnd && i == m_focusTile)
+				UiTheme::FillRoundRect(dc.m_hDC, tile, Scale(10), CLR_NONE, UiTheme::Accent());
 		}
 		dc.SelectObject(oldFont);
 	}

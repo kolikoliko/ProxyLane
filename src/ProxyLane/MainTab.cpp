@@ -133,6 +133,9 @@ BOOL CMainTab::CreateTabCtrl(CWnd* parent)
 	if (m_currentPage == PAGE_APPLICATIONS)
 		m_page3.OnPageActivated();
 	FinalizeLayout(FALSE);
+	// Hide focus rectangles until the keyboard is used, like standard dialogs do.
+	if (CWnd* top = GetTopLevelParent())
+		top->PostMessage(WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS | UISF_HIDEACCEL), 0);
 	// Run once more after WM_INITDIALOG returns and the normal message loop is
 	// active. This covers delayed theme/font realization on a busy machine.
 	PostMessage(WM_MAIN_TAB_FINALIZE_LAYOUT);

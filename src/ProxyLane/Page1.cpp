@@ -77,6 +77,8 @@ CPage1::CPage1(CWnd* pParent /*=NULL*/)
 	, m_loadingProfile(TRUE)
 	, m_profileStore(g_ini)
 	, m_activeTab(0)
+	, m_scrollY(0)
+	, m_inLayout(FALSE)
 {
 	m_pTestProxy = 0;
 	m_pProxyTester = 0;
@@ -148,6 +150,8 @@ void CPage1::DoDataExchange(CDataExchange* pDX)
 BEGIN_MESSAGE_MAP(CPage1, CModernDialog)
 
 	ON_WM_SIZE()
+	ON_WM_VSCROLL()
+	ON_WM_MOUSEWHEEL()
 	ON_BN_CLICKED(IDOK, &CPage1::OnBnClickedOk)
 	ON_BN_CLICKED(IDCANCEL, &CPage1::OnBnClickedCancel)
 	ON_WM_DESTROY()
@@ -303,19 +307,25 @@ void CPage1::UpdateWorkflowCard()
 
 void CPage1::LayoutSettingsPage()
 {
-	if (!GetSafeHwnd() || !m_cfgls.GetSafeHwnd() || !m_OK.GetSafeHwnd())
+	if (!GetSafeHwnd() || !m_cfgls.GetSafeHwnd() || !m_OK.GetSafeHwnd() || m_inLayout)
 		return;
 	CRect client;
 	GetClientRect(&client);
 	if (client.Width() <= 0 || client.Height() <= 0)
 		return;
+	m_inLayout = TRUE;
+	// WM_SETREDRAW TRUE also sets WS_VISIBLE, so only use it on a page that is shown.
+	const BOOL freezeRedraw = IsWindowVisible();
+	if (freezeRedraw) SetRedraw(FALSE);
+	const int scroll = m_scrollY;
 
 	auto S = [this](int value) { return UiTheme::ScaleForWindow(m_hWnd, value); };
 	auto place = [this](UINT id, int x, int y, int width, int height)
 	{
 		CWnd* control = GetDlgItem(id);
+		// Positions are in content coordinates; the page may be scrolled.
 		if (control && control->GetSafeHwnd())
-			control->SetWindowPos(NULL, x, y, max(0, width), max(0, height), SWP_NOZORDER | SWP_NOACTIVATE);
+			control->SetWindowPos(NULL, x, y - m_scrollY, max(0, width), max(0, height), SWP_NOZORDER | SWP_NOACTIVATE);
 	};
 	auto textWidth = [this](UINT id) -> int
 	{
@@ -365,8 +375,14 @@ void CPage1::LayoutSettingsPage()
 			title->GetWindowRect(&titleRect);
 			ScreenToClient(&titleRect);
 			const int titleRight = inlineProfile ? inlineLeft - S(12) : x0 + contentW;
-			title->SetWindowPos(NULL, 0, 0, max(0, titleRight - titleRect.left), titleRect.Height(),
-				SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+			place(IDC_STATIC_PAGE_TITLE, titleRect.left, S(4), max(0, titleRight - titleRect.left), S(36));
+			if (CWnd* subtitle = GetDlgItem(IDC_STATIC_PAGE_SUBTITLE))
+			{
+				CRect subtitleRect;
+				subtitle->GetWindowRect(&subtitleRect);
+				ScreenToClient(&subtitleRect);
+				place(IDC_STATIC_PAGE_SUBTITLE, subtitleRect.left, S(38), subtitleRect.Width(), S(18));
+			}
 		}
 		const int left = inlineProfile ? inlineLeft : x0 + S(2);
 		place(IDC_STATIC_CONFIG_LABEL, left, rowY + (fieldH - labelH) / 2, labelW, labelH);
@@ -454,7 +470,7 @@ void CPage1::LayoutSettingsPage()
 		if (m_activeTab == 0)
 			height = S(34) + rowH * 4 + S(6);
 		else
-			height = max(S(200), client.bottom - margin - top);
+			height = max(S(220), client.Height() - margin - top);
 		const CRect frame(x0, top, x0 + contentW, top + height);
 		place(IDC_STATIC_GROUP_OTHER, frame.left, frame.top, frame.Width(), frame.Height());
 		place(IDC_STATIC_CHILDFILTER_GROUP, frame.left, frame.top, frame.Width(), frame.Height());
@@ -491,9 +507,68 @@ void CPage1::LayoutSettingsPage()
 		place(IDC_RADIO_TARGETFILTER_PROXY, innerX + S(200), filterRadioTop, S(200), checkH);
 		place(IDC_EDIT_TARGETFILTER, innerX, editY, innerW, editH);
 		place(IDC_STATIC_TARGETFILTER_HINT, innerX, hintY, innerW, hintH);
+		y = frame.bottom + margin;
 	}
 
-	RedrawWindow(NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+	// Scroll range follows the content; showing or hiding the bar changes the
+	// client width, which needs one more pass.
+	const int maxScroll = max(0, y - client.Height());
+	SCROLLINFO info = { sizeof(info), SIF_RANGE | SIF_PAGE | SIF_POS, 0, y - 1, static_cast<UINT>(client.Height()),
+		min(scroll, maxScroll) };
+	SetScrollInfo(SB_VERT, &info, TRUE);
+	CRect after;
+	GetClientRect(&after);
+	if (freezeRedraw) SetRedraw(TRUE);
+	m_inLayout = FALSE;
+	if (scroll > maxScroll || after.Width() != client.Width())
+	{
+		m_scrollY = min(scroll, maxScroll);
+		LayoutSettingsPage();
+		return;
+	}
+	RedrawWindow(NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+}
+
+void CPage1::OnVScroll(UINT code, UINT position, CScrollBar* scrollBar)
+{
+	SCROLLINFO info = { sizeof(info), SIF_ALL };
+	GetScrollInfo(SB_VERT, &info);
+	const int line = UiTheme::ScaleForWindow(m_hWnd, 40);
+	int next = m_scrollY;
+	switch (code)
+	{
+	case SB_LINEUP: next -= line; break;
+	case SB_LINEDOWN: next += line; break;
+	case SB_PAGEUP: next -= static_cast<int>(info.nPage) - line; break;
+	case SB_PAGEDOWN: next += static_cast<int>(info.nPage) - line; break;
+	case SB_THUMBTRACK:
+	case SB_THUMBPOSITION: next = info.nTrackPos; break;
+	case SB_TOP: next = 0; break;
+	case SB_BOTTOM: next = info.nMax; break;
+	default: CModernDialog::OnVScroll(code, position, scrollBar); return;
+	}
+	next = max(0, min(next, info.nMax - static_cast<int>(info.nPage) + 1));
+	if (next != m_scrollY)
+	{
+		m_scrollY = next;
+		LayoutSettingsPage();
+	}
+}
+
+BOOL CPage1::OnMouseWheel(UINT flags, short delta, CPoint point)
+{
+	SCROLLINFO info = { sizeof(info), SIF_ALL };
+	GetScrollInfo(SB_VERT, &info);
+	const int maxScroll = max(0, info.nMax - static_cast<int>(info.nPage) + 1);
+	if (maxScroll <= 0)
+		return CModernDialog::OnMouseWheel(flags, delta, point);
+	const int next = max(0, min(maxScroll, m_scrollY - delta * UiTheme::ScaleForWindow(m_hWnd, 60) / WHEEL_DELTA));
+	if (next != m_scrollY)
+	{
+		m_scrollY = next;
+		LayoutSettingsPage();
+	}
+	return TRUE;
 }
 
 BOOL CPage1::UsesSecondaryText(UINT controlId) const

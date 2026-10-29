@@ -444,11 +444,23 @@ void CModernButton::DrawItem(LPDRAWITEMSTRUCT info)
 	if (oldFont)
 		dc.SelectObject(oldFont);
 
-	if ((info->itemState & ODS_FOCUS) && !disabled)
+	if ((info->itemState & ODS_FOCUS) && !(info->itemState & ODS_NOFOCUSRECT) && !disabled)
 	{
-		CRect focus = rect;
-		focus.DeflateRect(4, 3);
-		dc.DrawFocusRect(focus);
+		// Keyboard focus ring instead of the dotted rectangle.
+		const int radius = UiTheme::ScaleForWindow(m_hWnd, 6);
+		if (m_visualStyle == STYLE_PRIMARY)
+		{
+			CRect inner = rect;
+			inner.DeflateRect(2, 2);
+			UiTheme::FillRoundRect(dc.m_hDC, inner, max(1, radius - 2), CLR_NONE, RGB(255, 255, 255));
+		}
+		else
+		{
+			UiTheme::FillRoundRect(dc.m_hDC, rect, radius, CLR_NONE, UiTheme::Accent());
+			CRect inner = rect;
+			inner.DeflateRect(1, 1);
+			UiTheme::FillRoundRect(dc.m_hDC, inner, max(1, radius - 1), CLR_NONE, UiTheme::Accent());
+		}
 	}
 
 	target.BitBlt(0, 0, clientRect.Width(), clientRect.Height(), &dc, 0, 0, SRCCOPY);
